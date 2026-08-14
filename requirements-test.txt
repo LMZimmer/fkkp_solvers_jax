@@ -1,0 +1,4 @@
+# Extra packages installed only so the reference package ./fisher-kpp can be
+# imported for the comparison tests and validation script. NOT dependencies
+# of fisher_kpp_jax.
+torch==2.13.0+cpu  # --index-url https://download.pytorch.org/whl/cpu

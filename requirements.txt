@@ -1,0 +1,19 @@
+# Runtime dependencies of fisher_kpp_jax (exact versions installed in the
+# `fkkp_solver` conda env, Python 3.14.6).
+#
+# GPU status: jax/jaxlib 0.11.0 (CUDA 12 wheels) verified working on
+# Quadro RTX 8000 (Turing, sm_75, compute capability 7.5) — jax.devices()
+# reports CudaDevice and a jitted op runs on device, so no version pin for
+# sm_75 support is needed at this version.
+jax[cuda12]==0.11.0
+jaxlib==0.11.0
+numpy==2.5.2
+scipy==1.18.0
+
+# Test-only tooling.
+pytest==9.1.1
+
+# The reference package (./fisher-kpp) has an extra import-time dependency of
+# its own; it was installed into the env only so the comparison tests can run
+# and is deliberately not a dependency of fisher_kpp_jax — see
+# requirements-test.txt.
