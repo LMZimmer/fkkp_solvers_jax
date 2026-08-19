@@ -2,3 +2,7 @@
 # imported for the comparison tests and validation script. NOT dependencies
 # of fisher_kpp_jax.
 torch==2.13.0+cpu  # --index-url https://download.pytorch.org/whl/cpu
+
+# For scripts/run_reference_solves.py (reads/writes the GliODIL-style .nii
+# volumes in reference_solves/). Not a dependency of fisher_kpp_jax.
+nibabel==5.4.2

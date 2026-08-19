@@ -1,0 +1,32 @@
+jax 0.11.0, default backend: gpu
+CPUs: 128 available of 128 on this host
+config: Dw=0.927641 rho=0.091541 RatioDw_Dg=100 days=100 Nt=4608 (dt=0.0217014 d) th_necro=0.8 th_up=0.554089 th_down=0.303587
+grid: (182, 218, 182), seed voxel (140, 116, 55), GliODIL seed (Dt=15, M=1500)
+
+== fkpp_jax_f64_cpu ==
+  wall time: 1.2 min
+  CPU time:  12.3 min -> 10.28 cores busy on average
+  final_time=100, criterion=time, final mass=58181.566, max density=0.999241
+  saved /home/home/lucas/projects/pde_solver_development/reference_solves/result_fkpp_jax_f64_cpu.nii.gz
+  saved /home/home/lucas/projects/pde_solver_development/reference_solves/segmentation_fkpp_jax_f64_cpu.nii.gz
+
+== fkpp_jax_f64_gpu ==
+  wall time: 0.1 min
+  CPU time:  0.1 min -> 0.83 cores busy on average
+  final_time=100, criterion=time, final mass=58181.566, max density=0.999241
+  saved /home/home/lucas/projects/pde_solver_development/reference_solves/result_fkpp_jax_f64_gpu.nii.gz
+  saved /home/home/lucas/projects/pde_solver_development/reference_solves/segmentation_fkpp_jax_f64_gpu.nii.gz
+
+== fkpp_jax_f32_gpu ==
+  wall time: 0.1 min
+  CPU time:  0.1 min -> 0.86 cores busy on average
+  final_time=100, criterion=time, final mass=58181.56, max density=0.99924
+  saved /home/home/lucas/projects/pde_solver_development/reference_solves/result_fkpp_jax_f32_gpu.nii.gz
+  saved /home/home/lucas/projects/pde_solver_development/reference_solves/segmentation_fkpp_jax_f32_gpu.nii.gz
+
+== comparison vs result_reference.nii.gz ==
+  fkpp_jax_f64_cpu     max|d|=2.220e-16  relL2=3.890e-17
+  fkpp_jax_f64_gpu     max|d|=0.000e+00  relL2=0.000e+00
+  fkpp_jax_f32_gpu     max|d|=1.473e-06  relL2=2.131e-07
+
+done.

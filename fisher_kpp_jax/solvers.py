@@ -1,6 +1,6 @@
 """The three JAX Fisher-KPP forward solvers (port of ``fisher_kpp.solvers``).
 
-Numerical behavior follows the NumPy reference exactly (see that module's
+Numerical behavior follows the NumPy reference (see that module's
 docstrings for the deliberate quirks inherited from TumorGrowthToolkit:
 zero-flux boundaries, the FK_2c stopping-mass voxel-volume fix and
 reaction-rate dt guard, the DTI guard-exit failure semantics, and the
@@ -19,8 +19,6 @@ Port-specific notes:
     computed host-side in float64 and shipped to the device as booleans, so
     they are identical for both precisions; the FK_2c occupancy mask depends
     on the evolving state and is computed on the device at the state dtype.
-  - ``elongate_tensor_along_principal_axis`` uses ``jnp.linalg.eigh`` instead
-    of torch (see fisher_kpp_jax.operators).
 """
 
 from __future__ import annotations
@@ -45,6 +43,9 @@ from .base import (
     StepSpec,
 )
 from .operators import (
+    GAUSSIAN_SEED_DIFFUSION_TIME,
+    GAUSSIAN_SEED_FLOOR,
+    GAUSSIAN_SEED_MASS,
     FaceFields,
     clipped_gaussian,
     crop,
@@ -72,7 +73,10 @@ _AXES = ("x", "y", "z")
 _COMMON_DEFAULTS: dict[str, Any] = {
     "diffusivity_ratio": 10.0,
     "voxel_size_mm": (1.0, 1.0, 1.0),
-    "seed_scale": 1.0,
+    "gaussian_seed_scale": 1.0,
+    "gaussian_seed_diffusion_time": GAUSSIAN_SEED_DIFFUSION_TIME,
+    "gaussian_seed_mass": GAUSSIAN_SEED_MASS,
+    "gaussian_seed_floor": GAUSSIAN_SEED_FLOOR,
     "stopping_time": 100,
     "stopping_threshold": np.inf,
     "stopping_mode": "mass",
@@ -160,9 +164,9 @@ def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
 
 
 def _validate_seed_fractions(params: Mapping[str, Any]) -> None:
-    assert 0 <= params["seed_x_fraction"] <= 1, "seed_x_fraction must be between 0 and 1"
-    assert 0 <= params["seed_y_fraction"] <= 1, "seed_y_fraction must be between 0 and 1"
-    assert 0 <= params["seed_z_fraction"] <= 1, "seed_z_fraction must be between 0 and 1"
+    assert 0 <= params["gaussian_seed_x_fraction"] <= 1, "gaussian_seed_x_fraction must be between 0 and 1"
+    assert 0 <= params["gaussian_seed_y_fraction"] <= 1, "gaussian_seed_y_fraction must be between 0 and 1"
+    assert 0 <= params["gaussian_seed_z_fraction"] <= 1, "gaussian_seed_z_fraction must be between 0 and 1"
 
 
 def _mixture_face_fields(
@@ -356,9 +360,9 @@ class FKPPSolver(BaseFKPPSolver):
             "rho",
             "gray_matter",
             "white_matter",
-            "seed_x_fraction",
-            "seed_y_fraction",
-            "seed_z_fraction",
+            "gaussian_seed_x_fraction",
+            "gaussian_seed_y_fraction",
+            "gaussian_seed_z_fraction",
             "resolution_factor",
         }
     )
@@ -396,8 +400,11 @@ class FKPPSolver(BaseFKPPSolver):
                 self.grid_shape,
                 self.seed_voxel,
                 self.grid_spacing,
-                scale=self.params["seed_scale"],
+                scale=self.params["gaussian_seed_scale"],
                 dtype=self._dtype,
+                diffusion_time=self.params["gaussian_seed_diffusion_time"],
+                mass=self.params["gaussian_seed_mass"],
+                floor=self.params["gaussian_seed_floor"],
             )
         }
 
@@ -483,9 +490,9 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             "nutrient_consumption_rate",
             "gray_matter",
             "white_matter",
-            "seed_x_fraction",
-            "seed_y_fraction",
-            "seed_z_fraction",
+            "gaussian_seed_x_fraction",
+            "gaussian_seed_y_fraction",
+            "gaussian_seed_z_fraction",
             "resolution_factor",
         }
     )
@@ -519,8 +526,11 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             self.grid_shape,
             self.seed_voxel,
             self.grid_spacing,
-            scale=self.params["seed_scale"],
+            scale=self.params["gaussian_seed_scale"],
             dtype=self._dtype,
+            diffusion_time=self.params["gaussian_seed_diffusion_time"],
+            mass=self.params["gaussian_seed_mass"],
+            floor=self.params["gaussian_seed_floor"],
         )
         necrotic = jnp.zeros(proliferative.shape, dtype=self._dtype)
         nutrient = jnp.ones(proliferative.shape, dtype=self._dtype)
@@ -623,9 +633,9 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             "diffusivity",
             "rho",
             "diffusion_tensors",
-            "seed_x_fraction",
-            "seed_y_fraction",
-            "seed_z_fraction",
+            "gaussian_seed_x_fraction",
+            "gaussian_seed_y_fraction",
+            "gaussian_seed_z_fraction",
             "resolution_factor",
         }
     )
@@ -798,8 +808,11 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             self.grid_shape,
             self.seed_voxel,
             self.grid_spacing,
-            scale=self.params["seed_scale"],
+            scale=self.params["gaussian_seed_scale"],
             dtype=self._dtype,
+            diffusion_time=self.params["gaussian_seed_diffusion_time"],
+            mass=self.params["gaussian_seed_mass"],
+            floor=self.params["gaussian_seed_floor"],
         )
         if self.params["verbose"]:
             logger.debug(

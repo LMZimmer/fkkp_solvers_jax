@@ -32,9 +32,9 @@ def fk_params(gm: np.ndarray, wm: np.ndarray, **overrides) -> dict:
         rho=0.15,
         gray_matter=gm,
         white_matter=wm,
-        seed_x_fraction=0.5,
-        seed_y_fraction=0.5,
-        seed_z_fraction=0.5,
+        gaussian_seed_x_fraction=0.5,
+        gaussian_seed_y_fraction=0.5,
+        gaussian_seed_z_fraction=0.5,
         resolution_factor=0.6,
         stopping_time=10,
     )
@@ -52,9 +52,9 @@ def fk2c_params(gm: np.ndarray, wm: np.ndarray, **overrides) -> dict:
         nutrient_consumption_rate=0.1,
         gray_matter=gm,
         white_matter=wm,
-        seed_x_fraction=0.5,
-        seed_y_fraction=0.5,
-        seed_z_fraction=0.5,
+        gaussian_seed_x_fraction=0.5,
+        gaussian_seed_y_fraction=0.5,
+        gaussian_seed_z_fraction=0.5,
         resolution_factor=0.6,
         stopping_time=10,
     )
@@ -67,9 +67,9 @@ def dti_params(tensors: np.ndarray, **overrides) -> dict:
         diffusivity=0.3,
         rho=0.15,
         diffusion_tensors=tensors,
-        seed_x_fraction=0.5,
-        seed_y_fraction=0.5,
-        seed_z_fraction=0.5,
+        gaussian_seed_x_fraction=0.5,
+        gaussian_seed_y_fraction=0.5,
+        gaussian_seed_z_fraction=0.5,
         resolution_factor=0.6,
         stopping_time=10,
     )
@@ -242,8 +242,8 @@ def test_snapshot_step_indices(tissue_phantom):
 
 def test_seed_outside_tissue_errors(tissue_phantom):
     gm, wm = tissue_phantom
-    params = fk_params(gm, wm, seed_x_fraction=0.02, seed_y_fraction=0.02,
-                       seed_z_fraction=0.02)
+    params = fk_params(gm, wm, gaussian_seed_x_fraction=0.02, gaussian_seed_y_fraction=0.02,
+                       gaussian_seed_z_fraction=0.02)
     ref = RefFK(params).solve()
     ours = JaxFK(params).solve()
     assert ref.success is False and ours.success is False

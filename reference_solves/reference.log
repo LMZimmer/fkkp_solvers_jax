@@ -1,0 +1,57 @@
+python -u /home/home/lucas/projects/dockerize/GliODIL/synthetic_generator.py --Dw 0.927641 --rho 0.091541 --RatioDw_Dg 100 --days 100 --Nt 4608 --th_necro 0.8 --th_up 0.554089 --th_down 0.303587 --NxT1_pct 0.771978021978022 --NyT1_pct 0.5344036697247706 --NzT1_pct 0.30494505494505497 --NxT2_pct -1 --NyT2_pct -1 --NzT2_pct -1 --NxT3_pct -1 --NyT3_pct -1 --NzT3_pct -1 --gm_path /home/home/lucas/projects/pde_solver_development/reference_solves/sGM.npy --wm_path /home/home/lucas/projects/pde_solver_development/reference_solves/sWM.npy --out_dir /home/home/lucas/projects/pde_solver_development/reference_solves
+CPUs: 128 available of 128 on this host
+Number of steps: 4608.0
+Cropped to (147, 178, 145) of (182, 218, 182)
+0
+100
+200
+300
+400
+500
+600
+700
+800
+900
+1000
+1100
+1200
+1300
+1400
+1500
+1600
+1700
+1800
+1900
+2000
+2100
+2200
+2300
+2400
+2500
+2600
+2700
+2800
+2900
+3000
+3100
+3200
+3300
+3400
+3500
+3600
+3700
+3800
+3900
+4000
+4100
+4200
+4300
+4400
+4500
+4600
+(2, 182, 218, 182)
+Data saved at /home/home/lucas/projects/pde_solver_development/reference_solves
+wall time: 6.7 min (includes up to 4 s of poll overshoot)
+CPU time:  6.9 min -> 1.04 cores busy on average
+ok      /home/home/lucas/projects/pde_solver_development/reference_solves/result.nii
+ok      /home/home/lucas/projects/pde_solver_development/reference_solves/segm.nii

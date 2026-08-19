@@ -115,9 +115,9 @@ class BaseFKPPSolver(ABC):
         )
         nx, ny, nz = low_shape
         self.seed_voxel = (
-            int(params["seed_x_fraction"] * nx),
-            int(params["seed_y_fraction"] * ny),
-            int(params["seed_z_fraction"] * nz),
+            int(params["gaussian_seed_x_fraction"] * nx),
+            int(params["gaussian_seed_y_fraction"] * ny),
+            int(params["gaussian_seed_z_fraction"] * nz),
         )
         self._check_seed_early()
 

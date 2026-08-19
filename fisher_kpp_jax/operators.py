@@ -1,8 +1,8 @@
 """Stateless numerical operators for the JAX Fisher-KPP solvers.
 
-Device operators (``jax.numpy``) are 1:1 ports of ``fisher_kpp.operators``;
-host operators (bounding box, crop/embed) stay in NumPy because they only run
-once per solve, outside the jitted time loop.
+Device operators (``jax.numpy``) implement the numerics of
+``fisher_kpp.operators``; host operators (bounding box, crop/embed) stay in
+NumPy because they only run once per solve, outside the jitted time loop.
 
 Boundary convention: all stencils apply zero-flux (homogeneous Neumann)
 boundaries via edge replication — the ghost cell outside the array equals the
@@ -156,6 +156,9 @@ def clipped_gaussian(
     spacing: tuple[float, float, float],
     scale: float = 1.0,
     dtype: jnp.dtype = jnp.float64,
+    diffusion_time: float = GAUSSIAN_SEED_DIFFUSION_TIME,
+    mass: float = GAUSSIAN_SEED_MASS,
+    floor: float = GAUSSIAN_SEED_FLOOR,
 ) -> jax.Array:
     """Isotropic Gaussian profile centered at ``center_voxel``.
 
@@ -171,6 +174,10 @@ def clipped_gaussian(
         scale: Seed width scale factor.
         dtype: Device dtype of the returned field (the whole profile is
             evaluated at this precision).
+        diffusion_time: "Dt" of the analytic heat kernel (kernel width).
+        mass: "M", total mass of the kernel (with diffusion_time, sets the
+            amplitude).
+        floor: Values at or below this are zeroed.
 
     Returns:
         The clipped Gaussian seed profile on the device.
@@ -188,15 +195,14 @@ def clipped_gaussian(
     # The scalar amplitude is computed in float64 on the host and cast, so a
     # NumPy scalar never promotes the device array dtype.
     amplitude = jnp.asarray(
-        GAUSSIAN_SEED_MASS
-        / np.power(4 * np.pi * GAUSSIAN_SEED_DIFFUSION_TIME, 3 / 2),
+        mass / np.power(4 * np.pi * diffusion_time, 3 / 2),
         dtype=dtype,
     )
     gauss = amplitude * jnp.exp(
         -(jnp.power(x_scaled, 2) + jnp.power(y_scaled, 2) + jnp.power(z_scaled, 2))
-        / (4 * GAUSSIAN_SEED_DIFFUSION_TIME)
+        / (4 * diffusion_time)
     )
-    gauss = jnp.where(gauss > GAUSSIAN_SEED_FLOOR, gauss, 0)
+    gauss = jnp.where(gauss > floor, gauss, 0)
     gauss = jnp.where(gauss > 1, jnp.asarray(1.0, dtype=dtype), gauss)
     return gauss
 
@@ -239,20 +245,11 @@ def elongate_tensor_along_principal_axis(
 ) -> NDArray:
     """Scale each voxel's tensor along its principal eigenvector by factor.
 
-    Port of the original torch implementation to ``jnp.linalg.eigh`` (batched),
-    removing the torch dependency. The numerics follow the original exactly:
-    the same float32 cast up front, the same eigenvalue-adjustment order, and
-    a float32 ``np.ndarray`` return.
-
-    KNOWN UPSTREAM BUG, reproduced intentionally: despite the original's
-    "keep the eigenvalue sum constant" comments, the adjustment sequence
-    below drifts each voxel's trace by +(2/3)*(factor-1)*lambda_max — the
-    residual correction is computed while the max eigenvalue is still
-    unscaled, and the later scatter adds the full difference. See
-    UPSTREAM_ISSUE_elongation_trace.md (repo root) for the derivation, a
-    minimal repro against TumorGrowthToolkit, and a proposed upstream fix.
-    Do NOT "fix" it here: this port must match the reference bit-for-bit in
-    structure.
+    Each tensor is eigendecomposed (batched ``jnp.linalg.eigh`` in float32),
+    its largest eigenvalue is multiplied by ``factor``, and half of the
+    resulting increase is subtracted from each of the two remaining
+    eigenvalues, so the eigenvalue sum — the tensor trace — is preserved up
+    to float32 round-off. The eigenvectors are unchanged.
 
     Args:
         tensors: Tensor field of shape (..., 3, 3).
@@ -264,18 +261,11 @@ def elongate_tensor_along_principal_axis(
     tensor_array = jnp.asarray(np.asarray(tensors), dtype=jnp.float32)
 
     e, v = jnp.linalg.eigh(tensor_array)
-    # Original sum of eigenvalues
-    original_sum = jnp.sum(e, axis=-1, keepdims=True)
-    # Identify and scale the maximum eigenvalue
     max_eigenvalue_indices = jnp.argmax(e, axis=-1, keepdims=True)
     max_eigenvalues = jnp.take_along_axis(e, max_eigenvalue_indices, axis=-1)
     scaled_max_eigenvalues = max_eigenvalues * factor
-
-    # Calculate the difference introduced by scaling
     difference = scaled_max_eigenvalues - max_eigenvalues
 
-    # Prepare to adjust the other eigenvalues to keep the sum constant
-    adjustment = difference / 2
     mask = jnp.put_along_axis(
         jnp.ones_like(e, dtype=bool),
         max_eigenvalue_indices,
@@ -284,17 +274,9 @@ def elongate_tensor_along_principal_axis(
         inplace=False,
     )
 
-    # Adjust the other two eigenvalues
-    e_adjusted = jnp.where(mask, e - adjustment, e)
-    e_adjusted_sum = jnp.sum(e_adjusted, axis=-1, keepdims=True)
-
-    # Calculate final adjustments due to precision errors
-    final_adjustment = (original_sum - e_adjusted_sum) / 3
-    e_final = e_adjusted + jnp.where(
-        mask, final_adjustment, jnp.zeros_like(final_adjustment)
-    )
-
-    # Ensure the scaled max eigenvalue is set correctly
+    # Trace-preserving adjustment: the two non-max eigenvalues each absorb
+    # half of the max eigenvalue's increase.
+    e_final = jnp.where(mask, e - difference / 2, e)
     e_final = jnp.put_along_axis(
         e_final, max_eigenvalue_indices, scaled_max_eigenvalues, axis=-1, inplace=False
     )

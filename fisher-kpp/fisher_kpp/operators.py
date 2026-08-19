@@ -109,12 +109,18 @@ def clipped_gaussian(
     center_voxel: tuple[int, int, int],
     spacing: tuple[float, float, float],
     scale: float = 1.0,
+    diffusion_time: float = GAUSSIAN_SEED_DIFFUSION_TIME,
+    mass: float = GAUSSIAN_SEED_MASS,
+    floor: float = GAUSSIAN_SEED_FLOOR,
 ) -> NDArray:
     """Isotropic Gaussian profile centered at center_voxel, zeroed below a
     floor value and capped at 1. Used as the initial tumor cell density.
 
     Reproduces the original `gauss_sol3d` exactly, including its clipping
     order: floor first (strictly-greater keeps the value), then cap at 1.
+    diffusion_time ("Dt") sets the kernel width, mass ("M") its total mass
+    (together they set the amplitude), and floor the zeroing threshold; the
+    defaults are the original's hardcoded constants.
     """
     xv, yv, zv = np.meshgrid(
         np.arange(0, shape[0]),
@@ -126,13 +132,13 @@ def clipped_gaussian(
     y_scaled = (yv - center_voxel[1]) * spacing[1] / scale
     z_scaled = (zv - center_voxel[2]) * spacing[2] / scale
 
-    gauss = GAUSSIAN_SEED_MASS / np.power(
-        4 * np.pi * GAUSSIAN_SEED_DIFFUSION_TIME, 3 / 2
+    gauss = mass / np.power(
+        4 * np.pi * diffusion_time, 3 / 2
     ) * np.exp(
         -(np.power(x_scaled, 2) + np.power(y_scaled, 2) + np.power(z_scaled, 2))
-        / (4 * GAUSSIAN_SEED_DIFFUSION_TIME)
+        / (4 * diffusion_time)
     )
-    gauss = np.where(gauss > GAUSSIAN_SEED_FLOOR, gauss, 0)
+    gauss = np.where(gauss > floor, gauss, 0)
     gauss = np.where(gauss > 1, np.float64(1), gauss)
     return gauss
 

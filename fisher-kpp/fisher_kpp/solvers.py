@@ -19,6 +19,9 @@ from scipy.ndimage import binary_dilation
 
 from .base import BaseFKPPSolver
 from .operators import (
+    GAUSSIAN_SEED_DIFFUSION_TIME,
+    GAUSSIAN_SEED_FLOOR,
+    GAUSSIAN_SEED_MASS,
     FaceFields,
     clipped_gaussian,
     crop,
@@ -46,7 +49,10 @@ _AXES = ("x", "y", "z")
 _COMMON_DEFAULTS: dict[str, Any] = {
     "diffusivity_ratio": 10.0,
     "voxel_size_mm": (1.0, 1.0, 1.0),
-    "seed_scale": 1.0,
+    "gaussian_seed_scale": 1.0,
+    "gaussian_seed_diffusion_time": GAUSSIAN_SEED_DIFFUSION_TIME,
+    "gaussian_seed_mass": GAUSSIAN_SEED_MASS,
+    "gaussian_seed_floor": GAUSSIAN_SEED_FLOOR,
     "stopping_time": 100,
     "stopping_volume": np.inf,
     "stopping_mode": "mass",
@@ -109,9 +115,9 @@ def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
 
 
 def _validate_seed_fractions(params: Mapping[str, Any]) -> None:
-    assert 0 <= params["seed_x_fraction"] <= 1, "seed_x_fraction must be between 0 and 1"
-    assert 0 <= params["seed_y_fraction"] <= 1, "seed_y_fraction must be between 0 and 1"
-    assert 0 <= params["seed_z_fraction"] <= 1, "seed_z_fraction must be between 0 and 1"
+    assert 0 <= params["gaussian_seed_x_fraction"] <= 1, "gaussian_seed_x_fraction must be between 0 and 1"
+    assert 0 <= params["gaussian_seed_y_fraction"] <= 1, "gaussian_seed_y_fraction must be between 0 and 1"
+    assert 0 <= params["gaussian_seed_z_fraction"] <= 1, "gaussian_seed_z_fraction must be between 0 and 1"
 
 
 def _mixture_face_fields(
@@ -150,9 +156,9 @@ class FKPPSolver(BaseFKPPSolver):
             "rho",
             "gray_matter",
             "white_matter",
-            "seed_x_fraction",
-            "seed_y_fraction",
-            "seed_z_fraction",
+            "gaussian_seed_x_fraction",
+            "gaussian_seed_y_fraction",
+            "gaussian_seed_z_fraction",
             "resolution_factor",
         }
     )
@@ -194,7 +200,10 @@ class FKPPSolver(BaseFKPPSolver):
                 self.grid_shape,
                 self.seed_voxel,
                 self.grid_spacing,
-                scale=self.params["seed_scale"],
+                scale=self.params["gaussian_seed_scale"],
+                diffusion_time=self.params["gaussian_seed_diffusion_time"],
+                mass=self.params["gaussian_seed_mass"],
+                floor=self.params["gaussian_seed_floor"],
             )
         }
 
@@ -285,9 +294,9 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             "nutrient_consumption_rate",
             "gray_matter",
             "white_matter",
-            "seed_x_fraction",
-            "seed_y_fraction",
-            "seed_z_fraction",
+            "gaussian_seed_x_fraction",
+            "gaussian_seed_y_fraction",
+            "gaussian_seed_z_fraction",
             "resolution_factor",
         }
     )
@@ -327,7 +336,10 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             self.grid_shape,
             self.seed_voxel,
             self.grid_spacing,
-            scale=self.params["seed_scale"],
+            scale=self.params["gaussian_seed_scale"],
+            diffusion_time=self.params["gaussian_seed_diffusion_time"],
+            mass=self.params["gaussian_seed_mass"],
+            floor=self.params["gaussian_seed_floor"],
         )
         necrotic = np.zeros(proliferative.shape)
         nutrient = np.ones(proliferative.shape)
@@ -470,9 +482,9 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             "diffusivity",
             "rho",
             "diffusion_tensors",
-            "seed_x_fraction",
-            "seed_y_fraction",
-            "seed_z_fraction",
+            "gaussian_seed_x_fraction",
+            "gaussian_seed_y_fraction",
+            "gaussian_seed_z_fraction",
             "resolution_factor",
         }
     )
@@ -648,7 +660,10 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             self.grid_shape,
             self.seed_voxel,
             self.grid_spacing,
-            scale=self.params["seed_scale"],
+            scale=self.params["gaussian_seed_scale"],
+            diffusion_time=self.params["gaussian_seed_diffusion_time"],
+            mass=self.params["gaussian_seed_mass"],
+            floor=self.params["gaussian_seed_floor"],
         )
         if self.params["verbose"]:
             logger.debug(

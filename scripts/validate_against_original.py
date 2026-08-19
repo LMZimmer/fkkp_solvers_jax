@@ -42,7 +42,6 @@ import fisher_kpp_jax as jax_pkg  # noqa: E402
 N = 128
 STRICT_REL_TOL = 1e-8  # part 1: reference vs JAX CPU f64
 F32_REL_TOL = 1e-2  # part 2 sanity bound: f32 vs f64
-INFO_DTI_ELONGATE_TOL = 1e-3  # cross-library float32 eigh, informational
 
 FAILURES: list[str] = []
 TIMINGS: list[tuple[str, str, float, float | None]] = []  # solver, impl, cold, warm
@@ -213,9 +212,9 @@ def validate_fk_volume_stop() -> None:
         rho=0.15,
         gray_matter=gm,
         white_matter=wm,
-        seed_x_fraction=0.5,
-        seed_y_fraction=0.5,
-        seed_z_fraction=0.5,
+        gaussian_seed_x_fraction=0.5,
+        gaussian_seed_y_fraction=0.5,
+        gaussian_seed_z_fraction=0.5,
         resolution_factor=1.0,
         stopping_time=30,
     )
@@ -267,42 +266,6 @@ def validate_fk_volume_stop() -> None:
                   f64_result.stopping_criterion)
 
 
-def validate_dti_elongated_info() -> None:
-    """Informational: DTI with ellipsoid_scaling=1.5. Both implementations
-    elongate in float32, but through different eigh backends (torch LAPACK vs
-    jnp.linalg.eigh), so the diffusivity fields — and hence the solves —
-    agree only to float32 eigendecomposition accuracy, not 1e-8. Reported
-    with a loose 1e-3 bound that would only trip on a genuine port bug."""
-    print("\n== AnisotropicFKPPSolver, ellipsoid_scaling=1.5 (informational) ==")
-    tensors = make_tensor_field(64)  # elongation path only; smaller is enough
-    params = dict(
-        diffusivity=0.3,
-        rho=0.15,
-        diffusion_tensors=tensors,
-        ellipsoid_scaling=1.5,
-        tensor_exponent=2,
-        tensor_linear_term=0.1,
-        seed_x_fraction=0.5,
-        seed_y_fraction=0.5,
-        seed_z_fraction=0.5,
-        resolution_factor=1.0,
-        stopping_time=15,
-    )
-    ref_result, _ = timed_solve(ref_pkg.AnisotropicFKPPSolver, params)
-    f64_result, _, _ = solve_jax(
-        jax_pkg.AnisotropicFKPPSolver, params, "f64", CPU_DEVICE
-    )
-    report_scalar("stopping_criterion", f64_result.stopping_criterion,
-                  ref_result.stopping_criterion)
-    report_scalar("final_time", f64_result.final_time, ref_result.final_time)
-    report_field(
-        "final_state (float32-eigh-limited)",
-        f64_result.final_state["cell_density"],
-        ref_result.final_state["cell_density"],
-        INFO_DTI_ELONGATE_TOL,
-    )
-
-
 def print_timings() -> None:
     print("\n== wall-clock timings ==")
     print(f"  {'solver':38s} {'implementation':16s} {'1st solve (incl compile)':>26s} "
@@ -332,9 +295,9 @@ def main() -> None:
             rho=0.15,
             gray_matter=gm,
             white_matter=wm,
-            seed_x_fraction=0.5,
-            seed_y_fraction=0.5,
-            seed_z_fraction=0.5,
+            gaussian_seed_x_fraction=0.5,
+            gaussian_seed_y_fraction=0.5,
+            gaussian_seed_z_fraction=0.5,
             resolution_factor=1.0,
             stopping_time=30,
         ),
@@ -353,9 +316,9 @@ def main() -> None:
             nutrient_consumption_rate=0.1,
             gray_matter=gm,
             white_matter=wm,
-            seed_x_fraction=0.5,
-            seed_y_fraction=0.5,
-            seed_z_fraction=0.5,
+            gaussian_seed_x_fraction=0.5,
+            gaussian_seed_y_fraction=0.5,
+            gaussian_seed_z_fraction=0.5,
             resolution_factor=1.0,
             stopping_time=30,
         ),
@@ -369,16 +332,15 @@ def main() -> None:
             diffusivity=0.3,
             rho=0.15,
             diffusion_tensors=tensors,
-            seed_x_fraction=0.5,
-            seed_y_fraction=0.5,
-            seed_z_fraction=0.5,
+            gaussian_seed_x_fraction=0.5,
+            gaussian_seed_y_fraction=0.5,
+            gaussian_seed_z_fraction=0.5,
             resolution_factor=1.0,
             stopping_time=30,
         ),
         ("cell_density",),
     )
     validate_fk_volume_stop()
-    validate_dti_elongated_info()
     print_timings()
 
     print()

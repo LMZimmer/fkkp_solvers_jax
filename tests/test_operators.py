@@ -1,8 +1,11 @@
-"""Each ported device operator vs. its NumPy original (tight tolerance, f64).
+"""Device-operator tests: ports vs. their NumPy originals, plus properties.
 
-The jnp ports are run under a local ``jax.enable_x64()`` scope so the f64
-comparison is meaningful; expected differences are at most a few ULP from
-XLA's transcendental implementations and reduction order.
+Most operators are compared against ``fisher_kpp.operators`` at tight f64
+tolerance; the jnp ports are run under a local ``jax.enable_x64()`` scope so
+the comparison is meaningful, with expected differences at most a few ULP
+from XLA's transcendental implementations and reduction order. The tensor
+elongation operator is instead checked against its documented properties at
+float32 tolerance.
 """
 
 from __future__ import annotations
@@ -128,28 +131,36 @@ def test_tissue_bounding_box_crop_embed() -> None:
 
 
 def test_elongate_tensor_along_principal_axis(tensor_phantom: np.ndarray) -> None:
-    """jnp.linalg.eigh port vs. the torch original.
+    """Trace preserved, max eigenvalue scaled by factor, eigenvectors kept.
 
-    Both implementations cast to float32 before the eigendecomposition, so
-    LAPACK-backend differences bound the achievable agreement: the comparison
-    tolerance is float32-level (rel L2 ~1e-6 observed; 1e-5 asserted), not
-    the f64 tolerance used for the other operators.
+    The operator works in float32, so all assertions use float32-level
+    tolerances (per-voxel errors ~2e-6 observed on the phantom).
     """
-    ours = jax_ops.elongate_tensor_along_principal_axis(tensor_phantom, 1.5)
-    theirs = ref_ops.elongate_tensor_along_principal_axis(tensor_phantom, 1.5)
-    assert ours.dtype == np.float32
-    assert theirs.dtype == np.float32
-    rel_l2 = np.linalg.norm((ours - theirs).ravel()) / np.linalg.norm(
-        theirs.ravel()
-    )
-    assert rel_l2 < 1e-5, rel_l2
-    # NOTE: despite the original's comments, its adjustment sequence does NOT
-    # keep the eigenvalue sum constant (net trace change is +2/3 of the
-    # scaling difference); the port reproduces that quirk, so only the traces
-    # of the two implementations are compared against each other.
+    factor = 1.5
+    out = jax_ops.elongate_tensor_along_principal_axis(tensor_phantom, factor)
+    assert out.dtype == np.float32
+
+    tensors_f32 = tensor_phantom.astype(np.float32)
     np.testing.assert_allclose(
-        np.trace(ours, axis1=-2, axis2=-1),
-        np.trace(theirs, axis1=-2, axis2=-1),
-        rtol=1e-4,
+        np.trace(out, axis1=-2, axis2=-1),
+        np.trace(tensors_f32, axis1=-2, axis2=-1),
+        rtol=0,
         atol=1e-5,
     )
+
+    e_in, v_in = np.linalg.eigh(tensors_f32)
+    e_out = np.linalg.eigvalsh(out)
+    np.testing.assert_allclose(
+        e_out[..., -1], factor * e_in[..., -1], rtol=0, atol=1e-5
+    )
+
+    # In the input eigenbasis the output must be diagonal (eigenvectors
+    # preserved), with the max eigenvalue scaled and half of its increase
+    # subtracted from each of the other two.
+    difference = (factor - 1) * e_in[..., -1:]
+    e_expected = np.concatenate(
+        [e_in[..., :-1] - difference / 2, factor * e_in[..., -1:]], axis=-1
+    )
+    rotated = np.swapaxes(v_in, -2, -1) @ out @ v_in
+    expected = e_expected[..., None, :] * np.eye(3, dtype=np.float32)
+    np.testing.assert_allclose(rotated, expected, rtol=0, atol=1e-5)
