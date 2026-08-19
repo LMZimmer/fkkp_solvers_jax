@@ -13,7 +13,7 @@ scipy==1.18.0
 # Test-only tooling.
 pytest==9.1.1
 
-# The reference package (./fisher-kpp) has an extra import-time dependency of
+# The reference package (./fisher_kpp) has an extra import-time dependency of
 # its own; it was installed into the env only so the comparison tests can run
 # and is deliberately not a dependency of fisher_kpp_jax — see
 # requirements-test.txt.

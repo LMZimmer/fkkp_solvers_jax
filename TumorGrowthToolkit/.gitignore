@@ -1,4 +1,0 @@
-dist/*
-*.pyc
-*.egg-info 
-synthetic_gens/*

@@ -1,5 +1,8 @@
 """Shared fixtures: path setup and small synthetic phantoms.
 
+Tests cover ``fisher_kpp_jax`` only; comparison against the frozen NumPy
+reference package lives in ``scripts/run_reference_solves.py``.
+
 Runnable on CPU: ``JAX_PLATFORMS=cpu pytest tests`` must pass.
 """
 
@@ -11,12 +14,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+# The fisher_kpp_jax package lives at the repo root.
 _ROOT = Path(__file__).resolve().parent.parent
-# The JAX port lives at the repo root; the NumPy reference package lives in
-# the hyphenated ./fisher-kpp project directory.
-for entry in (str(_ROOT), str(_ROOT / "fisher-kpp")):
-    if entry not in sys.path:
-        sys.path.insert(0, entry)
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 PHANTOM_N = 24
 

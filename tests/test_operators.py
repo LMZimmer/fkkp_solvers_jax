@@ -1,11 +1,12 @@
-"""Device-operator tests: ports vs. their NumPy originals, plus properties.
+"""Device-operator tests against independent NumPy specs.
 
-Most operators are compared against ``fisher_kpp.operators`` at tight f64
-tolerance; the jnp ports are run under a local ``jax.enable_x64()`` scope so
-the comparison is meaningful, with expected differences at most a few ULP
-from XLA's transcendental implementations and reduction order. The tensor
-elongation operator is instead checked against its documented properties at
-float32 tolerance.
+Each operator is compared with a small NumPy implementation of its documented
+semantics, written here (``_edge_shift``, ``_diffusion_term_numpy``, the
+analytic Gaussian) — no dependency on the frozen reference package. The jnp
+ports run under a local ``jax.enable_x64()`` scope so comparisons are at
+float64; expected differences are at most a few ULP from XLA transcendentals
+and scaling-order. The tensor elongation operator is checked against its
+documented properties at float32 tolerance.
 """
 
 from __future__ import annotations
@@ -14,10 +15,8 @@ import jax
 import numpy as np
 import pytest
 
-from fisher_kpp import operators as ref_ops
 from fisher_kpp_jax import operators as jax_ops
 
-RNG = np.random.default_rng(7)
 SHAPE = (12, 13, 14)
 SPACING = (1.3, 0.9, 1.1)
 
@@ -27,13 +26,36 @@ def _x64(fn, *args, **kwargs) -> np.ndarray:
         return np.asarray(fn(*args, **kwargs))
 
 
+def _edge_shift(field: np.ndarray, shift: int, axis: int) -> np.ndarray:
+    """Independent spec of edge_roll: unit shift with edge replication."""
+    v = np.moveaxis(field, axis, 0)
+    if shift == 1:
+        shifted = np.concatenate([v[:1], v[:-1]])
+    else:
+        shifted = np.concatenate([v[1:], v[-1:]])
+    return np.moveaxis(shifted, 0, axis)
+
+
+def _diffusion_term_numpy(u: np.ndarray, faces: dict, spacing: tuple) -> np.ndarray:
+    """Independent spec of diffusion_term: divergence of forward-face fluxes
+    with zero flux through the boundary faces."""
+    out = np.zeros_like(u)
+    for axis, (name, h) in enumerate(zip("xyz", spacing)):
+        d = faces[f"minus_{name}"]  # forward face, between cells i and i+1
+        flux = d * (_edge_shift(u, -1, axis) - u)  # zero at the last face
+        div = np.moveaxis(flux.copy(), axis, 0)
+        div[1:] -= np.moveaxis(flux, axis, 0)[:-1]  # backward flux; zero at i=0
+        out += np.moveaxis(div, 0, axis) / (h * h)
+    return out
+
+
 @pytest.mark.parametrize("axis", [0, 1, 2])
 @pytest.mark.parametrize("shift", [1, -1])
 def test_edge_roll(axis: int, shift: int) -> None:
-    field = RNG.random(SHAPE)
+    field = np.random.default_rng(7).random(SHAPE)
     np.testing.assert_array_equal(
         _x64(jax_ops.edge_roll, field, shift, axis),
-        ref_ops.edge_roll(field, shift, axis),
+        _edge_shift(field, shift, axis),
     )
 
 
@@ -45,89 +67,134 @@ def test_edge_roll_rejects_large_shift() -> None:
 
 @pytest.mark.parametrize("axis", [0, 1, 2])
 def test_face_average(axis: int) -> None:
-    field = RNG.random(SHAPE)
-    np.testing.assert_allclose(
+    field = np.random.default_rng(8).random(SHAPE)
+    np.testing.assert_array_equal(
         _x64(jax_ops.face_average, field, axis),
-        ref_ops.face_average(field, axis),
-        rtol=0,
-        atol=0,
+        (field + _edge_shift(field, -1, axis)) / 2,
     )
 
 
 @pytest.mark.parametrize("axis", [0, 1, 2])
 def test_masked_face_average(axis: int) -> None:
-    field = RNG.random(SHAPE)
-    mask = RNG.random(SHAPE) > 0.3
-    np.testing.assert_allclose(
-        _x64(jax_ops.masked_face_average, field, mask, axis),
-        ref_ops.masked_face_average(field, mask, axis),
-        rtol=0,
-        atol=0,
+    rng = np.random.default_rng(9)
+    field = rng.random(SHAPE)
+    mask = rng.random(SHAPE) > 0.3
+    both_valid = mask & _edge_shift(mask, -1, axis)
+    expected = np.where(both_valid, (field + _edge_shift(field, -1, axis)) / 2, 0.0)
+    np.testing.assert_array_equal(
+        _x64(jax_ops.masked_face_average, field, mask, axis), expected
     )
 
 
 def test_diffusion_term() -> None:
-    u = RNG.random(SHAPE)
-    minus = {name: RNG.random(SHAPE) for name in ("x", "y", "z")}
+    rng = np.random.default_rng(10)
+    u = rng.random(SHAPE)
     faces = {}
-    for axis, name in enumerate(("x", "y", "z")):
-        faces[f"minus_{name}"] = minus[name]
-        faces[f"plus_{name}"] = ref_ops.edge_roll(minus[name], 1, axis=axis)
+    for axis, name in enumerate("xyz"):
+        minus = rng.random(SHAPE)
+        faces[f"minus_{name}"] = minus
+        faces[f"plus_{name}"] = _edge_shift(minus, 1, axis)
     ours = _x64(jax_ops.diffusion_term, u, faces, SPACING)
-    theirs = ref_ops.diffusion_term(u, faces, SPACING)
-    np.testing.assert_allclose(ours, theirs, rtol=1e-14, atol=1e-14)
+    expected = _diffusion_term_numpy(u, faces, SPACING)
+    np.testing.assert_allclose(ours, expected, rtol=1e-12, atol=1e-13)
+
+
+def test_diffusion_term_conserves_mass() -> None:
+    """Zero-flux boundaries: the divergence sums to zero over the grid."""
+    rng = np.random.default_rng(11)
+    u = rng.random(SHAPE)
+    faces = {}
+    for axis, name in enumerate("xyz"):
+        minus = rng.random(SHAPE)
+        faces[f"minus_{name}"] = minus
+        faces[f"plus_{name}"] = _edge_shift(minus, 1, axis)
+    term = _x64(jax_ops.diffusion_term, u, faces, SPACING)
+    assert abs(term.sum()) < 1e-11
+
+
+def test_diffusion_term_zero_for_uniform_field() -> None:
+    faces = {}
+    rng = np.random.default_rng(12)
+    for axis, name in enumerate("xyz"):
+        minus = rng.random(SHAPE)
+        faces[f"minus_{name}"] = minus
+        faces[f"plus_{name}"] = _edge_shift(minus, 1, axis)
+    term = _x64(jax_ops.diffusion_term, np.full(SHAPE, 0.7), faces, SPACING)
+    np.testing.assert_array_equal(term, np.zeros(SHAPE))
 
 
 def test_logistic_growth() -> None:
-    u = RNG.random(SHAPE)
+    u = np.random.default_rng(13).random(SHAPE)
     np.testing.assert_allclose(
-        _x64(jax_ops.logistic_growth, u, 0.17),
-        ref_ops.logistic_growth(u, 0.17),
-        rtol=1e-15,
-        atol=0,
+        _x64(jax_ops.logistic_growth, u, 0.17), 0.17 * u * (1 - u), rtol=1e-15
     )
 
 
 def test_logistic_sigmoid() -> None:
-    x = RNG.normal(scale=10.0, size=SHAPE)
+    x = np.random.default_rng(14).normal(scale=10.0, size=SHAPE)
     np.testing.assert_allclose(
-        _x64(jax_ops.logistic_sigmoid, x),
-        ref_ops.logistic_sigmoid(x),
-        rtol=1e-14,
-        atol=0,
+        _x64(jax_ops.logistic_sigmoid, x), 1 / (1 + np.exp(-x)), rtol=1e-14
     )
 
 
-def test_clipped_gaussian() -> None:
+@pytest.mark.parametrize("mass", [jax_ops.GAUSSIAN_SEED_MASS, 2000.0])
+def test_clipped_gaussian(mass: float) -> None:
+    """Analytic heat-kernel profile, floored at 0.1 and capped at 1.
+
+    mass=2000 raises the amplitude above 1 so the cap is exercised too.
+    exp() may differ by ~1 ULP between XLA and libm; the floor/cap clipping
+    thresholds are only crossed well away from these values here.
+    """
     shape = (20, 21, 22)
     center = (10, 9, 11)
     spacing = (1.4, 1.1, 0.8)
+    scale = 1.3
     with jax.enable_x64():
         ours = np.asarray(
             jax_ops.clipped_gaussian(
-                shape, center, spacing, scale=1.3, dtype=np.float64
+                shape, center, spacing, scale=scale, dtype=np.float64, mass=mass
             )
         )
-    theirs = ref_ops.clipped_gaussian(shape, center, spacing, scale=1.3)
-    # exp() may differ by ~1 ULP between XLA and libm; the floor/cap clipping
-    # thresholds are only crossed well away from these values here.
-    np.testing.assert_allclose(ours, theirs, rtol=1e-13, atol=1e-16)
+
+    idx = np.indices(shape, dtype=np.float64)
+    sq = sum(
+        ((idx[a] - center[a]) * spacing[a] / scale) ** 2 for a in range(3)
+    )
+    diffusion_time = jax_ops.GAUSSIAN_SEED_DIFFUSION_TIME
+    amplitude = mass / (4 * np.pi * diffusion_time) ** 1.5
+    expected = amplitude * np.exp(-sq / (4 * diffusion_time))
+    expected[expected <= jax_ops.GAUSSIAN_SEED_FLOOR] = 0.0
+    expected = np.minimum(expected, 1.0)
+    assert (ours == 1.0).any() == (mass == 2000.0)  # cap active only at high mass
+    assert (ours == 0.0).any()  # floor active
+    np.testing.assert_allclose(ours, expected, rtol=1e-13, atol=1e-16)
 
 
-def test_tissue_bounding_box_crop_embed() -> None:
+def test_tissue_bounding_box() -> None:
     mask = np.zeros((16, 17, 18), dtype=bool)
     mask[4:9, 5:7, 10:15] = True
-    ours = jax_ops.tissue_bounding_box(mask, margin=2)
-    theirs = ref_ops.tissue_bounding_box(mask, margin=2)
-    assert ours == theirs
-    field = RNG.random(mask.shape)
-    np.testing.assert_array_equal(
-        jax_ops.crop(field, ours), ref_ops.crop(field, theirs)
-    )
-    np.testing.assert_array_equal(
-        jax_ops.embed(jax_ops.crop(field, ours), ours, mask.shape),
-        ref_ops.embed(ref_ops.crop(field, theirs), theirs, mask.shape),
-    )
+    box = jax_ops.tissue_bounding_box(mask, margin=2)
+    assert box == (slice(2, 11), slice(3, 9), slice(8, 17))
+
+
+def test_tissue_bounding_box_clips_margin_to_bounds() -> None:
+    mask = np.zeros((16, 17, 18), dtype=bool)
+    mask[0:3, 15:17, 0:2] = True
+    box = jax_ops.tissue_bounding_box(mask, margin=2)
+    assert box == (slice(0, 5), slice(13, 17), slice(0, 4))
+
+
+def test_crop_embed_roundtrip() -> None:
+    box = (slice(2, 11), slice(3, 9), slice(8, 17))
+    shape = (16, 17, 18)
+    field = np.random.default_rng(15).random(shape)
+    cropped = jax_ops.crop(field, box)
+    assert cropped.shape == (9, 6, 9)
+    restored = jax_ops.embed(cropped, box, shape)
+    np.testing.assert_array_equal(restored[box], field[box])
+    outside = np.ones(shape, dtype=bool)
+    outside[box] = False
+    assert (restored[outside] == 0).all()
 
 
 def test_elongate_tensor_along_principal_axis(tensor_phantom: np.ndarray) -> None:
