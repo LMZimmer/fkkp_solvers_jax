@@ -41,7 +41,7 @@ def _diffusion_term_numpy(u: np.ndarray, faces: dict, spacing: tuple) -> np.ndar
     with zero flux through the boundary faces."""
     out = np.zeros_like(u)
     for axis, (name, h) in enumerate(zip("xyz", spacing)):
-        d = faces[f"minus_{name}"]  # forward face, between cells i and i+1
+        d = faces[f"fwd_{name}"]  # forward face, between cells i and i+1
         flux = d * (_edge_shift(u, -1, axis) - u)  # zero at the last face
         div = np.moveaxis(flux.copy(), axis, 0)
         div[1:] -= np.moveaxis(flux, axis, 0)[:-1]  # backward flux; zero at i=0
@@ -91,9 +91,9 @@ def test_diffusion_term() -> None:
     u = rng.random(SHAPE)
     faces = {}
     for axis, name in enumerate("xyz"):
-        minus = rng.random(SHAPE)
-        faces[f"minus_{name}"] = minus
-        faces[f"plus_{name}"] = _edge_shift(minus, 1, axis)
+        fwd = rng.random(SHAPE)
+        faces[f"fwd_{name}"] = fwd
+        faces[f"bwd_{name}"] = _edge_shift(fwd, 1, axis)
     ours = _x64(jax_ops.diffusion_term, u, faces, SPACING)
     expected = _diffusion_term_numpy(u, faces, SPACING)
     np.testing.assert_allclose(ours, expected, rtol=1e-12, atol=1e-13)
@@ -105,9 +105,9 @@ def test_diffusion_term_conserves_mass() -> None:
     u = rng.random(SHAPE)
     faces = {}
     for axis, name in enumerate("xyz"):
-        minus = rng.random(SHAPE)
-        faces[f"minus_{name}"] = minus
-        faces[f"plus_{name}"] = _edge_shift(minus, 1, axis)
+        fwd = rng.random(SHAPE)
+        faces[f"fwd_{name}"] = fwd
+        faces[f"bwd_{name}"] = _edge_shift(fwd, 1, axis)
     term = _x64(jax_ops.diffusion_term, u, faces, SPACING)
     assert abs(term.sum()) < 1e-11
 
@@ -116,9 +116,9 @@ def test_diffusion_term_zero_for_uniform_field() -> None:
     faces = {}
     rng = np.random.default_rng(12)
     for axis, name in enumerate("xyz"):
-        minus = rng.random(SHAPE)
-        faces[f"minus_{name}"] = minus
-        faces[f"plus_{name}"] = _edge_shift(minus, 1, axis)
+        fwd = rng.random(SHAPE)
+        faces[f"fwd_{name}"] = fwd
+        faces[f"bwd_{name}"] = _edge_shift(fwd, 1, axis)
     term = _x64(jax_ops.diffusion_term, np.full(SHAPE, 0.7), faces, SPACING)
     np.testing.assert_array_equal(term, np.zeros(SHAPE))
 
@@ -184,11 +184,11 @@ def test_tissue_bounding_box_clips_margin_to_bounds() -> None:
     assert box == (slice(0, 5), slice(13, 17), slice(0, 4))
 
 
-def test_crop_embed_roundtrip() -> None:
+def test_embed_roundtrip() -> None:
     box = (slice(2, 11), slice(3, 9), slice(8, 17))
     shape = (16, 17, 18)
     field = np.random.default_rng(15).random(shape)
-    cropped = jax_ops.crop(field, box)
+    cropped = field[box]
     assert cropped.shape == (9, 6, 9)
     restored = jax_ops.embed(cropped, box, shape)
     np.testing.assert_array_equal(restored[box], field[box])

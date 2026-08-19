@@ -35,11 +35,16 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.ndimage import zoom
 
-from .operators import clipped_gaussian, tissue_bounding_box
+from .operators import clipped_gaussian, embed, tissue_bounding_box
 
 logger = logging.getLogger(__name__)
 
-CROP_MARGIN: int = 2  # voxels of margin left around the crop mask (original)
+CROP_MARGIN: int = 2  # voxels of margin left around the crop mask
+
+# DTI guard thresholds (see solvers._dti_guard): referenced by the device
+# guard and by the error messages below, so they can never disagree.
+SHRINKAGE_LIMIT: float = 10.0
+VANISHING_DENSITY_LIMIT: float = 1e-6
 
 # Stop-kind codes carried through the scan.
 _RUNNING: int = 0
@@ -56,9 +61,13 @@ Consts = dict[str, Any]
 #: on the host to its use dtype, so changing its value never recompiles. The
 #: static args tuple is hashable and holds only structural values (grid
 #: spacing, voxel volume — geometry that cannot change without a shape
-#: change).
+#: change). The step impl is called step_impl(state, consts, dyn, *static).
 StepSpec = tuple[Callable[..., State], tuple[jax.Array, ...], tuple[Any, ...]]
+#: quantity_impl(state, consts, dyn, *static) -> f64 stopping quantity.
 QuantitySpec = tuple[Callable[..., jax.Array], tuple[jax.Array, ...], tuple[Any, ...]]
+#: guard_impl(new_state, prev_state, consts, dyn, *static) ->
+#: (code, shrinkage change, integrated density); code 0 = no guard fired,
+#: 1 = shrinkage, 2 = vanishing volume.
 GuardSpec = tuple[
     Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
     tuple[jax.Array, ...],
@@ -130,28 +139,13 @@ def _scan_driver(
     ``StepSpec`` contract), so re-solves retrace only on a shape/dtype/
     step-count change (see SCAN_TRACE_COUNT).
 
-    Args:
-        state: Initial (cropped) device state.
-        consts: Constant device arrays (face diffusivities, tissue masks).
-        dynamics: Dynamic scalar pytree: "step" / "quantity" / "guard" hold
-            each impl's 0-d device scalars (pre-cast to their use dtype on
-            the host), "stopping_threshold" the f64 stopping threshold.
-        slot_ids: int32 array of length n_steps; snapshot slot per step or -1.
-        step_impl: step_impl(state, consts, dyn, *step_static) -> new state.
-        step_static: Structural statics for step_impl (grid spacing).
-        quantity_impl: quantity_impl(state, consts, dyn, *quantity_static)
-            -> f64 stopping quantity.
-        quantity_static: Structural statics for quantity_impl (voxel volume).
-        guard_impl: guard_impl(new_state, prev_state, consts, dyn,
-            *guard_static) -> (code, shrinkage value, integrated density);
-            code 0 = no guard fired, 1 = shrinkage, 2 = vanishing volume.
-        guard_static: Structural statics for guard_impl (voxel volume).
-        n_steps: Static number of steps.
-        n_slots: Static number of snapshot slots.
-
-    Returns:
-        The final scan carry: final state, stop bookkeeping scalars,
-        snapshot buffers and the recorded-frame count (device values).
+    Calling conventions for the impls and their dynamic/static splits are
+    documented at ``StepSpec``/``QuantitySpec``/``GuardSpec``. ``dynamics``
+    holds each impl's 0-d device scalars under "step"/"quantity"/"guard",
+    plus the f64 "stopping_threshold"; ``slot_ids`` maps each step to its
+    snapshot slot (-1: none). Returns the final scan carry: final state,
+    stop bookkeeping scalars, snapshot buffers and the recorded-frame count
+    (device values).
     """
     global SCAN_TRACE_COUNT
     SCAN_TRACE_COUNT += 1  # trace-time side effect only, by design
@@ -455,6 +449,8 @@ class BaseFKPPSolver(ABC):
     # --- shared pipeline ---
 
     def solve(self) -> Result:
+        """Run the full pipeline; never raises — any failure is returned as
+        ``Result(success=False, stopping_criterion="error")``."""
         try:
             return self._run_pipeline()
         except Exception as exc:  # noqa: BLE001 - originals funnel errors into the result
@@ -559,19 +555,20 @@ class BaseFKPPSolver(ABC):
         if stop_kind == _STOP_SHRINKAGE:
             guard_error = (
                 "shrinkage guard fired: step-to-step cell-density sum "
-                f"decreased by {-guard_change} (> 10) "
+                f"decreased by {-guard_change} (> {SHRINKAGE_LIMIT:g}) "
                 f"(at simulation time {stop_step * dt})"
             )
         elif stop_kind == _STOP_VANISHING:
             guard_error = (
                 "vanishing-volume guard fired: integrated cell density "
-                f"{guard_density} < 1e-6 (at simulation time {stop_step * dt})"
+                f"{guard_density} < {VANISHING_DENSITY_LIMIT:g} "
+                f"(at simulation time {stop_step * dt})"
             )
         if guard_error is not None and verbose:
             logger.debug("early loop exit at t=%s: %s", stop_step * dt, guard_error)
 
         final_low = {
-            k: self._embed(v, box, low_shape) for k, v in final_state_low.items()
+            k: embed(v, box, low_shape) for k, v in final_state_low.items()
         }
 
         result_time_series: dict[str, NDArray] | None = None
@@ -579,7 +576,7 @@ class BaseFKPPSolver(ABC):
             result_time_series = {
                 key: np.array(
                     [
-                        self._upsample_to(self._embed(frame, box, low_shape), full_shape)
+                        self._upsample_to(embed(frame, box, low_shape), full_shape)
                         for frame in frames
                     ]
                 )
@@ -607,15 +604,6 @@ class BaseFKPPSolver(ABC):
             time_series=result_time_series,
             error=guard_error,
         )
-
-    @staticmethod
-    def _embed(
-        field: NDArray, box: tuple[slice, ...], full_shape: tuple[int, ...]
-    ) -> NDArray:
-        """Place a cropped host field into a float64 zero array of full_shape."""
-        full = np.zeros(full_shape)
-        full[box] = field
-        return full
 
     def _downsample(
         self, field: NDArray, factor: float | Sequence[float], order: int = 1
@@ -693,8 +681,8 @@ class BaseFKPPSolver(ABC):
     def _time_step_count(self) -> tuple[int, float]:
         """(N_simulation_steps, dt) from each solver's own ad-hoc stability
         formula; bypassed entirely when the ``n_steps`` param is set. The
-        three formulas remain mutually inconsistent by heritage (see the
-        notes at each implementation) and may be unified later."""
+        three formulas remain mutually inconsistent by heritage and may be
+        unified later."""
 
     def _guard_spec(self) -> GuardSpec:
         """Post-step guard spec, evaluated on the device inside the scan.

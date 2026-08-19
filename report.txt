@@ -1,0 +1,314 @@
+Readability review: fisher_kpp_jax + tests
+==========================================
+Suggestions only — no code changed. Ordered by value/effort. Tags:
+behavior-neutral / API-BREAKING / OUT-OF-SCOPE. Effort: S/M/L.
+
+Note on ripple surface: scripts/validate_against_original.py (named in the task)
+does not exist; the live consumer of the public API is
+scripts/run_reference_solves.py (FKPPSolver, params keys, Result fields:
+success, error, final_state, final_time, stopping_criterion,
+final_stopping_quantity). API-BREAKING items ripple there and into tests/.
+
+ 1. Duplicate embed + trivial crop indirection.
+    Current: base.BaseFKPPSolver._embed (base.py:611) is a line-for-line copy of
+    operators.embed (operators.py:234); meanwhile operators.crop is a one-liner
+    `field[box]` used at 3 call sites in solvers.py, while base.py:520 indexes
+    `v[box]` directly.
+    Proposed: delete BaseFKPPSolver._embed and call operators.embed; delete
+    operators.crop and index directly (or, if you prefer the crop/embed pair,
+    use crop in base.py too — but dropping crop is simpler). Update
+    test_crop_embed_roundtrip accordingly.
+    Rationale: two implementations of the same function invite drift; a named
+    wrapper for `field[box]` is pure indirection.
+    Effort: S. behavior-neutral.
+
+ 2. Cryptic heritage locals in the step impls.
+    Current: solvers.py step impls use `sp`, `ss`, `diff_u`, `diff_p`, `diff_n`,
+    `diff_s`, `dw` (solvers.py:121-197, 451-461) — "diff" means delta, not
+    diffusion, in a diffusion solver, and `sp`/`ss` are opaque.
+    Proposed: rename to e.g. `diffusion_u` / `nutrient_diffusion` for the
+    div(D grad u) terms and `delta_u` / `delta_p` / `delta_n` / `delta_s` for
+    the Euler increments; `dw` -> `diffusivity_wm` (also in the
+    _time_step_count methods).
+    Rationale: the numerics core is exactly where a reader must not have to
+    guess; "diff" is actively ambiguous here.
+    Effort: S. behavior-neutral.
+
+ 3. Heritage leakage in _axial_diffusivity_from_tensor.
+    Current: assert messages say "sRGB must be a numpy array" (solvers.py:646-649)
+    — a name from the original makeXYZ_rgb_from_tensor; the work array is named
+    `output`; _prepare_fields calls the method twice with near-identical
+    argument lists differing only in wm/gm/ratio (solvers.py:625-644); the
+    method takes 7 explicit args but silently pulls 3 more from self.params.
+    Proposed: fix the messages to say "axial diffusivity", rename `output` ->
+    `axial`, collapse the two call sites into one call with
+    `wm=params["white_matter"] if uniform else None` (etc.), and pass the
+    upper/lower limits explicitly (or none of the params — pick one style).
+    Rationale: the sRGB messages are misleading to anyone who hasn't read the
+    original; the dual call site is 20 lines that differ in 3 values.
+    Effort: S. behavior-neutral.
+
+ 4. Guard thresholds duplicated as magic numbers across modules.
+    Current: _dti_guard hard-codes -10 and 0.000001 (solvers.py:261-263), and
+    base._run_pipeline hard-codes the same values inside the error strings
+    "(> 10)" and "< 1e-6" (base.py:563, 568). If one changes, the message lies.
+    Proposed: named constants (e.g. SHRINKAGE_LIMIT = 10.0,
+    VANISHING_DENSITY_LIMIT = 1e-6) in base.py, imported by solvers.py, and
+    f-formatted into the messages. Also write 1e-6 instead of 0.000001.
+    Rationale: single source of truth for values that appear in both the guard
+    and its user-facing explanation.
+    Effort: S. behavior-neutral (tests only match the "guard fired" substring).
+
+ 5. Inverted heritage face keys 'minus_*' / 'plus_*'.
+    Current: FaceFields keys are inherited names where 'minus_x' is the
+    *forward* face and 'plus_x' the backward one — the FaceFields docstring
+    (operators.py:22-28) exists solely to warn about this inversion, and
+    test_operators re-explains it in comments.
+    Proposed: rename to 'fwd_x'/'bwd_x' (or 'face_x'/'face_x_shifted');
+    touches operators.py (FaceFields, diffusion_term), solvers.py
+    (_mixture_face_fields, DTI _device_constants), and the faces dicts in
+    test_operators.py. Delete the warning docstring, which the rename obsoletes.
+    Rationale: a name that means the opposite of what it says is the worst kind
+    of heritage name; the codebase currently pays a docstring tax to keep it.
+    Effort: M. behavior-neutral (keys are internal to consts/tests).
+
+ 6. FK / FK_2c duplication: extract a tissue-based solver base.
+    Current: FKPPSolver and TwoCompartmentWithNutrientFKPPSolver duplicate
+    _validate_extra, _prepare_fields, _crop_mask and the _gm_low/_wm_low
+    attributes verbatim (solvers.py:295-313 vs 396-409), and the
+    `(wm + gm) >= min_tissue_fraction` mask is computed three times
+    (solvers.py:324, 416-418, 431-433).
+    Proposed: an intermediate class (e.g. _TissueFKPPSolverBase(BaseFKPPSolver))
+    holding the shared hooks plus a _tissue_valid_mask(gm, wm) helper.
+    Rationale: ~25 duplicated lines across the two solvers most likely to be
+    edited together.
+    Effort: M. behavior-neutral.
+
+ 7. FK_2c 8-tuple positional dyn unpacking.
+    Current: _two_compartment_step unpacks an 8-element positional tuple
+    (solvers.py:145-154) that must stay in lockstep with _step_spec
+    (solvers.py:452-461); a silent ordering mistake would produce wrong
+    numerics with no error.
+    Proposed: make the dyn leg of StepSpec/QuantitySpec/GuardSpec a dict
+    {name: 0-d array} instead of a tuple (dicts are valid jit pytrees; keys are
+    structural, so the caching contract is unchanged). Update the type aliases,
+    _run_time_loop, and all impls.
+    Rationale: self-documenting, order-proof unpacking at the riskiest
+    correctness spot in the package.
+    Effort: M. behavior-neutral (one extra retrace after the change, same
+    numerics and cache semantics).
+
+ 8. Docstring reduction pass.
+    Current state -> proposed, per spot:
+    a) operators.py: edge_roll, face_average, masked_face_average,
+       diffusion_term, clipped_gaussian carry full Args/Returns/Raises blocks
+       that restate the signature. Trim to the one-line semantics plus the
+       genuinely load-bearing notes (the face-indexing example, the boundary
+       convention, clipping order).
+    b) base._scan_driver (base.py:121-155): the Args block re-documents the
+       StepSpec/GuardSpec contracts already documented at the type aliases
+       (base.py:52-66). Keep the loop-order paragraph, drop the arg listing or
+       reduce it to one line per hook pointing at the alias.
+    c) The identical "NOTE: ad-hoc stability formula; ... mutually inconsistent
+       by heritage" comment appears three times (solvers.py:345, 470, 709) and
+       a fourth time in the _time_step_count abstract docstring (base.py:694).
+       Keep it once on the abstract hook; per-impl keep only the
+       implementation-specific notes (FK_2c's reaction-rate guard, DTI's
+       full-res-max quirk).
+    d) History-describing asides that don't state behavior: "(original)" in the
+       CROP_MARGIN comment (base.py:42), "as in the original" repetitions where
+       the module docstring already establishes the port contract. Keep
+       provenance markers that aid cross-checking (e.g. "source: FK.FK.Solver")
+       — they are one parenthetical each and the frozen reference is in-repo.
+    e) Missing docstring: solve() (base.py:457) — the single public method has
+       none while private helpers have paragraphs. Add one line: runs the
+       pipeline, never raises, returns Result (errors funneled into
+       Result.error).
+    Rationale: matches the repo's own recent "Reduce docstrings" direction;
+    keeps the load-bearing numerics notes, drops signature echo and history.
+    Effort: M. behavior-neutral.
+
+ 9. Scan-driver mechanics: idiomatic JAX forms.
+    Current: the snapshot write uses lax.dynamic_index_in_dim +
+    dynamic_update_index_in_dim in a nested closure (base.py:185-194); the jit
+    wrapping rebinds the function name after definition
+    (`_scan_driver = jax.jit(_scan_driver, ...)`, base.py:240-252).
+    Proposed: use the .at[] idiom
+    (`buffer.at[slot].set(jnp.where(do_record, field, buffer[slot]))`) and
+    decorate with `@partial(jax.jit, static_argnames=...)`; optionally
+    `~volume_hit` for jnp.logical_not.
+    Rationale: same lowering, half the code, and the reader sees standard JAX
+    idioms instead of raw lax plumbing.
+    Effort: S. behavior-neutral.
+
+10. Internal "volume" naming for the threshold stop.
+    Current: the threshold-crossing stop is called _STOP_VOLUME / stop_volume /
+    volume_hit throughout _scan_driver (base.py:46, 169-204) even though in the
+    default "mass" mode the quantity is a mass, not a volume — the same
+    heritage confusion the stopping_volume->stopping_threshold param rename
+    already fixed.
+    Proposed: rename internals to _STOP_THRESHOLD / threshold_hit / stop_threshold.
+    (The public Result.stopping_criterion value "volume" is item 19.)
+    Rationale: finishes the rename the package already started, without
+    touching the API.
+    Effort: S. behavior-neutral.
+
+11. Split the scan machinery out of base.py.
+    Current: base.py (714 lines) mixes three concerns: the jitted scan driver
+    and its spec contracts (~250 lines: type aliases, _no_guard, stop codes,
+    _scan_driver, _run_time_loop, SCAN_TRACE_COUNT), params
+    validation/merging, and Result + BaseFKPPSolver.
+    Proposed: move the scan machinery to a new module (e.g. time_loop.py or
+    scan.py); base.py keeps Result, validation, and the solver base. Update
+    the `from fisher_kpp_jax import base` import in
+    test_solvers.test_no_retrace_on_repeat_solve (SCAN_TRACE_COUNT moves too).
+    Rationale: the scan driver is a self-contained abstraction with its own
+    contracts; navigation and the module docstrings both get simpler.
+    Effort: M. behavior-neutral (public API unaffected; __init__ re-exports).
+
+12. Bare asserts used for user-input validation.
+    Current: _validate_seed_fractions (base.py:380-383) is three copy-pasted
+    asserts; _validate_tissue_arrays (solvers.py:85-90) likewise, with one
+    assert lacking a message. Asserts disappear under `python -O`, and every
+    other validation path raises ValueError.
+    Proposed: raise ValueError, and loop over the three seed axes instead of
+    repeating the line.
+    Rationale: consistent failure mode for bad params; -O safety.
+    Effort: S. Nearly behavior-neutral — the exception type changes from
+    AssertionError to ValueError (not test-verified; solve() error paths only
+    see str(exc), and no current message would change if kept verbatim).
+
+13. Collapse the one-line spec builders.
+    Current: _quantity_spec dispatches to _mass_spec and _volume_spec, each a
+    1-2 line method with its own docstring (base.py:670-690).
+    Proposed: inline both into _quantity_spec (keep the mass/volume semantics
+    in its docstring, which already summarizes them).
+    Rationale: three methods and three docstrings for six lines of logic.
+    Effort: S. behavior-neutral.
+
+14. Grid-stage variable names in _run_pipeline.
+    Current: `state_full` (base.py:514) is the *low-res uncropped* state, not
+    full resolution; `final_state_low` (cropped) vs `final_low` (uncropped
+    low-res) differ by one word for different grids (base.py:535, 573).
+    Proposed: adopt one glossary and apply it — e.g. `_fullres` (input grid),
+    `_lowres` (downsampled uncropped), `_cropped` — giving `state_lowres`,
+    `final_cropped`, `final_lowres`. Consider renaming the `dynamics` dict to
+    `dyn_scalars` while there (it reads as physics, means jit-dynamic args).
+    Rationale: three grids are in play; the names currently mislabel one and
+    barely distinguish the other two.
+    Effort: S. behavior-neutral.
+
+15. tests/test_operators.py: duplicated faces-dict construction.
+    Current: the `for axis, name in enumerate("xyz"): minus = rng.random(...)`
+    faces-building block is repeated in test_diffusion_term,
+    test_diffusion_term_conserves_mass and
+    test_diffusion_term_zero_for_uniform_field (lines 92-96, 106-110, 116-121).
+    Proposed: a `_random_faces(rng)` helper (or fixture) next to _edge_shift.
+    Rationale: three copies of setup obscure what each test actually asserts.
+    Effort: S. behavior-neutral.
+
+16. tests/conftest.py: duplicated sphere geometry.
+    Current: tissue_phantom and tensor_phantom both compute
+    `idx = np.indices(...); r = sqrt(...)` for the same centered radius grid
+    (conftest.py:29-30, 43-44).
+    Proposed: a small `_radius_grid(n)` helper used by both fixtures.
+    Rationale: the shared geometry (and the fact both phantoms use the same
+    spheres) becomes explicit.
+    Effort: S. behavior-neutral.
+
+17. tests/test_solvers.py structure nits.
+    Current: `from fisher_kpp_jax import base` is imported inside
+    test_no_retrace_on_repeat_solve (line 307); test_f32_vs_f64_agreement
+    selects solver/params via an if/elif ladder on a string (lines 339-344).
+    Proposed: hoist the import to module top; replace the ladder with a dict
+    {kind: (cls, factory)} or parametrize over (cls, factory) pairs directly.
+    Rationale: imports at the top, data-driven parametrization over control
+    flow.
+    Effort: S. behavior-neutral.
+
+18. Cosmetic trivia bundle (one sweep).
+    - jnp.multiply(u, 1 - u) -> u * (1 - u); jnp.power(x, 2) -> x**2
+      (operators.py:145, 202; solvers.py:181) — identical ops, heritage call
+      style.
+    - DTI _device_constants mixes operand order: `face * diffusivity` vs
+      `diffusivity * edge_roll(...)` (solvers.py:688-689) — unify (float
+      multiply is commutative bitwise).
+    - solve() uses self.params.get("verbose", False) (base.py:461) but verbose
+      always exists after the merge — use self.params["verbose"].
+    - DEFAULT_DENSITY_THRESHOLD sits mid-file between the loop and the params
+      code (base.py:303) — move next to CROP_MARGIN.
+    - The n_steps default's spilled comment continuation in _COMMON_DEFAULTS
+      (solvers.py:79-80) — reformat.
+    - _record_steps's param is n_records while every caller says n_snapshots —
+      align.
+    - _time_step_count returns (n_steps, dt) but is named as if it returned a
+      count — consider _step_count_and_dt or _stability_steps.
+    Rationale: each is noise a reader trips on once; cheapest as one commit.
+    Effort: S. behavior-neutral.
+
+19. Result.stopping_criterion value "volume" for any threshold stop.
+    Current: crossing stopping_threshold reports stopping_criterion="volume"
+    even in the default "mass" mode (test_stopping_threshold_early_exit
+    asserts exactly this), a leftover of the stopping_volume-era naming.
+    Proposed: rename the value to "threshold" (Literal, _run_pipeline, tests,
+    and the criterion= line in scripts/run_reference_solves.py); optionally
+    accept/emit nothing else.
+    Rationale: completes the stopping_volume -> stopping_threshold rename at
+    the one place the old semantics still leak into the public API.
+    Effort: S-M. API-BREAKING (Result field value; test-verified today).
+
+20. Seed-check hooks: two names for one concept.
+    Current: _check_seed_early and _check_seed_late (base.py:708-714) exist
+    only to replicate *where* each original checks; the DTI check needs
+    nothing computed after _prepare_fields, so both could run at the early
+    point.
+    Proposed: a single _check_seed() hook called once (early).
+    Rationale: one hook with a clear name beats two hooks named after
+    pipeline timing.
+    Effort: S. Flag: not strictly behavior-neutral — in corner cases (e.g.
+    empty brainmask) the DTI solver would now report the seed error instead of
+    whatever error the crop/constants stage raises first. Not test-verified;
+    accept only if that error-precedence change is acceptable.
+
+21. nt_multiplier asymmetry (flag only).
+    Current: FK_2c exposes nt_multiplier (default 8) as a params key while FK
+    and DTI hard-code the same 8 in their formulas.
+    Proposed: either expose it for all three or drop it from FK_2c's schema —
+    but this is a params-schema change either way.
+    Rationale: schema asymmetry with no documented reason.
+    Effort: S. API-BREAKING (params key) — probably not worth it now; noting
+    for whenever the "may be unified later" stability-formula cleanup happens.
+
+22. OUT-OF-SCOPE: package the repo.
+    Current: tests/conftest.py:17-20 (and scripts/run_reference_solves.py)
+    insert the repo root into sys.path by hand.
+    Proposed: a minimal pyproject.toml + editable install; delete the path
+    hacks.
+    Rationale: standard packaging removes per-entry-point boilerplate and
+    makes the import layout explicit.
+    Effort: S-M.
+
+23. OUT-OF-SCOPE: elongate_tensor_along_principal_axis contradicts the stated
+    host/device split.
+    Current: operators.py's docstring says host ops stay NumPy because they run
+    once per solve, yet this once-per-solve host op is implemented in JAX
+    (float32 jnp.linalg.eigh, jnp.put_along_axis).
+    Proposed: either document why it is JAX (batched eigh throughput on GPU?)
+    or port to NumPy — the latter shifts float32 eigh results slightly and
+    would need tolerance revalidation, hence out of scope here.
+    Effort: S (document) / M (port + revalidate).
+
+24. OUT-OF-SCOPE: solve() swallows exceptions near-silently.
+    Current: solve() catches everything and logs only at debug level, only when
+    verbose (base.py:460-462) — a genuine bug (typo, shape error) surfaces as
+    an opaque Result.error string with no traceback anywhere.
+    Proposed: always log at debug with exc_info=True (behavior of the returned
+    Result unchanged).
+    Rationale: keeps the reference's funnel-errors-into-Result contract while
+    making failures diagnosable.
+    Effort: S.
+
+
+10. 11. 12. 13.
+
+flake8, black

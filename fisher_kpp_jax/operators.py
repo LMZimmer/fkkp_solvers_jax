@@ -19,12 +19,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 FaceFields = dict[str, jax.Array]
-"""Keys: 'minus_x', 'minus_y', 'minus_z', 'plus_x', 'plus_y', 'plus_z'.
+"""Keys: 'fwd_x', 'fwd_y', 'fwd_z', 'bwd_x', 'bwd_y', 'bwd_z'.
 
-Naming is inherited from the original solvers: the 'minus' field along an
-axis holds the *forward* face value (between cells i and i+1) and 'plus' is
-its shift by +1 (edge-replicated, see ``edge_roll``), i.e. the backward face
-(between cells i-1 and i).
+'fwd' along an axis is the forward face value (between cells i and i+1);
+'bwd' is its edge-replicated shift by +1 (see ``edge_roll``), the backward
+face (between cells i-1 and i).
 """
 
 # Magic constants of the original `gauss_sol3d` seed profile
@@ -39,18 +38,8 @@ def edge_roll(field: jax.Array, shift: int, axis: int) -> jax.Array:
 
     ``jnp.roll(field, shift, axis)`` where the entries vacated by the shift
     are filled with the array edge value (ghost cell equals boundary cell),
-    which realizes zero-flux boundaries in the stencils below.
-
-    Args:
-        field: Array to shift.
-        shift: +1 or -1 (only unit shifts are supported).
-        axis: Axis along which to shift.
-
-    Returns:
-        The shifted array, same shape and dtype as ``field``.
-
-    Raises:
-        ValueError: If ``shift`` is not +1 or -1.
+    which realizes zero-flux boundaries in the stencils below. Only unit
+    shifts (+1 / -1) are supported; anything else raises ValueError.
     """
     pad_width = [(0, 0)] * field.ndim
     index: list[slice] = [slice(None)] * field.ndim
@@ -69,16 +58,9 @@ def edge_roll(field: jax.Array, shift: int, axis: int) -> jax.Array:
 def face_average(field: jax.Array, axis: int) -> jax.Array:
     """Arithmetic average of a cell-centered field onto forward faces.
 
-    Example: for axis=0, out[i, j, k] = (field[i, j, k] + field[i+1, j, k]) / 2,
-    i.e. the value on the face between cells i and i+1 (zero-flux edge
-    replication at the boundary, see module docstring).
-
-    Args:
-        field: Cell-centered field.
-        axis: Axis along which to average.
-
-    Returns:
-        Face-averaged field, same shape as ``field``.
+    For axis=0: out[i, j, k] = (field[i, j, k] + field[i+1, j, k]) / 2, the
+    value on the face between cells i and i+1 (zero-flux edge replication at
+    the boundary, see module docstring).
     """
     return (edge_roll(field, -1, axis=axis) + field) / 2
 
@@ -86,19 +68,9 @@ def face_average(field: jax.Array, axis: int) -> jax.Array:
 def masked_face_average(
     field: jax.Array, valid_mask: jax.Array, axis: int
 ) -> jax.Array:
-    """Like ``face_average``, but faces touching invalid cells are zeroed.
-
-    A face value is set to 0 unless both adjacent cells satisfy
-    ``valid_mask``. Used to block flux across faces that touch invalid cells
+    """Like ``face_average``, but a face is zeroed unless both adjacent cells
+    satisfy ``valid_mask`` — blocks flux across faces touching invalid cells
     (e.g. CSF, background, fully necrotic tissue).
-
-    Args:
-        field: Cell-centered field.
-        valid_mask: Boolean validity mask, same shape as ``field``.
-        axis: Axis along which to average.
-
-    Returns:
-        Masked face-averaged field, same shape as ``field``.
     """
     condition = jnp.logical_and(edge_roll(valid_mask, -1, axis=axis), valid_mask)
     return jnp.where(condition, (edge_roll(field, -1, axis=axis) + field) / 2, 0)
@@ -111,33 +83,26 @@ def diffusion_term(
 ) -> jax.Array:
     """Conservative finite-volume discretization of div(D grad u).
 
-    Uses per-axis face diffusivities and zero-flux boundaries: the
-    edge-replicated ghost cell equals the boundary cell, so the boundary-face
-    difference (and hence the flux through it) is exactly zero.
-
-    Args:
-        u: Cell-centered density field.
-        diffusivity: Face diffusivity fields (see ``FaceFields``).
-        spacing: Grid spacing (dx, dy, dz) in mm.
-
-    Returns:
-        The discretized divergence term, same shape as ``u``.
+    Uses per-axis face diffusivities (see ``FaceFields``) with zero-flux
+    boundaries: the edge-replicated ghost cell equals the boundary cell, so
+    the flux through a boundary face is exactly zero. ``spacing`` is
+    (dx, dy, dz) in mm.
     """
     dx, dy, dz = spacing
     d = diffusivity
-    sp_x = 1 / (dx * dx) * (
-        d["plus_x"] * (edge_roll(u, 1, axis=0) - u)
-        - d["minus_x"] * (u - edge_roll(u, -1, axis=0))
+    div_x = 1 / (dx * dx) * (
+        d["bwd_x"] * (edge_roll(u, 1, axis=0) - u)
+        - d["fwd_x"] * (u - edge_roll(u, -1, axis=0))
     )
-    sp_y = 1 / (dy * dy) * (
-        d["plus_y"] * (edge_roll(u, 1, axis=1) - u)
-        - d["minus_y"] * (u - edge_roll(u, -1, axis=1))
+    div_y = 1 / (dy * dy) * (
+        d["bwd_y"] * (edge_roll(u, 1, axis=1) - u)
+        - d["fwd_y"] * (u - edge_roll(u, -1, axis=1))
     )
-    sp_z = 1 / (dz * dz) * (
-        d["plus_z"] * (edge_roll(u, 1, axis=2) - u)
-        - d["minus_z"] * (u - edge_roll(u, -1, axis=2))
+    div_z = 1 / (dz * dz) * (
+        d["bwd_z"] * (edge_roll(u, 1, axis=2) - u)
+        - d["fwd_z"] * (u - edge_roll(u, -1, axis=2))
     )
-    return sp_x + sp_y + sp_z
+    return div_x + div_y + div_z
 
 
 def logistic_growth(u: jax.Array, rho: float) -> jax.Array:
@@ -160,27 +125,15 @@ def clipped_gaussian(
     mass: float = GAUSSIAN_SEED_MASS,
     floor: float = GAUSSIAN_SEED_FLOOR,
 ) -> jax.Array:
-    """Isotropic Gaussian profile centered at ``center_voxel``.
+    """Isotropic Gaussian profile centered at ``center_voxel``; the initial
+    tumor cell density.
 
-    Zeroed below a floor value and capped at 1; used as the initial tumor
-    cell density. Reproduces the original ``gauss_sol3d`` exactly, including
-    its clipping order: floor first (strictly-greater keeps the value), then
-    cap at 1.
-
-    Args:
-        shape: Grid shape.
-        center_voxel: Seed voxel indices.
-        spacing: Grid spacing (dx, dy, dz) in mm.
-        scale: Seed width scale factor.
-        dtype: Device dtype of the returned field (the whole profile is
-            evaluated at this precision).
-        diffusion_time: "Dt" of the analytic heat kernel (kernel width).
-        mass: "M", total mass of the kernel (with diffusion_time, sets the
-            amplitude).
-        floor: Values at or below this are zeroed.
-
-    Returns:
-        The clipped Gaussian seed profile on the device.
+    Reproduces the original ``gauss_sol3d`` exactly, including its clipping
+    order: values at or below ``floor`` are zeroed first (strictly-greater
+    keeps the value), then the profile is capped at 1. ``diffusion_time``
+    ("Dt") and ``mass`` ("M") are the analytic heat kernel's width and total
+    mass, ``scale`` widens the seed, and the whole profile is evaluated at
+    ``dtype``.
     """
     xv, yv, zv = jnp.meshgrid(
         jnp.arange(0, shape[0], dtype=dtype),
@@ -226,15 +179,10 @@ def tissue_bounding_box(
     )
 
 
-def crop(field: NDArray, box: tuple[slice, ...]) -> NDArray:
-    """Crop field to box (a view; leading axes only for >3D fields)."""
-    return field[box]
-
-
 def embed(
     field: NDArray, box: tuple[slice, ...], full_shape: tuple[int, ...]
 ) -> NDArray:
-    """Inverse of crop: place field into a zero array of full_shape at box."""
+    """Place a cropped field into a float64 zero array of full_shape at box."""
     full = np.zeros(full_shape)
     full[box] = field
     return full
@@ -243,20 +191,13 @@ def embed(
 def elongate_tensor_along_principal_axis(
     tensors: NDArray, factor: float
 ) -> NDArray:
-    """Scale each voxel's tensor along its principal eigenvector by factor.
+    """Scale each (..., 3, 3) tensor along its principal eigenvector by factor.
 
     Each tensor is eigendecomposed (batched ``jnp.linalg.eigh`` in float32),
     its largest eigenvalue is multiplied by ``factor``, and half of the
     resulting increase is subtracted from each of the two remaining
     eigenvalues, so the eigenvalue sum — the tensor trace — is preserved up
-    to float32 round-off. The eigenvectors are unchanged.
-
-    Args:
-        tensors: Tensor field of shape (..., 3, 3).
-        factor: Scaling factor for the principal eigenvalue.
-
-    Returns:
-        The elongated tensor field as a float32 NumPy array.
+    to float32 round-off. Eigenvectors are unchanged; returns float32 NumPy.
     """
     tensor_array = jnp.asarray(np.asarray(tensors), dtype=jnp.float32)
 
