@@ -170,6 +170,23 @@ def test_stopping_threshold_early_exit(tissue_phantom):
         assert 0 < frames.shape[0] < 6  # truncated by the early exit
 
 
+def test_n_steps_override(tissue_phantom):
+    """An explicit n_steps pins the step count (dt = stopping_time / n_steps),
+    bypassing the stability formula."""
+    gm, wm = tissue_phantom
+    params = fk_params(
+        gm, wm, stopping_time=40, n_steps=2000, stopping_threshold=300.0
+    )
+    result = FKPPSolver(params).solve()
+    assert result.success
+    assert result.stopping_criterion == "volume"
+    # final_time is a whole number of override steps; the stability formula's
+    # own dt (~0.297 here, vs the override's 0.02) would not divide it.
+    n_taken = result.final_time / (40 / 2000)
+    assert 0 < n_taken < 2000
+    assert abs(n_taken - round(n_taken)) < 1e-9
+
+
 def test_dti_guard_exit(tensor_phantom):
     """A shrinking tumor (negative rho) fires a DTI guard: success=False,
     stopping_criterion='error', final_time at the actual exit step."""
@@ -255,6 +272,10 @@ def test_param_validation_errors(tissue_phantom):
         FKPPSolver(fk_params(gm, wm, stopping_mode="occupancy"))
     with pytest.raises(ValueError):
         FKPPSolver(fk_params(gm, wm, precision="f16"))
+    with pytest.raises(ValueError):
+        FKPPSolver(fk_params(gm, wm, n_steps=0))
+    with pytest.raises(ValueError):
+        FKPPSolver(fk_params(gm, wm, n_steps=12.5))
 
 
 def test_volume_stopping_mode(tissue_phantom):

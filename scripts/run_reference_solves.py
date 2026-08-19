@@ -15,17 +15,16 @@ Only the plain FKPP solver is run: the GliODIL config does not define the
 nutrient/necrosis parameters of FK_2c or a DTI tensor field, so the other two
 solvers have no clean parameter mapping and are skipped.
 
-A thin subclass forces two things the solver's parameters cannot express:
+Two parameter choices pin the run to the GliODIL configuration:
 
-  - _time_step_count: the solver derives its own step count from a stability
-    formula and exposes no Nt parameter, so it is pinned to GliODIL's Nt = 4608
-    (dt = 100/4608 days; smaller than the solver's own choice of ~843 steps,
-    so still stable);
-  - _initialize_state: GliODIL's gauss_sol3d seed uses Dt=15, M=1500
-    ("experimentally chosen" there), while TumorGrowthToolkit and both our
-    ports use Dt=5, M=250 — a much narrower, lighter seed (~44% less final
-    mass over this run). gaussian_seed_scale only rescales the width, not the
-    amplitude, so the GliODIL seed is substituted directly.
+  - n_steps=4608: GliODIL's Nt (dt = 100/4608 days; smaller than the
+    solver's own stability choice of ~843 steps, so still stable);
+  - gaussian_seed_diffusion_time=15, gaussian_seed_mass=1500: GliODIL's
+    gauss_sol3d seed ("experimentally chosen" there), much wider and heavier
+    than the TumorGrowthToolkit default of Dt=5, M=250 (which yields ~44%
+    less final mass over this run). The solver evaluates the seed on the
+    device at the state dtype; differences to GliODIL's host float64 profile
+    are at the ULP level.
 
 Inputs: reference_solves/{gm,wm}_pbmap.nii.gz (the patient's tissue
 probability maps). Outputs per run, GliODIL-style with identity affine:
@@ -80,6 +79,10 @@ TH_NECRO = 0.8
 DAYS = 100  # --days of the GliODIL run
 NT = 4608  # --Nt of the GliODIL run, i.e. dt = 100/4608 days
 
+# GliODIL's gauss_sol3d seed profile ("experimentally chosen" there).
+GLIODIL_SEED_DIFFUSION_TIME = 15.0
+GLIODIL_SEED_MASS = 1500.0
+
 # Center of mass of the enhancing core (label 3) at voxel (140, 116, 55),
 # offset by half a voxel so int(pct*N) truncation lands on it (both the
 # generator and our solvers compute the seed voxel as int(fraction * N)).
@@ -119,46 +122,6 @@ def load_tissue_maps() -> tuple[np.ndarray, np.ndarray]:
         path = os.path.join(OUT_DIR, f"{tissue}_pbmap.nii.gz")
         arrays[tissue] = np.asarray(nib.load(path).get_fdata(), dtype=np.float64)
     return arrays["gm"], arrays["wm"]
-
-
-def gliodil_seed(
-    shape: tuple[int, int, int], center: tuple[int, int, int]
-) -> np.ndarray:
-    """GliODIL's gauss_sol3d initial condition, verbatim (Dt=15, M=1500,
-    floored at 0.1, capped at 1), evaluated in float64 on the full grid."""
-    dt_kernel = 15.0
-    mass = 1500.0
-    xv, yv, zv = np.meshgrid(
-        np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]), indexing="ij"
-    )
-    r2 = (
-        (xv - center[0]) ** 2.0 + (yv - center[1]) ** 2.0 + (zv - center[2]) ** 2.0
-    )
-    gauss = mass / np.power(4 * np.pi * dt_kernel, 3 / 2) * np.exp(-r2 / (4 * dt_kernel))
-    gauss = np.where(gauss > 0.1, gauss, 0)
-    return np.where(gauss > 1, np.float64(1), gauss)
-
-
-def gliodil_config(solver_cls: type) -> type:
-    """Subclass pinning what the params cannot express: GliODIL's timestep
-    count and its (wider, heavier) Gaussian seed — see the module docstring."""
-
-    class GliODILConfigSolver(solver_cls):
-        def _time_step_count(self) -> tuple[int, float]:
-            return NT, DAYS / NT
-
-        def _initialize_state(self):
-            state = super()._initialize_state()
-            seed = gliodil_seed(self.grid_shape, self.seed_voxel)
-            import jax.numpy as jnp
-
-            state["cell_density"] = jnp.asarray(
-                seed, dtype=state["cell_density"].dtype
-            )
-            return state
-
-    GliODILConfigSolver.__name__ = f"{solver_cls.__name__}(GliODIL config)"
-    return GliODILConfigSolver
 
 
 def segment(cell_density: np.ndarray) -> np.ndarray:
@@ -209,7 +172,8 @@ def main() -> None:
     emit(
         f"grid: {gm.shape}, seed voxel "
         f"({int(SEED_X_FRACTION * gm.shape[0])}, {int(SEED_Y_FRACTION * gm.shape[1])}, "
-        f"{int(SEED_Z_FRACTION * gm.shape[2])}), GliODIL seed (Dt=15, M=1500)"
+        f"{int(SEED_Z_FRACTION * gm.shape[2])}), GliODIL seed "
+        f"(Dt={GLIODIL_SEED_DIFFUSION_TIME:g}, M={GLIODIL_SEED_MASS:g})"
     )
 
     base_params = {
@@ -223,9 +187,11 @@ def main() -> None:
         "gaussian_seed_z_fraction": SEED_Z_FRACTION,
         "resolution_factor": 1.0,
         "stopping_time": DAYS,
+        "n_steps": NT,
+        "gaussian_seed_diffusion_time": GLIODIL_SEED_DIFFUSION_TIME,
+        "gaussian_seed_mass": GLIODIL_SEED_MASS,
     }
 
-    solver_cls = gliodil_config(jax_pkg.FKPPSolver)
     runs = [("fkpp_jax_f64_cpu", "f64", CPU_DEVICE)]
     if GPU_DEVICE is not None:
         runs.append(("fkpp_jax_f64_gpu", "f64", GPU_DEVICE))
@@ -237,7 +203,7 @@ def main() -> None:
     failures: list[str] = []
     for name, precision, device in runs:
         emit(f"\n== {name} ==")
-        solver = solver_cls({**base_params, "precision": precision})
+        solver = jax_pkg.FKPPSolver({**base_params, "precision": precision})
         wall_start = time.perf_counter()
         cpu_start = cpu_seconds()
         with jax.default_device(device):

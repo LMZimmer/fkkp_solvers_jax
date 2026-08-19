@@ -1,0 +1,31 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Notebooks / editors
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+# NIfTI volumes (solver outputs; tracked reference inputs are unaffected)
+*.nii
+*.nii.gz

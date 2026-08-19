@@ -7,14 +7,11 @@ reaction-rate dt guard, the DTI guard-exit failure semantics, and the
 mutually inconsistent per-solver time-step formulas — all retained).
 
 Port-specific notes:
-  - The device code is purely functional: each solver contributes one fused
-    ``step_fn`` closure; in-place ``u += ...`` updates become explicit
-    functional updates with the same evaluation order.
-  - FK_2c's sequential semantics are made explicit: the necrotic and nutrient
-    updates see the already-updated proliferative field, and the per-step
-    tumor-diffusivity rebuild happens at the top of the next step from the
-    carried (post-step) P and N — identical to the original's effective
-    post-step aliasing behavior.
+  - The device code is purely functional: each solver's step is a
+    module-level impl (see ``StepSpec`` in ``base``); in-place ``u += ...``
+    updates become explicit functional updates with the same evaluation
+    order (FK_2c's sequential/aliasing semantics are documented at
+    ``_two_compartment_step``).
   - Tissue validity masks that are constant in time ((wm+gm) thresholds) are
     computed host-side in float64 and shipped to the device as booleans, so
     they are identical for both precisions; the FK_2c occupancy mask depends
@@ -24,7 +21,6 @@ Port-specific notes:
 from __future__ import annotations
 
 import logging
-import warnings
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
@@ -38,7 +34,6 @@ from .base import (
     BaseFKPPSolver,
     Consts,
     GuardSpec,
-    QuantitySpec,
     State,
     StepSpec,
 )
@@ -47,7 +42,6 @@ from .operators import (
     GAUSSIAN_SEED_FLOOR,
     GAUSSIAN_SEED_MASS,
     FaceFields,
-    clipped_gaussian,
     crop,
     diffusion_term,
     edge_roll,
@@ -82,78 +76,11 @@ _COMMON_DEFAULTS: dict[str, Any] = {
     "stopping_mode": "mass",
     "density_threshold": None,  # only valid with stopping_mode="volume"
     "n_time_series_snapshots": None,
+    "n_steps": None,  # explicit step count (dt = stopping_time / n_steps);
+    #                   None -> the solver's own stability formula
     "verbose": False,
     "precision": "f32",  # device state dtype: "f32" (default) or "f64"
 }
-
-DEFAULT_DENSITY_THRESHOLD: float = 0.5
-
-
-def _merge_params(
-    params: Mapping[str, Any],
-    required: frozenset[str],
-    defaults: Mapping[str, Any],
-    solver_name: str,
-) -> dict[str, Any]:
-    """Strict parameter merge: unknown keys and missing required keys raise.
-
-    ``stopping_volume`` is accepted as a deprecated alias of
-    ``stopping_threshold`` (the quantity it thresholds is only a physical
-    volume in "volume" mode); supplying both raises.
-    """
-    params = dict(params)
-    if "stopping_volume" in params:
-        if "stopping_threshold" in params:
-            raise ValueError(
-                f"{solver_name}: pass only one of 'stopping_threshold' and its "
-                "deprecated alias 'stopping_volume'"
-            )
-        warnings.warn(
-            f"{solver_name}: 'stopping_volume' is deprecated, use "
-            "'stopping_threshold' (identical semantics)",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        params["stopping_threshold"] = params.pop("stopping_volume")
-    unknown = sorted(set(params) - required - set(defaults))
-    if unknown:
-        raise ValueError(f"{solver_name}: unknown parameter(s): {unknown}")
-    missing = sorted(required - set(params))
-    if missing:
-        raise KeyError(f"{solver_name}: missing required parameter(s): {missing}")
-    merged = dict(defaults)
-    merged.update(params)
-    _validate_stopping_params(merged, solver_name)
-    if merged["precision"] not in ("f32", "f64"):
-        raise ValueError(
-            f"{solver_name}: precision must be 'f32' or 'f64', "
-            f"got {merged['precision']!r}"
-        )
-    return merged
-
-
-def _validate_stopping_params(merged: dict[str, Any], solver_name: str) -> None:
-    """stopping_mode / density_threshold validation, shared by all solvers.
-
-    "mass" (the default) reproduces the original solvers' stopping behavior
-    (modulo the FK_2c voxel-volume fix): an integrated cell density, not a
-    physical volume. density_threshold is only meaningful for "volume" mode
-    and is rejected otherwise (no silent unused parameters).
-    """
-    mode = merged["stopping_mode"]
-    if mode not in ("mass", "volume"):
-        raise ValueError(
-            f"{solver_name}: stopping_mode must be 'mass' or 'volume', got {mode!r}"
-        )
-    if mode == "mass":
-        if merged["density_threshold"] is not None:
-            raise ValueError(
-                f"{solver_name}: density_threshold is only valid with "
-                "stopping_mode='volume'"
-            )
-    elif merged["density_threshold"] is None:
-        merged["density_threshold"] = DEFAULT_DENSITY_THRESHOLD
-
 
 def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
     assert isinstance(gm, np.ndarray), "gray_matter must be a numpy array"
@@ -161,12 +88,6 @@ def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
     assert gm.ndim == 3, "gray_matter must be a 3D numpy array"
     assert wm.ndim == 3, "white_matter must be a 3D numpy array"
     assert gm.shape == wm.shape
-
-
-def _validate_seed_fractions(params: Mapping[str, Any]) -> None:
-    assert 0 <= params["gaussian_seed_x_fraction"] <= 1, "gaussian_seed_x_fraction must be between 0 and 1"
-    assert 0 <= params["gaussian_seed_y_fraction"] <= 1, "gaussian_seed_y_fraction must be between 0 and 1"
-    assert 0 <= params["gaussian_seed_z_fraction"] <= 1, "gaussian_seed_z_fraction must be between 0 and 1"
 
 
 def _mixture_face_fields(
@@ -204,8 +125,7 @@ def _single_field_step(
     spacing: tuple[float, float, float],
 ) -> State:
     """One Euler step of the single-field solvers (FK and DTI): the face
-    diffusivities are constant in time and come from consts; dt and rho are
-    dynamic 0-d scalars at the state dtype (see BaseFKPPSolver._step_spec)."""
+    diffusivities are constant in time and come from consts."""
     dt, rho = dyn
     u = state["cell_density"]
     sp = diffusion_term(u, consts["faces"], spacing)
@@ -219,10 +139,9 @@ def _two_compartment_step(
     dyn: tuple[jax.Array, ...],
     spacing: tuple[float, float, float],
 ) -> State:
-    """One Euler step of the P/N/S system, sequential as in the original.
-
-    All physical scalars arrive as dynamic 0-d device scalars at the state
-    dtype, so parameter changes never recompile the scan."""
+    """One Euler step of the P/N/S system, sequential as in the original:
+    the necrotic and nutrient updates see the already-updated proliferative
+    field."""
     (
         dt,
         dw,
@@ -291,8 +210,8 @@ def _mass_pn(
 ) -> jax.Array:
     """FK_2c integrated cell density: voxel_volume * (sum(P) + sum(N)), in
     f64. The voxel-volume factor multiplies BOTH terms; the original FK_2c
-    dropped it on the necrotic term (mixed units), so this intentionally
-    deviates — see TwoCompartmentWithNutrientFKPPSolver."""
+    dropped it on the necrotic term (mixed units) — an intentional deviation
+    whenever a finite stopping_threshold is set in "mass" mode."""
     del consts, dyn
     return voxel_volume * (
         jnp.sum(state["proliferative"], dtype=jnp.float64)
@@ -370,15 +289,14 @@ class FKPPSolver(BaseFKPPSolver):
         **_COMMON_DEFAULTS,
         "min_tissue_fraction": 0.1,
     }
+    _mass_impl = staticmethod(_mass_single)
+    _volume_impl = staticmethod(_volume_single)
 
     _gm_low: NDArray
     _wm_low: NDArray
 
-    def _validate_params(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
-        merged = _merge_params(params, self._REQUIRED, self._DEFAULTS, type(self).__name__)
-        _validate_tissue_arrays(merged["gray_matter"], merged["white_matter"])
-        _validate_seed_fractions(merged)
-        return merged
+    def _validate_extra(self, params: Mapping[str, Any]) -> None:
+        _validate_tissue_arrays(params["gray_matter"], params["white_matter"])
 
     def _prepare_fields(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         factor = self.params["resolution_factor"]
@@ -395,26 +313,14 @@ class FKPPSolver(BaseFKPPSolver):
         return (self._gm_low + self._wm_low) >= CROP_TISSUE_THRESHOLD
 
     def _initialize_state(self) -> State:
-        return {
-            "cell_density": clipped_gaussian(
-                self.grid_shape,
-                self.seed_voxel,
-                self.grid_spacing,
-                scale=self.params["gaussian_seed_scale"],
-                dtype=self._dtype,
-                diffusion_time=self.params["gaussian_seed_diffusion_time"],
-                mass=self.params["gaussian_seed_mass"],
-                floor=self.params["gaussian_seed_floor"],
-            )
-        }
+        return {"cell_density": self._gaussian_seed()}
 
     def _device_constants(self, dt: float) -> Consts:
         del dt
         assert self._crop_box is not None
         gm_host = crop(self._gm_low, self._crop_box)
         wm_host = crop(self._wm_low, self._crop_box)
-        # Constant-in-time validity mask, computed host-side in float64 so it
-        # is identical for both precisions (matches the f64 original).
+        # Time-constant validity mask, host-side in f64 (see module docstring).
         valid_host = (wm_host + gm_host) >= float(self.params["min_tissue_fraction"])
         gm = jnp.asarray(gm_host, dtype=self._dtype)
         wm = jnp.asarray(wm_host, dtype=self._dtype)
@@ -430,15 +336,6 @@ class FKPPSolver(BaseFKPPSolver):
     def _step_spec(self, dt: float) -> StepSpec:
         dyn = (self._dyn_scalar(dt), self._dyn_scalar(self.params["rho"]))
         return _single_field_step, dyn, (self.grid_spacing,)
-
-    def _mass_spec(self) -> QuantitySpec:
-        # "mass" stopping mode: integrated cell density, reproducing the
-        # original FK stopping quantity exactly. Not a physical volume.
-        return _mass_single, (), (self.voxel_volume,)
-
-    def _volume_spec(self) -> QuantitySpec:
-        dyn = (self._dyn_scalar(self.params["density_threshold"]),)
-        return _volume_single, dyn, (self.voxel_volume,)
 
     def _time_step_count(self) -> tuple[int, float]:
         stopping_time = self.params["stopping_time"]
@@ -462,22 +359,13 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
 
     State keys: 'proliferative', 'necrotic', 'nutrient'. Tumor diffusivity
     faces are additionally masked where proliferative + necrotic exceeds
-    max_tumor_occupancy and are rebuilt every step. The nutrient diffuses
-    with nutrient_diffusivity, masked by tissue only, built once.
+    max_tumor_occupancy and are rebuilt every step from the carried state
+    (see ``_two_compartment_step`` for the aliasing semantics this
+    reproduces). The nutrient diffuses with nutrient_diffusivity, masked by
+    tissue only, built once.
 
-    Stopping quantity in "mass" mode: voxel_volume * (sum(P) + sum(N)).
-    This fixes the original FK_2c formula, which dropped the voxel-volume
-    factor on the necrotic term (mixing units), so "mass"-mode stopping
-    behavior intentionally differs from FK_2c whenever a finite
-    stopping_threshold is set. As in the other solvers, "mass" is an integrated
-    cell density (the original behavior modulo this fix), not a physical
-    volume; the nutrient field S is never included.
-
-    Aliasing note: the per-step tumor diffusivity rebuild uses the POST-step
-    P and N fields. In this functional port that is explicit: the rebuild
-    happens at the top of ``step`` from the carried state, which is the
-    previous step's post-update state (the initial state on the first step) —
-    exactly the reference pipeline's effective behavior.
+    The "mass" stopping quantity intentionally fixes the original FK_2c's
+    dropped voxel-volume factor on the necrotic term — see ``_mass_pn``.
     """
 
     _REQUIRED: ClassVar[frozenset[str]] = frozenset(
@@ -502,15 +390,14 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         "max_tumor_occupancy": 0.9,
         "nt_multiplier": 8,
     }
+    _mass_impl = staticmethod(_mass_pn)
+    _volume_impl = staticmethod(_volume_pn)
 
     _gm_low: NDArray
     _wm_low: NDArray
 
-    def _validate_params(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
-        merged = _merge_params(params, self._REQUIRED, self._DEFAULTS, type(self).__name__)
-        _validate_tissue_arrays(merged["gray_matter"], merged["white_matter"])
-        _validate_seed_fractions(merged)
-        return merged
+    def _validate_extra(self, params: Mapping[str, Any]) -> None:
+        _validate_tissue_arrays(params["gray_matter"], params["white_matter"])
 
     def _prepare_fields(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         factor = self.params["resolution_factor"]
@@ -522,20 +409,10 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         return (self._gm_low + self._wm_low) >= CROP_TISSUE_THRESHOLD
 
     def _initialize_state(self) -> State:
-        proliferative = clipped_gaussian(
-            self.grid_shape,
-            self.seed_voxel,
-            self.grid_spacing,
-            scale=self.params["gaussian_seed_scale"],
-            dtype=self._dtype,
-            diffusion_time=self.params["gaussian_seed_diffusion_time"],
-            mass=self.params["gaussian_seed_mass"],
-            floor=self.params["gaussian_seed_floor"],
-        )
+        proliferative = self._gaussian_seed()
         necrotic = jnp.zeros(proliferative.shape, dtype=self._dtype)
         nutrient = jnp.ones(proliferative.shape, dtype=self._dtype)
-        # remove CSF from the nutrient field (tissue mask in host float64,
-        # identical for both precisions)
+        # remove CSF from the nutrient field (host-side f64 tissue mask)
         tissue_host = (self._wm_low + self._gm_low) >= float(
             self.params["min_tissue_fraction"]
         )
@@ -583,15 +460,6 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             self._dyn_scalar(self.params["max_tumor_occupancy"]),
         )
         return _two_compartment_step, dyn, (self.grid_spacing,)
-
-    def _mass_spec(self) -> QuantitySpec:
-        # "mass" stopping mode with the voxel-volume fix; see _mass_pn and
-        # the class docstring.
-        return _mass_pn, (), (self.voxel_volume,)
-
-    def _volume_spec(self) -> QuantitySpec:
-        dyn = (self._dyn_scalar(self.params["density_threshold"]),)
-        return _volume_pn, dyn, (self.voxel_volume,)
 
     def _time_step_count(self) -> tuple[int, float]:
         stopping_time = self.params["stopping_time"]
@@ -651,22 +519,21 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         "diffusivity_upper_limit": 2,
         "diffusivity_lower_limit": 0,
     }
+    _mass_impl = staticmethod(_mass_single)
+    _volume_impl = staticmethod(_volume_single)
 
     _axial_low: NDArray
     _axial_full_max: float
     _brainmask: NDArray
 
-    def _validate_params(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
-        merged = _merge_params(params, self._REQUIRED, self._DEFAULTS, type(self).__name__)
-        _validate_seed_fractions(merged)
-        if merged["uniform_gray_matter"] and (
-            merged["gray_matter"] is None or merged["white_matter"] is None
+    def _validate_extra(self, params: Mapping[str, Any]) -> None:
+        if params["uniform_gray_matter"] and (
+            params["gray_matter"] is None or params["white_matter"] is None
         ):
             raise KeyError(
                 "AnisotropicFKPPSolver: uniform_gray_matter=True requires "
                 "gray_matter and white_matter"
             )
-        return merged
 
     def _axial_diffusivity_from_tensor(
         self,
@@ -783,9 +650,6 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
 
         factor = params["resolution_factor"]
         low = self._downsample(axial, [factor, factor, factor, 1])
-        # NOTE(ported): the original also computed a second, double-zoomed
-        # brainmask here at threshold 1e-6 (`brainmask_low_res`) that is never
-        # used; that dead computation is dropped (as in the reference).
         low[low <= 0] = 0
         self._axial_low = low
         # The Nt stability formula uses the max of the FULL-resolution field,
@@ -804,16 +668,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             raise ValueError("Origin not within brainmask")
 
     def _initialize_state(self) -> State:
-        cell_density = clipped_gaussian(
-            self.grid_shape,
-            self.seed_voxel,
-            self.grid_spacing,
-            scale=self.params["gaussian_seed_scale"],
-            dtype=self._dtype,
-            diffusion_time=self.params["gaussian_seed_diffusion_time"],
-            mass=self.params["gaussian_seed_mass"],
-            floor=self.params["gaussian_seed_floor"],
-        )
+        cell_density = self._gaussian_seed()
         if self.params["verbose"]:
             logger.debug(
                 "init: %s, volume of initial tumor: %s",
@@ -845,15 +700,6 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         stopping_criterion="error") with final_time at the actual exit step.
         """
         return _dti_guard, (), (self.voxel_volume,)
-
-    def _mass_spec(self) -> QuantitySpec:
-        # "mass" stopping mode: integrated cell density, reproducing the
-        # original DTI stopping quantity exactly. Not a physical volume.
-        return _mass_single, (), (self.voxel_volume,)
-
-    def _volume_spec(self) -> QuantitySpec:
-        dyn = (self._dyn_scalar(self.params["density_threshold"]),)
-        return _volume_single, dyn, (self.voxel_volume,)
 
     def _time_step_count(self) -> tuple[int, float]:
         stopping_time = self.params["stopping_time"]
