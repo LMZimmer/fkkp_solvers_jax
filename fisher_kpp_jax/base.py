@@ -12,12 +12,12 @@ computation and the final embed/upsample stay on the host in NumPy
 (``scipy.ndimage.zoom`` is deliberate — ``jax.image.resize`` is not
 numerically equivalent and must not replace it). State initialization, face-diffusivity construction and the time
 loop run on the device; the loop is compiled once per cropped shape (see
-``time_loop._scan_driver``), and x64 is enabled locally around the device
+``operators._scan_driver``), and x64 is enabled locally around the device
 portion — never globally at import.
 
 Stopping semantics are documented on ``Result`` and the ``_quantity_spec``
 hook; the dynamic/static argument contract that keeps re-solves from
-recompiling is documented at ``time_loop.StepSpec``.
+recompiling is documented at ``operators.StepSpec``.
 """
 
 from __future__ import annotations
@@ -35,8 +35,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.ndimage import zoom
 
-from .operators import clipped_gaussian, embed, tissue_bounding_box
-from .time_loop import (
+from .operators import (
     Consts,
     GuardSpec,
     QuantitySpec,
@@ -50,6 +49,9 @@ from .time_loop import (
     _STOP_VANISHING,
     _no_guard,
     _run_time_loop,
+    clipped_gaussian,
+    embed,
+    tissue_bounding_box,
 )
 
 logger = logging.getLogger(__name__)

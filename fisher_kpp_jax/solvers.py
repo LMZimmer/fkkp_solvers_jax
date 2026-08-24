@@ -2,7 +2,7 @@
 
 Implementation notes:
   - The device code is purely functional: each solver's step is a
-    module-level impl (see ``time_loop.StepSpec``); the two-compartment
+    module-level impl (see ``operators.StepSpec``); the two-compartment
     step's deliberately sequential update order is documented at
     ``_two_compartment_step``.
   - Tissue validity masks that are constant in time ((wm+gm) thresholds) are
@@ -29,7 +29,13 @@ from .operators import (
     GAUSSIAN_SEED_DIFFUSION_TIME,
     GAUSSIAN_SEED_FLOOR,
     GAUSSIAN_SEED_MASS,
+    SHRINKAGE_LIMIT,
+    VANISHING_DENSITY_LIMIT,
+    Consts,
     FaceFields,
+    GuardSpec,
+    State,
+    StepSpec,
     diffusion_term,
     edge_shift,
     elongate_tensor_along_principal_axis,
@@ -37,14 +43,6 @@ from .operators import (
     logistic_growth,
     logistic_sigmoid,
     masked_face_average,
-)
-from .time_loop import (
-    Consts,
-    GuardSpec,
-    SHRINKAGE_LIMIT,
-    State,
-    StepSpec,
-    VANISHING_DENSITY_LIMIT,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,7 +110,7 @@ def _mixture_face_fields(
 
 
 # --- module-level device impls (stable identity so the jitted scan driver's
-# --- cache persists across solves; see time_loop._scan_driver) ---
+# --- cache persists across solves; see operators._scan_driver) ---
 
 
 def _single_field_step(
