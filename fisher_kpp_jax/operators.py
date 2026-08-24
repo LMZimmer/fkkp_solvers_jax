@@ -26,6 +26,21 @@ GAUSSIAN_SEED_DIFFUSION_TIME: float = 5.0  # width of the analytic heat kernel
 GAUSSIAN_SEED_MASS: float = 250.0  # total mass of the kernel
 GAUSSIAN_SEED_FLOOR: float = 0.1  # values at or below this are zeroed
 
+# DTI guard thresholds (see solvers._dti_guard): referenced by the device
+# guard and by base's error messages, so they can never disagree.
+SHRINKAGE_LIMIT: float = 10.0
+VANISHING_DENSITY_LIMIT: float = 1e-6
+
+# Stop-kind codes carried through the scan.
+_RUNNING: int = 0
+_STOP_THRESHOLD: int = 1
+_STOP_SHRINKAGE: int = 2
+_STOP_VANISHING: int = 3
+
+SCAN_TRACE_COUNT: int = 0
+"""Number of times the time scan has been traced in this process
+(diagnostic: identical consecutive solves must not increase it)."""
+
 
 class StepSpec(TypedDict):
     """Step specification for the jitted time loop.
@@ -365,21 +380,6 @@ def elongate_tensor_along_principal_axis(
 
 # --- jitted time loop ---
 
-# DTI guard thresholds (see solvers._dti_guard): referenced by the device
-# guard and by base's error messages, so they can never disagree.
-SHRINKAGE_LIMIT: float = 10.0
-VANISHING_DENSITY_LIMIT: float = 1e-6
-
-# Stop-kind codes carried through the scan.
-_RUNNING: int = 0
-_STOP_THRESHOLD: int = 1
-_STOP_SHRINKAGE: int = 2
-_STOP_VANISHING: int = 3
-
-SCAN_TRACE_COUNT: int = 0
-"""Number of times the time scan has been traced in this process
-(diagnostic: identical consecutive solves must not increase it)."""
-
 
 def _no_guard(
     new_state: dict[str, jax.Array],
@@ -392,6 +392,97 @@ def _no_guard(
     zero_i = jnp.asarray(0, dtype=jnp.int32)
     zero_f = jnp.asarray(0.0, dtype=jnp.float64)
     return zero_i, zero_f, zero_f
+
+
+def _time_step(
+    carry: dict[str, Any],
+    x: tuple[jax.Array, jax.Array],
+    *,
+    step_func: Callable[..., dict[str, jax.Array]],
+    quantity_func: Callable[..., jax.Array],
+    guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
+    constants: dict[str, Any],
+    dynamic_args: dict[str, Any],
+    step_static: tuple[Any, ...],
+    quantity_static: tuple[Any, ...],
+    guard_static: tuple[Any, ...],
+    n_slots: int,
+) -> tuple[dict[str, Any], None]:
+    """
+    Perform one time step of the scan: the scan body of ``_run_time_scan``,
+    which binds every keyword argument with ``functools.partial`` so that
+    ``lax.scan`` calls this as f(carry, x).
+
+    The operation order is fixed -- results depend on it: step ->
+    stopping quantity -> threshold-stop check (priority) -> guard check ->
+    snapshot recording (skipped at a break step).
+
+    Args:
+        carry: The loop state, see ``_run_time_scan``'s Returns.
+        x: Per-step scan inputs (step index, snapshot slot).
+
+    Returns:
+        (next carry, None): scan carries the loop state; nothing is
+        emitted per step.
+    """
+    t, slot = x
+    prev = carry["state"]
+    active = carry["active"]
+    new_state = step_func(
+        prev, constants, dynamic_args["step"], *step_static
+    )
+    quantity = quantity_func(
+        new_state, constants, dynamic_args["quantity"], *quantity_static
+    )
+    threshold_hit = quantity >= dynamic_args["stopping_threshold"]
+    guard_code, guard_mass_change, guard_density = guard_func(
+        new_state, prev, constants, dynamic_args["guard"], *guard_static
+    )
+
+    stop_threshold = active & threshold_hit
+    stop_guard = active & jnp.logical_not(threshold_hit) & (guard_code > 0)
+    stopped_now = stop_threshold | stop_guard
+    # Recording happens after both stop checks, so a break step is never
+    # snapshotted.
+    do_record = active & jnp.logical_not(stopped_now) & (slot >= 0)
+
+    buffers = carry["buffers"]
+    if n_slots > 0:
+        slot_clipped = jnp.clip(slot, 0, n_slots - 1)
+        buffers = {
+            k: buf.at[slot_clipped].set(
+                jnp.where(do_record, new_state[k], buf[slot_clipped])
+            )
+            for k, buf in buffers.items()
+        }
+
+    stop_kind = jnp.where(
+        stop_threshold,
+        _STOP_THRESHOLD,
+        jnp.where(
+            stop_guard,
+            jnp.where(guard_code == 1, _STOP_SHRINKAGE, _STOP_VANISHING),
+            carry["stop_kind"],
+        ),
+    )
+    next_carry = {
+        "state": {k: jnp.where(active, new_state[k], prev[k]) for k in new_state},
+        "active": active & jnp.logical_not(stopped_now),
+        "stop_kind": stop_kind,
+        "stop_step": jnp.where(stopped_now, t, carry["stop_step"]),
+        # The loop's last computed stopping quantity: frozen at the value
+        # of the stopping step once the loop is done.
+        "quantity": jnp.where(active, quantity, carry["quantity"]),
+        "guard_mass_change": jnp.where(
+            stop_guard, guard_mass_change, carry["guard_mass_change"]
+        ),
+        "guard_density": jnp.where(
+            stop_guard, guard_density, carry["guard_density"]
+        ),
+        "n_recorded": carry["n_recorded"] + do_record.astype(jnp.int32),
+        "buffers": buffers,
+    }
+    return next_carry, None
 
 
 @partial(
@@ -425,16 +516,12 @@ def _run_time_scan(
     """
     Run the explicit-Euler time loop as one jitted ``lax.scan``.
 
-    The loop body order is fixed -- results depend on it: step -> per-step
-    quantities -> threshold-stop check (priority) -> guard check -> snapshot
-    recording (skipped at a break step). After a stop, every remaining scan
+    The loop length is fixed. After a stop, every remaining scan
     iteration is a masked no-op.
 
-    This is a single module-level jitted function: the step, quantity and
-    guard functions and their static argument tuples are stable across
-    solves, while device arrays and physical scalars are dynamic arguments
-    (see ``StepSpec``), so re-solves retrace
-    only on a shape/dtype/step-count change (see SCAN_TRACE_COUNT).
+    The step, quantity and guard functions and their static argument tuples
+    are stable across solves, while device arrays and physical scalars are
+    dynamic arguments (see ``StepSpec``).
 
     Args:
         state: Initial device state on the cropped grid.
@@ -466,70 +553,23 @@ def _run_time_scan(
         'buffers' / 'n_recorded' (per-field snapshot arrays of shape
         (n_slots, *field_shape) and the number of frames written).
     """
-    global SCAN_TRACE_COUNT
-    SCAN_TRACE_COUNT += 1  # incremented once per trace (diagnostic)
+    global SCAN_TRACE_COUNT  # diagnostic, incremented once per compile
+    SCAN_TRACE_COUNT += 1
 
     xs = (jnp.arange(n_steps, dtype=jnp.int32), slot_ids)
 
-    def body(carry: dict[str, Any], x: tuple[jax.Array, jax.Array]):
-        t, slot = x
-        prev = carry["state"]
-        active = carry["active"]
-        new_state = step_func(
-            prev, constants, dynamic_args["step"], *step_static
-        )
-        quantity = quantity_func(
-            new_state, constants, dynamic_args["quantity"], *quantity_static
-        )
-        threshold_hit = quantity >= dynamic_args["stopping_threshold"]
-        guard_code, guard_mass_change, guard_density = guard_func(
-            new_state, prev, constants, dynamic_args["guard"], *guard_static
-        )
-
-        stop_threshold = active & threshold_hit
-        stop_guard = active & jnp.logical_not(threshold_hit) & (guard_code > 0)
-        stopped_now = stop_threshold | stop_guard
-        # Recording happens after both stop checks, so a break step is never
-        # snapshotted.
-        do_record = active & jnp.logical_not(stopped_now) & (slot >= 0)
-
-        buffers = carry["buffers"]
-        if n_slots > 0:
-            slot_clipped = jnp.clip(slot, 0, n_slots - 1)
-            buffers = {
-                k: buf.at[slot_clipped].set(
-                    jnp.where(do_record, new_state[k], buf[slot_clipped])
-                )
-                for k, buf in buffers.items()
-            }
-
-        stop_kind = jnp.where(
-            stop_threshold,
-            _STOP_THRESHOLD,
-            jnp.where(
-                stop_guard,
-                jnp.where(guard_code == 1, _STOP_SHRINKAGE, _STOP_VANISHING),
-                carry["stop_kind"],
-            ),
-        )
-        next_carry = {
-            "state": {k: jnp.where(active, new_state[k], prev[k]) for k in new_state},
-            "active": active & jnp.logical_not(stopped_now),
-            "stop_kind": stop_kind,
-            "stop_step": jnp.where(stopped_now, t, carry["stop_step"]),
-            # The loop's last computed stopping quantity: frozen at the value
-            # of the stopping step once the loop is done.
-            "quantity": jnp.where(active, quantity, carry["quantity"]),
-            "guard_mass_change": jnp.where(
-                stop_guard, guard_mass_change, carry["guard_mass_change"]
-            ),
-            "guard_density": jnp.where(
-                stop_guard, guard_density, carry["guard_density"]
-            ),
-            "n_recorded": carry["n_recorded"] + do_record.astype(jnp.int32),
-            "buffers": buffers,
-        }
-        return next_carry, None
+    time_step = partial(
+        _time_step,
+        step_func=step_func,
+        quantity_func=quantity_func,
+        guard_func=guard_func,
+        constants=constants,
+        dynamic_args=dynamic_args,
+        step_static=step_static,
+        quantity_static=quantity_static,
+        guard_static=guard_static,
+        n_slots=n_slots,
+    )
 
     initial_carry = {
         "state": state,
@@ -545,7 +585,7 @@ def _run_time_scan(
             for k, v in state.items()
         },
     }
-    final_carry, _ = jax.lax.scan(body, initial_carry, xs)
+    final_carry, _ = jax.lax.scan(time_step, initial_carry, xs)
     return final_carry
 
 
@@ -573,9 +613,18 @@ def _run_time_loop(
         record_steps: Step indices at which snapshots are recorded.
 
     Returns:
-        Dict: the final fields under 'state', the stop bookkeeping
-        scalars ('stop_kind', 'stop_step', 'quantity', 'guard_mass_change', 
-        'guard_density') and the snapshot buffers ('buffers', 'n_recorded').
+        Dict of device values with keys after the time loop:
+        'state' (the fields after the last active step),
+        'active' (False if a stop fired),
+        'stop_kind' (_RUNNING, _STOP_THRESHOLD, _STOP_SHRINKAGE or
+        _STOP_VANISHING),
+        'stop_step' (step index at which the loop stopped, 0 if it never
+        did),
+        'quantity' (stopping quantity of the last active step, float64),
+        'guard_mass_change' and 'guard_density' (guard diagnostics of the
+        stopping step, 0.0 unless a guard fired) and
+        'buffers' / 'n_recorded' (per-field snapshot arrays of shape
+        (n_slots, *field_shape) and the number of frames written).
     """
     slot_steps = np.unique(np.asarray(record_steps, dtype=np.int64))
     n_slots = int(slot_steps.size)

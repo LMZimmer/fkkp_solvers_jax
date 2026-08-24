@@ -1,7 +1,7 @@
 """Device-operator tests against independent NumPy specs.
 
 Each operator is compared with a small NumPy implementation of its documented
-semantics, written here (``_edge_shift``, ``_diffusion_term_numpy``, the
+semantics, written here (``_shift_grid_by_one``, ``_diffusion_term_numpy``, the
 analytic Gaussian). The jnp operators run under a local ``jax.enable_x64()``
 scope so comparisons are at float64; expected differences are at most a few
 ULP from XLA transcendentals and scaling-order. The tensor elongation operator is checked against its
@@ -25,8 +25,8 @@ def _x64(fn, *args, **kwargs) -> np.ndarray:
         return np.asarray(fn(*args, **kwargs))
 
 
-def _edge_shift(field: np.ndarray, shift: int, axis: int) -> np.ndarray:
-    """Independent spec of edge_shift: unit shift with edge replication."""
+def _shift_grid_by_one(field: np.ndarray, shift: int, axis: int) -> np.ndarray:
+    """Independent spec of shift_grid_by_one: unit shift with edge replication."""
     v = np.moveaxis(field, axis, 0)
     if shift == 1:
         shifted = np.concatenate([v[:1], v[:-1]])
@@ -41,7 +41,7 @@ def _diffusion_term_numpy(u: np.ndarray, faces: dict, spacing: tuple) -> np.ndar
     out = np.zeros_like(u)
     for axis, (name, h) in enumerate(zip("xyz", spacing)):
         d = faces[f"fwd_{name}"]  # forward face, between cells i and i+1
-        flux = d * (_edge_shift(u, -1, axis) - u)  # zero at the last face
+        flux = d * (_shift_grid_by_one(u, -1, axis) - u)  # zero at the last face
         div = np.moveaxis(flux.copy(), axis, 0)
         div[1:] -= np.moveaxis(flux, axis, 0)[:-1]  # backward flux; zero at i=0
         out += np.moveaxis(div, 0, axis) / (h * h)
@@ -54,24 +54,24 @@ def _random_faces(rng: np.random.Generator) -> dict:
     for axis, name in enumerate("xyz"):
         fwd = rng.random(SHAPE)
         faces[f"fwd_{name}"] = fwd
-        faces[f"bwd_{name}"] = _edge_shift(fwd, 1, axis)
+        faces[f"bwd_{name}"] = _shift_grid_by_one(fwd, 1, axis)
     return faces
 
 
 @pytest.mark.parametrize("axis", [0, 1, 2])
 @pytest.mark.parametrize("shift", [1, -1])
-def test_edge_shift(axis: int, shift: int) -> None:
+def test_shift_grid_by_one(axis: int, shift: int) -> None:
     field = np.random.default_rng(7).random(SHAPE)
     np.testing.assert_array_equal(
-        _x64(jax_ops.edge_shift, field, shift, axis),
-        _edge_shift(field, shift, axis),
+        _x64(jax_ops.shift_grid_by_one, field, shift, axis),
+        _shift_grid_by_one(field, shift, axis),
     )
 
 
-def test_edge_shift_rejects_large_shift() -> None:
+def test_shift_grid_by_one_rejects_large_shift() -> None:
     with pytest.raises(ValueError):
         with jax.enable_x64():
-            jax_ops.edge_shift(np.zeros(SHAPE), 2, 0)
+            jax_ops.shift_grid_by_one(np.zeros(SHAPE), 2, 0)
 
 
 @pytest.mark.parametrize("axis", [0, 1, 2])
@@ -79,7 +79,7 @@ def test_face_average(axis: int) -> None:
     field = np.random.default_rng(8).random(SHAPE)
     np.testing.assert_array_equal(
         _x64(jax_ops.face_average, field, axis),
-        (field + _edge_shift(field, -1, axis)) / 2,
+        (field + _shift_grid_by_one(field, -1, axis)) / 2,
     )
 
 
@@ -88,8 +88,8 @@ def test_masked_face_average(axis: int) -> None:
     rng = np.random.default_rng(9)
     field = rng.random(SHAPE)
     mask = rng.random(SHAPE) > 0.3
-    both_valid = mask & _edge_shift(mask, -1, axis)
-    expected = np.where(both_valid, (field + _edge_shift(field, -1, axis)) / 2, 0.0)
+    both_valid = mask & _shift_grid_by_one(mask, -1, axis)
+    expected = np.where(both_valid, (field + _shift_grid_by_one(field, -1, axis)) / 2, 0.0)
     np.testing.assert_array_equal(
         _x64(jax_ops.masked_face_average, field, mask, axis), expected
     )

@@ -22,7 +22,7 @@ def _radius_grid(n: int) -> np.ndarray:
 
 @pytest.fixture(scope="session")
 def tissue_phantom() -> tuple[np.ndarray, np.ndarray]:
-    """(gray_matter, white_matter): spherical WM core with a GM shell, 24^3."""
+    """(gray_matter_pbmap, white_matter_pbmap): spherical WM core with a GM shell, 24^3."""
     r = _radius_grid(PHANTOM_N)
     wm = (r < 6).astype(np.float64)
     gm = ((r >= 6) & (r < 9)).astype(np.float64)

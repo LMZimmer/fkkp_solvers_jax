@@ -41,8 +41,8 @@ def fk_params(gm: np.ndarray, wm: np.ndarray, **overrides) -> dict:
     params = dict(
         white_matter_diffusivity=0.3,
         rho=0.15,
-        gray_matter=gm,
-        white_matter=wm,
+        gray_matter_pbmap=gm,
+        white_matter_pbmap=wm,
         **_COMMON,
     )
     params.update(overrides)
@@ -57,8 +57,8 @@ def two_compartment_params(gm: np.ndarray, wm: np.ndarray, **overrides) -> dict:
         nutrient_threshold=0.4,
         nutrient_diffusivity=0.5,
         nutrient_consumption_rate=0.1,
-        gray_matter=gm,
-        white_matter=wm,
+        gray_matter_pbmap=gm,
+        white_matter_pbmap=wm,
         **_COMMON,
     )
     params.update(overrides)
@@ -155,8 +155,8 @@ def test_dti_uniform_gray_matter_solve(tensor_phantom, tissue_phantom):
     params = dti_params(
         tensor_phantom,
         uniform_gray_matter=True,
-        gray_matter=gm,
-        white_matter=wm,
+        gray_matter_pbmap=gm,
+        white_matter_pbmap=wm,
         diffusivity_ratio=10.0,
         tensor_exponent=2,
         tensor_linear_term=0.1,
@@ -247,36 +247,6 @@ def test_seed_outside_tissue_errors(tissue_phantom):
     assert result.error == "Initial tumor position is outside the brain matter."
 
 
-def test_stopping_volume_deprecated_alias(tissue_phantom):
-    """'stopping_volume' still works as a deprecated alias: it warns and
-    produces a Result identical to 'stopping_threshold'."""
-    gm, wm = tissue_phantom
-    params = fk_params(gm, wm, stopping_time=40)
-    canonical = FKPPSolver({**params, "stopping_threshold": 300.0}).solve()
-    with pytest.warns(DeprecationWarning, match="stopping_volume"):
-        aliased_solver = FKPPSolver({**params, "stopping_volume": 300.0})
-    aliased = aliased_solver.solve()
-    assert aliased.success == canonical.success
-    assert aliased.stopping_criterion == canonical.stopping_criterion
-    assert aliased.final_time == canonical.final_time
-    assert aliased.final_stopping_quantity == canonical.final_stopping_quantity
-    for key in canonical.final_state:
-        np.testing.assert_array_equal(
-            aliased.final_state[key], canonical.final_state[key]
-        )
-        np.testing.assert_array_equal(
-            aliased.initial_state[key], canonical.initial_state[key]
-        )
-
-
-def test_stopping_threshold_and_alias_both_rejected(tissue_phantom):
-    gm, wm = tissue_phantom
-    with pytest.raises(ValueError, match="only one of"):
-        FKPPSolver(
-            fk_params(gm, wm, stopping_threshold=300.0, stopping_volume=300.0)
-        )
-
-
 def test_param_validation_errors(tissue_phantom):
     gm, wm = tissue_phantom
     with pytest.raises(ValueError):
@@ -284,7 +254,7 @@ def test_param_validation_errors(tissue_phantom):
     with pytest.raises(KeyError):
         FKPPSolver({"rho": 0.1})
     with pytest.raises(ValueError):
-        FKPPSolver(fk_params(gm, wm, density_threshold=0.5))  # mass mode
+        FKPPSolver(fk_params(gm, wm, volume_threshold=0.5))  # mass mode
     with pytest.raises(ValueError):
         FKPPSolver(fk_params(gm, wm, stopping_mode="occupancy"))
     with pytest.raises(ValueError):
@@ -301,7 +271,7 @@ def test_param_validation_errors(tissue_phantom):
 
 def test_volume_stopping_mode(tissue_phantom):
     """stopping_mode='volume' thresholds a physical volume:
-    voxel_volume * count(cell density > density_threshold)."""
+    voxel_volume * count(cell density > volume_threshold)."""
     gm, wm = tissue_phantom
     params = fk_params(
         gm, wm, stopping_time=40, stopping_mode="volume", stopping_threshold=50.0
@@ -317,7 +287,7 @@ def test_volume_stopping_mode(tissue_phantom):
 
 
 def test_no_retrace_on_repeat_solve(tissue_phantom):
-    """Solves must reuse the compiled scan driver.
+    """Solves must reuse the compiled time scan.
 
     After a warm-up solve, zero new traces (operators.SCAN_TRACE_COUNT is a
     trace-time counter) are allowed for (a) identical re-solves and (b)
