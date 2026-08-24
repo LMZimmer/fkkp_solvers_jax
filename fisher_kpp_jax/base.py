@@ -41,6 +41,10 @@ CROP_MARGIN: int = 2
 
 DEFAULT_VOLUME_THRESHOLD: float = 0.5
 
+GAUSSIAN_SEED_POSITION_FRACTION: tuple[str, ...] = tuple(
+    f"gaussian_seed_{axis}_fraction" for axis in "xyz"
+)
+
 
 @dataclass(slots=True)
 class Result:
@@ -108,8 +112,7 @@ def _validate_parameters(parameters: dict[str, Any], solver_name: str) -> None:
     Check the parameter values shared by all solvers.
 
     volume_threshold is only meaningful for "volume" mode and is rejected
-    otherwise (no silent unused parameters); in "volume" mode it is the one
-    default filled in here (logged), because it depends on stopping_mode.
+    otherwise.
 
     Args:
         parameters: Merged parameter dict, modified in place.
@@ -149,11 +152,16 @@ def _validate_parameters(parameters: dict[str, Any], solver_name: str) -> None:
         )
 
 
-def _validate_seed_fractions(params: Mapping[str, Any]) -> None:
-    for axis in "xyz":
-        key = f"gaussian_seed_{axis}_fraction"
-        if not 0 <= params[key] <= 1:
-            raise ValueError(f"{key} must be between 0 and 1.")
+def _validate_unit_interval(
+    parameters: Mapping[str, Any], keys: Sequence[str], solver_name: str
+) -> None:
+    """Check that each named parameter lies in [0, 1]."""
+    for key in keys:
+        value = parameters[key]
+        if not 0 <= value <= 1:
+            raise ValueError(
+                f"{solver_name}: {key} must be between 0 and 1, got {value!r}."
+            )
 
 
 class BaseFKPPSolver(ABC):
@@ -177,21 +185,24 @@ class BaseFKPPSolver(ABC):
     grid_spacing: tuple[float, float, float]
     seed_voxel: tuple[int, int, int]
 
-    # Parameter schema, defined per solver class.
+    # Required and default parameters, implemented by each solver
     _REQUIRED: ClassVar[frozenset[str]]
     _DEFAULTS: ClassVar[dict[str, Any]]
-    # Stopping-quantity device impls consumed by _quantity_spec:
+    
+    # Stopping-quantity device functions consumed by _quantity_spec:
     # module-level functions wrapped in staticmethod (stable identity for
     # the jit cache), set per solver class.
-    _mass_impl: ClassVar[Callable[..., jax.Array]]
-    _volume_impl: ClassVar[Callable[..., jax.Array]]
+    _mass_func: ClassVar[Callable[..., jax.Array]]
+    _volume_func: ClassVar[Callable[..., jax.Array]]
 
     def __init__(self, params: Mapping[str, Any]) -> None:
         merged = _merge_parameters(
             params, self._REQUIRED, self._DEFAULTS, type(self).__name__
         )
         _validate_parameters(merged, type(self).__name__)
-        _validate_seed_fractions(merged)
+        _validate_unit_interval(
+            merged, GAUSSIAN_SEED_POSITION_FRACTION, type(self).__name__
+        )
         self._validate_extra(merged)
         self.params = merged
         self._crop_box: tuple[slice, slice, slice] | None = None
@@ -556,9 +567,9 @@ class BaseFKPPSolver(ABC):
         Return the ``StepSpec`` for one explicit-Euler step on the cropped
         grid.
 
-        See ``StepSpec`` for the impl signature and the dynamic/static
+        See ``StepSpec`` for the function signature and the dynamic/static
         split. A solver that rebuilds its diffusivity every step does so
-        inside the impl, from the carried state.
+        inside the step function, from the carried state.
         """
 
     def _quantity_spec(self) -> QuantitySpec:
@@ -566,11 +577,11 @@ class BaseFKPPSolver(ABC):
         Return the stopping-quantity spec dispatched on stopping_mode.
 
         See ``Result.final_stopping_quantity``: total cell mass
-        (``_mass_impl``, the default) or
+        (``_mass_func``, the default) or
         voxel_volume * count(cell density > volume_threshold)
-        (``_volume_impl``). The reduction runs in float64 regardless of the
+        (``_volume_func``). The reduction runs in float64 regardless of the
         state dtype; which fields count as cell density is documented on the
-        per-solver impls.
+        per-solver functions.
         """
         if self.params["stopping_mode"] == "volume":
             dynamic_scalars = {
@@ -579,12 +590,12 @@ class BaseFKPPSolver(ABC):
                 )
             }
             return {
-                "impl": self._volume_impl,
+                "func": self._volume_func,
                 "dynamic_scalars": dynamic_scalars,
                 "static_args": (self.voxel_volume,),
             }
         return {
-            "impl": self._mass_impl,
+            "func": self._mass_func,
             "dynamic_scalars": {},
             "static_args": (self.voxel_volume,),
         }
@@ -604,10 +615,10 @@ class BaseFKPPSolver(ABC):
         Return the post-step guard spec, evaluated on the device inside the
         scan.
 
-        See ``GuardSpec`` for the impl signature. The AnisotropicFKPPSolver
+        See ``GuardSpec`` for the function signature. The AnisotropicFKPPSolver
         overrides; the default never fires (and is pruned by XLA).
         """
-        return {"impl": _no_guard, "dynamic_scalars": {}, "static_args": ()}
+        return {"func": _no_guard, "dynamic_scalars": {}, "static_args": ()}
 
     def _check_seed(self) -> None:
         """

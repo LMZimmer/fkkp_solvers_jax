@@ -326,11 +326,11 @@ State = dict[str, jax.Array]
 Constants = dict[str, Any]
 
 StepSpec = dict[str, Any]
-"""Step specification: a dict with keys 'impl', 'dynamic_scalars' and
+"""Step specification: a dict with keys 'func', 'dynamic_scalars' and
 'static_args'.
 
-'impl' is a module-level function called as
-impl(state, constants, dynamic_scalars, *static_args); module level gives it
+'func' is a module-level function called as
+func(state, constants, dynamic_scalars, *static_args); module level gives it
 a stable identity, so the jit cache persists across solves. 'dynamic_scalars'
 is a dict of named 0-d device arrays (a jit pytree with a stable treedef):
 every physical parameter a sweep or optimizer would vary (dt, rates,
@@ -343,15 +343,16 @@ without a shape change).
 QuantitySpec = dict[str, Any]
 """Stopping-quantity specification with the same keys as ``StepSpec``.
 
-The impl is called as impl(state, constants, dynamic_scalars, *static_args)
+The function is called as
+func(state, constants, dynamic_scalars, *static_args)
 and returns the float64 stopping quantity.
 """
 
 GuardSpec = dict[str, Any]
 """Post-step guard specification with the same keys as ``StepSpec``.
 
-The impl is called as
-impl(new_state, previous_state, constants, dynamic_scalars, *static_args)
+The function is called as
+func(new_state, previous_state, constants, dynamic_scalars, *static_args)
 and returns (code, shrinkage change, integrated density); code 0 = no guard
 fired, 1 = shrinkage, 2 = vanishing volume.
 """
@@ -377,11 +378,11 @@ def _no_guard(
 @partial(
     jax.jit,
     static_argnames=(
-        "step_impl",
+        "step_func",
         "step_static",
-        "quantity_impl",
+        "quantity_func",
         "quantity_static",
-        "guard_impl",
+        "guard_func",
         "guard_static",
         "n_steps",
         "n_slots",
@@ -393,11 +394,11 @@ def _scan_driver(
     dynamics: dict[str, Any],
     slot_ids: jax.Array,
     *,
-    step_impl: Callable[..., State],
+    step_func: Callable[..., State],
     step_static: tuple[Any, ...],
-    quantity_impl: Callable[..., jax.Array],
+    quantity_func: Callable[..., jax.Array],
     quantity_static: tuple[Any, ...],
-    guard_impl: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
+    guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
     guard_static: tuple[Any, ...],
     n_steps: int,
     n_slots: int,
@@ -410,24 +411,25 @@ def _scan_driver(
     recording (skipped at a break step). After a stop, every remaining scan
     iteration is a masked no-op.
 
-    This is a single module-level jitted function: the impls and their
-    static argument tuples are stable across solves, while device arrays and
+    This is a single module-level jitted function: the step, quantity and
+    guard functions and their static argument tuples are stable across
+    solves, while device arrays and
     physical scalars are dynamic arguments (the ``StepSpec`` contract), so
     re-solves retrace only on a shape/dtype/step-count change (see
     SCAN_TRACE_COUNT).
 
     Args:
         state: Initial device state on the cropped grid.
-        constants: Constant device arrays consumed by the impls.
-        dynamics: Each impl's 0-d device scalars under the keys "step",
+        constants: Constant device arrays consumed by the functions.
+        dynamics: Each function's 0-d device scalars under the keys "step",
             "quantity" and "guard", plus the float64 "stopping_threshold".
         slot_ids: Snapshot slot of each step (-1: no snapshot).
-        step_impl: Step impl, see ``StepSpec``.
-        step_static: Static arguments of the step impl.
-        quantity_impl: Stopping-quantity impl, see ``QuantitySpec``.
-        quantity_static: Static arguments of the quantity impl.
-        guard_impl: Post-step guard impl, see ``GuardSpec``.
-        guard_static: Static arguments of the guard impl.
+        step_func: Step function, see ``StepSpec``.
+        step_static: Static arguments of the step function.
+        quantity_func: Stopping-quantity function, see ``QuantitySpec``.
+        quantity_static: Static arguments of the quantity function.
+        guard_func: Post-step guard function, see ``GuardSpec``.
+        guard_static: Static arguments of the guard function.
         n_steps: Number of scan iterations.
         n_slots: Number of snapshot slots.
 
@@ -444,12 +446,12 @@ def _scan_driver(
         t, slot = x
         prev = carry["state"]
         active = carry["active"]
-        new_state = step_impl(prev, constants, dynamics["step"], *step_static)
-        quantity = quantity_impl(
+        new_state = step_func(prev, constants, dynamics["step"], *step_static)
+        quantity = quantity_func(
             new_state, constants, dynamics["quantity"], *quantity_static
         )
         threshold_hit = quantity >= dynamics["stopping_threshold"]
-        guard_code, guard_change, guard_density = guard_impl(
+        guard_code, guard_change, guard_density = guard_func(
             new_state, prev, constants, dynamics["guard"], *guard_static
         )
 
@@ -532,7 +534,7 @@ def _run_time_loop(
 
     Args:
         state: Initial device state on the cropped grid.
-        constants: Constant device arrays consumed by the impls.
+        constants: Constant device arrays consumed by the functions.
         step_spec: Step specification, see ``StepSpec``.
         quantity_spec: Stopping-quantity specification, see ``QuantitySpec``.
         guard_spec: Post-step guard specification, see ``GuardSpec``.
@@ -560,11 +562,11 @@ def _run_time_loop(
         constants,
         dynamics,
         jnp.asarray(slot_ids),
-        step_impl=step_spec["impl"],
+        step_func=step_spec["func"],
         step_static=step_spec["static_args"],
-        quantity_impl=quantity_spec["impl"],
+        quantity_func=quantity_spec["func"],
         quantity_static=quantity_spec["static_args"],
-        guard_impl=guard_spec["impl"],
+        guard_func=guard_spec["func"],
         guard_static=guard_spec["static_args"],
         n_steps=n_steps,
         n_slots=n_slots,

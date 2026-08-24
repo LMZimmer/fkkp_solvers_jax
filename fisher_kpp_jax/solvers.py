@@ -2,7 +2,7 @@
 ``TwoCompartmentWithNutrientFKPPSolver`` and ``AnisotropicFKPPSolver``.
 
 The device code is purely functional: each solver's step is a module-level
-impl with a stable identity, so the jitted scan driver's cache persists
+function with a stable identity, so the jitted scan driver's cache persists
 across solves (see ``operators.StepSpec``).
 """
 
@@ -113,8 +113,8 @@ def _mixture_face_fields(
     return faces
 
 
-# --- module-level device impls (stable identity so the jitted scan driver's
-# --- cache persists across solves; see operators._scan_driver) ---
+# --- module-level device functions (stable identity so the jitted scan
+# --- driver's cache persists across solves; see operators._scan_driver) ---
 
 
 def _single_field_step(
@@ -335,8 +335,8 @@ class FKPPSolver(BaseFKPPSolver):
         **_COMMON_DEFAULTS,
         "min_tissue_fraction": 0.1,
     }
-    _mass_impl = staticmethod(_mass_single)
-    _volume_impl = staticmethod(_volume_single)
+    _mass_func = staticmethod(_mass_single)
+    _volume_func = staticmethod(_volume_single)
 
     _gm_lowres: NDArray
     _wm_lowres: NDArray
@@ -386,7 +386,7 @@ class FKPPSolver(BaseFKPPSolver):
             "rho": self._dynamic_scalar(self.params["rho"]),
         }
         return {
-            "impl": _single_field_step,
+            "func": _single_field_step,
             "dynamic_scalars": dynamic_scalars,
             "static_args": (self.grid_spacing,),
         }
@@ -442,8 +442,8 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         "max_tumor_occupancy": 0.9,
         "nt_multiplier": 8,
     }
-    _mass_impl = staticmethod(_mass_two_compartment)
-    _volume_impl = staticmethod(_volume_two_compartment)
+    _mass_func = staticmethod(_mass_two_compartment)
+    _volume_func = staticmethod(_volume_two_compartment)
 
     _gm_lowres: NDArray
     _wm_lowres: NDArray
@@ -492,7 +492,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
 
         # Nutrient faces are built once (constant in time; ratio 1 means
         # gray matter conducts nutrient like white matter).
-        # The tumor faces are rebuilt every step inside the step impl.
+        # The tumor faces are rebuilt every step inside the step function.
         nutrient_faces = _mixture_face_fields(
             wm, gm, tissue_valid, float(self.params["nutrient_diffusivity"]), 1
         )
@@ -518,7 +518,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         }
         dynamic_scalars["dt"] = self._dynamic_scalar(dt)
         return {
-            "impl": _two_compartment_step,
+            "func": _two_compartment_step,
             "dynamic_scalars": dynamic_scalars,
             "static_args": (self.grid_spacing,),
         }
@@ -578,8 +578,8 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         "diffusivity_upper_limit": 2,
         "diffusivity_lower_limit": 0,
     }
-    _mass_impl = staticmethod(_mass_single)
-    _volume_impl = staticmethod(_volume_single)
+    _mass_func = staticmethod(_mass_single)
+    _volume_func = staticmethod(_volume_single)
 
     _axial_lowres: NDArray
     _axial_original_max: float
@@ -755,7 +755,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             "rho": self._dynamic_scalar(self.params["rho"]),
         }
         return {
-            "impl": _single_field_step,
+            "func": _single_field_step,
             "dynamic_scalars": dynamic_scalars,
             "static_args": (self.grid_spacing,),
         }
@@ -763,7 +763,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
     def _guard_spec(self) -> GuardSpec:
         """DTI shrinkage/vanishing guards -- semantics at ``_dti_guard``."""
         return {
-            "impl": _dti_guard,
+            "func": _dti_guard,
             "dynamic_scalars": {},
             "static_args": (self.voxel_volume,),
         }
