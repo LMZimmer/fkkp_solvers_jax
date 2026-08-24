@@ -1,14 +1,12 @@
 """Stateless numerical operators for the JAX Fisher-KPP solvers.
 
-Device operators (``jax.numpy``) implement the numerics of
-``fisher_kpp.operators``; host operators (bounding box, crop/embed) stay in
-NumPy because they only run once per solve, outside the jitted time loop.
+Device operators use ``jax.numpy``; host operators (bounding box, embed)
+stay in NumPy because they only run once per solve, outside the jitted time
+loop.
 
 Boundary convention: all stencils apply zero-flux (homogeneous Neumann)
-boundaries via edge replication — the ghost cell outside the array equals the
-boundary cell, so boundary faces carry zero net flux. Interior values are
-bitwise identical to the original ``np.roll``-based (periodic-wrap) stencils;
-only the 1-voxel boundary shell differs.
+boundaries via edge replication — the ghost cell outside the array equals
+the boundary cell, so boundary faces carry zero net flux.
 """
 
 from __future__ import annotations
@@ -26,10 +24,9 @@ FaceFields = dict[str, jax.Array]
 face (between cells i-1 and i).
 """
 
-# Magic constants of the original `gauss_sol3d` seed profile
-# ("experimentally chosen" per the original comment).
-GAUSSIAN_SEED_DIFFUSION_TIME: float = 5.0  # "Dt" of the analytic heat kernel
-GAUSSIAN_SEED_MASS: float = 250.0  # "M", total mass of the kernel
+# Empirically chosen constants of the Gaussian seed profile.
+GAUSSIAN_SEED_DIFFUSION_TIME: float = 5.0  # width of the analytic heat kernel
+GAUSSIAN_SEED_MASS: float = 250.0  # total mass of the kernel
 GAUSSIAN_SEED_FLOOR: float = 0.1  # values at or below this are zeroed
 
 

@@ -4,9 +4,8 @@ Short solves on 24^3 phantoms, checking the documented Result semantics
 (stopping criteria, final_time bookkeeping, time-series recording, error
 paths) and physical invariants of the models (growth under positive rho,
 mass conservation of pure diffusion via the monotonicity checks, necrotic
-accumulation, nutrient consumption). Numerical comparison against the frozen
-NumPy reference package lives in ``scripts/run_reference_solves.py``, not
-here.
+accumulation, nutrient consumption). ``scripts/run_reference_solves.py``
+checks that the reference results are matched; that is not covered here.
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ def fk_params(gm: np.ndarray, wm: np.ndarray, **overrides) -> dict:
     return params
 
 
-def fk2c_params(gm: np.ndarray, wm: np.ndarray, **overrides) -> dict:
+def two_compartment_params(gm: np.ndarray, wm: np.ndarray, **overrides) -> dict:
     params = dict(
         white_matter_diffusivity=0.3,
         rho=0.15,
@@ -81,9 +80,9 @@ def dti_params(tensors: np.ndarray, **overrides) -> dict:
 # fixtures, keyed by the parametrize id.
 SOLVER_CASES = {
     "fk": (FKPPSolver, lambda tissue, tensors: fk_params(*tissue)),
-    "fk2c": (
+    "two_compartment": (
         TwoCompartmentWithNutrientFKPPSolver,
-        lambda tissue, tensors: fk2c_params(*tissue),
+        lambda tissue, tensors: two_compartment_params(*tissue),
     ),
     "dti": (AnisotropicFKPPSolver, lambda tissue, tensors: dti_params(tensors)),
 }
@@ -121,7 +120,7 @@ def test_fkpp_short_solve(tissue_phantom):
 
 def test_two_compartment_short_solve(tissue_phantom):
     gm, wm = tissue_phantom
-    params = fk2c_params(gm, wm, n_time_series_snapshots=3)
+    params = two_compartment_params(gm, wm, n_time_series_snapshots=3)
     result = TwoCompartmentWithNutrientFKPPSolver(params).solve()
     keys = {"proliferative", "necrotic", "nutrient"}
     assert_successful_time_solve(result, keys, gm.shape)
@@ -338,11 +337,11 @@ def test_no_retrace_on_repeat_solve(tissue_phantom):
     FKPPSolver({**params, "rho": 0.16}).solve()
     assert time_loop.SCAN_TRACE_COUNT == before
 
-    params_2c = fk2c_params(gm, wm)
-    TwoCompartmentWithNutrientFKPPSolver(params_2c).solve()  # warm-up
+    params_two_compartment = two_compartment_params(gm, wm)
+    TwoCompartmentWithNutrientFKPPSolver(params_two_compartment).solve()  # warm-up
     before = time_loop.SCAN_TRACE_COUNT
     TwoCompartmentWithNutrientFKPPSolver(
-        {**params_2c, "rho": 0.16, "necrosis_rate": 0.5}
+        {**params_two_compartment, "rho": 0.16, "necrosis_rate": 0.5}
     ).solve()
     assert time_loop.SCAN_TRACE_COUNT == before
 

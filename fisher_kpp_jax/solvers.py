@@ -1,19 +1,15 @@
-"""The three JAX Fisher-KPP forward solvers (port of ``fisher_kpp.solvers``,
-whose docstrings document the deliberate quirks retained here: zero-flux
-boundaries, the FK_2c stopping-mass voxel-volume fix and reaction-rate dt
-guard, the DTI guard-exit failure semantics, and the mutually inconsistent
-per-solver time-step formulas).
+"""The three JAX Fisher-KPP forward solvers.
 
-Port-specific notes:
+Implementation notes:
   - The device code is purely functional: each solver's step is a
-    module-level impl (see ``time_loop.StepSpec``); in-place ``u += ...``
-    updates become explicit functional updates with the same evaluation
-    order (FK_2c's sequential/aliasing semantics are documented at
-    ``_two_compartment_step``).
+    module-level impl (see ``time_loop.StepSpec``); the two-compartment
+    step's deliberately sequential update order is documented at
+    ``_two_compartment_step``.
   - Tissue validity masks that are constant in time ((wm+gm) thresholds) are
     computed host-side in float64 and shipped to the device as booleans, so
-    they are identical for both precisions; the FK_2c occupancy mask depends
-    on the evolving state and is computed on the device at the state dtype.
+    they are identical for both precisions; the two-compartment occupancy
+    mask depends on the evolving state and is computed on the device at the
+    state dtype.
 """
 
 from __future__ import annotations
@@ -53,12 +49,10 @@ from .time_loop import (
 
 logger = logging.getLogger(__name__)
 
-# Crop-mask threshold hard-coded at the originals' call sites (their crop
-# helpers advertise different defaults that are never used).
+# Tissue-occupancy threshold defining the crop mask.
 CROP_TISSUE_THRESHOLD: float = 0.5
 
-# Steepness of the descending nutrient switch in the original FK_2c
-# smooth_heaviside (k=50).
+# Steepness of the smooth descending switch on the nutrient level.
 NECROSIS_SWITCH_STEEPNESS: float = 50.0
 
 _AXES = ("x", "y", "z")
@@ -105,8 +99,7 @@ def _mixture_face_fields(
 
     D = diffusivity * (wm_face + gm_face / ratio), faces masked by valid_mask.
     The 'bwd' fields are the edge-replicated shift of the 'fwd' fields
-    (zero-flux boundary convention; interior bitwise identical to the original
-    roll-based construction).
+    (zero-flux boundary convention).
     """
     faces: FaceFields = {}
     for axis, name in enumerate(_AXES):
@@ -119,7 +112,7 @@ def _mixture_face_fields(
 
 
 # --- module-level device impls (stable identity so the jitted scan driver's
-# --- cache persists across solves; see base._scan_driver) ---
+# --- cache persists across solves; see time_loop._scan_driver) ---
 
 
 def _single_field_step(
@@ -128,8 +121,9 @@ def _single_field_step(
     dyn: dict[str, jax.Array],
     spacing: tuple[float, float, float],
 ) -> State:
-    """One Euler step of the single-field solvers (FK and DTI): the face
-    diffusivities are constant in time and come from consts."""
+    """One Euler step of the single-field solvers (FKPPSolver and
+    AnisotropicFKPPSolver): the face diffusivities are constant in time and
+    come from consts."""
     dt = dyn["dt"]
     rho = dyn["rho"]
     u = state["cell_density"]
@@ -144,9 +138,10 @@ def _two_compartment_step(
     dyn: dict[str, jax.Array],
     spacing: tuple[float, float, float],
 ) -> State:
-    """One Euler step of the proliferative/necrotic/nutrient system,
-    sequential as in the original: the necrotic and nutrient updates see
-    the already-updated proliferative field."""
+    """One Euler step of the proliferative/necrotic/nutrient system.
+
+    The update order is deliberately sequential: the necrotic and nutrient
+    updates see the already-updated proliferative field."""
     dt = dyn["dt"]
     necrosis_rate = dyn["necrosis_rate"]
     proliferative = state["proliferative"]
@@ -154,8 +149,8 @@ def _two_compartment_step(
     nutrient = state["nutrient"]
 
     # Per-step tumor-diffusivity rebuild from the carried state: on step t
-    # this is the post-step P and N of step t-1 (the initial state on step
-    # 0), reproducing the reference's effective post-step aliasing semantics.
+    # the mask deliberately uses the post-step P and N of step t-1 (the
+    # initial state on step 0).
     occupancy_valid = (proliferative + necrotic) <= dyn["max_tumor_occupancy"]
     tumor_faces = _mixture_face_fields(
         consts["wm"],
@@ -165,7 +160,7 @@ def _two_compartment_step(
         dyn["diffusivity_ratio"],
     )
 
-    # Descending switch on the nutrient level (original smooth_heaviside).
+    # Smooth descending switch on the nutrient level.
     switch = logistic_sigmoid(
         -NECROSIS_SWITCH_STEEPNESS * (nutrient - dyn["nutrient_threshold"])
     )
@@ -208,9 +203,9 @@ def _mass_single(
 def _mass_pn(
     state: State, consts: Consts, dyn: dict[str, jax.Array], voxel_volume: float
 ) -> jax.Array:
-    """FK_2c integrated cell density, f64: voxel_volume * (sum(P) + sum(N)),
-    intentionally applying the voxel-volume factor to BOTH terms — unlike
-    the original, which dropped it on the necrotic term (mixed units)."""
+    """Two-compartment integrated cell density, f64:
+    voxel_volume * (sum(P) + sum(N)); the voxel-volume factor deliberately
+    multiplies BOTH terms."""
     del consts, dyn
     return voxel_volume * (
         jnp.sum(state["proliferative"], dtype=jnp.float64)
@@ -247,13 +242,12 @@ def _dti_guard(
     dyn: dict[str, jax.Array],
     voxel_volume: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Shrinkage/vanishing guards of the DTI solver.
+    """Shrinkage/vanishing guards of the anisotropic solver.
 
-    Thresholds (SHRINKAGE_LIMIT, VANISHING_DENSITY_LIMIT) and check order are
-    unchanged from the original (shrinkage takes precedence); sums run in
-    float64 regardless of state dtype. A firing guard is reported as
-    Result(success=False, stopping_criterion="error") with final_time at the
-    actual exit step."""
+    Shrinkage takes precedence; the thresholds are SHRINKAGE_LIMIT and
+    VANISHING_DENSITY_LIMIT, and the sums run in float64 regardless of state
+    dtype. A firing guard is reported as Result(success=False,
+    stopping_criterion="error") with final_time at the actual exit step."""
     del consts, dyn
     new_sum = jnp.sum(new_state["cell_density"], dtype=jnp.float64)
     prev_sum = jnp.sum(previous_state["cell_density"], dtype=jnp.float64)
@@ -268,7 +262,7 @@ def _dti_guard(
 
 
 class FKPPSolver(BaseFKPPSolver):
-    """Isotropic Fisher-KPP on WM/GM tissue maps (source: FK.FK.Solver).
+    """Isotropic Fisher-KPP on WM/GM tissue maps.
 
     State key: 'cell_density'. Diffusivity is a WM/GM mixture,
     D = white_matter_diffusivity * (wm_face + gm_face / diffusivity_ratio),
@@ -294,25 +288,25 @@ class FKPPSolver(BaseFKPPSolver):
     _mass_impl = staticmethod(_mass_single)
     _volume_impl = staticmethod(_volume_single)
 
-    _gm_low: NDArray
-    _wm_low: NDArray
+    _gm_lowres: NDArray
+    _wm_lowres: NDArray
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
         _validate_tissue_arrays(params["gray_matter"], params["white_matter"])
 
     def _prepare_fields(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         factor = self.params["resolution_factor"]
-        self._gm_low = self._downsample(self.params["gray_matter"], factor)
-        self._wm_low = self._downsample(self.params["white_matter"], factor)
-        return self._gm_low.shape, self.params["gray_matter"].shape
+        self._gm_lowres = self._downsample(self.params["gray_matter"], factor)
+        self._wm_lowres = self._downsample(self.params["white_matter"], factor)
+        return self._gm_lowres.shape, self.params["gray_matter"].shape
 
     def _check_seed(self) -> None:
         i, j, k = self.seed_voxel
-        if self._gm_low[i, j, k] == 0 and self._wm_low[i, j, k] == 0:
+        if self._gm_lowres[i, j, k] == 0 and self._wm_lowres[i, j, k] == 0:
             raise ValueError("Initial tumor position is outside the brain matter")
 
     def _crop_mask(self) -> NDArray:
-        return (self._gm_low + self._wm_low) >= CROP_TISSUE_THRESHOLD
+        return (self._gm_lowres + self._wm_lowres) >= CROP_TISSUE_THRESHOLD
 
     def _initialize_state(self) -> State:
         return {"cell_density": self._gaussian_seed()}
@@ -320,8 +314,8 @@ class FKPPSolver(BaseFKPPSolver):
     def _device_constants(self, dt: float) -> Consts:
         del dt
         assert self._crop_box is not None
-        gm_host = self._gm_low[self._crop_box]
-        wm_host = self._wm_low[self._crop_box]
+        gm_host = self._gm_lowres[self._crop_box]
+        wm_host = self._wm_lowres[self._crop_box]
         # Time-constant validity mask, host-side in f64 (see module docstring).
         valid_host = (wm_host + gm_host) >= float(self.params["min_tissue_fraction"])
         gm = jnp.asarray(gm_host, dtype=self._dtype)
@@ -357,7 +351,7 @@ class FKPPSolver(BaseFKPPSolver):
 
 
 class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
-    """Proliferative/necrotic/nutrient system (source: FK_2c.Solver).
+    """Proliferative/necrotic/nutrient system.
 
     State keys: 'proliferative', 'necrotic', 'nutrient'. Tumor diffusivity
     faces are additionally masked where proliferative + necrotic exceeds
@@ -366,8 +360,8 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
     reproduces). The nutrient diffuses with nutrient_diffusivity, masked by
     tissue only, built once.
 
-    The "mass" stopping quantity intentionally fixes the original FK_2c's
-    dropped voxel-volume factor on the necrotic term — see ``_mass_pn``.
+    The "mass" stopping quantity deliberately applies the voxel-volume
+    factor to the necrotic term as well — see ``_mass_pn``.
     """
 
     _REQUIRED: ClassVar[frozenset[str]] = frozenset(
@@ -395,27 +389,27 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
     _mass_impl = staticmethod(_mass_pn)
     _volume_impl = staticmethod(_volume_pn)
 
-    _gm_low: NDArray
-    _wm_low: NDArray
+    _gm_lowres: NDArray
+    _wm_lowres: NDArray
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
         _validate_tissue_arrays(params["gray_matter"], params["white_matter"])
 
     def _prepare_fields(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         factor = self.params["resolution_factor"]
-        self._gm_low = self._downsample(self.params["gray_matter"], factor)
-        self._wm_low = self._downsample(self.params["white_matter"], factor)
-        return self._gm_low.shape, self.params["gray_matter"].shape
+        self._gm_lowres = self._downsample(self.params["gray_matter"], factor)
+        self._wm_lowres = self._downsample(self.params["white_matter"], factor)
+        return self._gm_lowres.shape, self.params["gray_matter"].shape
 
     def _crop_mask(self) -> NDArray:
-        return (self._gm_low + self._wm_low) >= CROP_TISSUE_THRESHOLD
+        return (self._gm_lowres + self._wm_lowres) >= CROP_TISSUE_THRESHOLD
 
     def _initialize_state(self) -> State:
         proliferative = self._gaussian_seed()
         necrotic = jnp.zeros(proliferative.shape, dtype=self._dtype)
         nutrient = jnp.ones(proliferative.shape, dtype=self._dtype)
         # remove CSF from the nutrient field (host-side f64 tissue mask)
-        tissue_host = (self._wm_low + self._gm_low) >= float(
+        tissue_host = (self._wm_lowres + self._gm_lowres) >= float(
             self.params["min_tissue_fraction"]
         )
         nutrient = jnp.where(jnp.asarray(tissue_host), nutrient, 0)
@@ -428,8 +422,8 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
     def _device_constants(self, dt: float) -> Consts:
         del dt
         assert self._crop_box is not None
-        gm_host = self._gm_low[self._crop_box]
-        wm_host = self._wm_low[self._crop_box]
+        gm_host = self._gm_lowres[self._crop_box]
+        wm_host = self._wm_lowres[self._crop_box]
         tissue_valid_host = (wm_host + gm_host) >= float(
             self.params["min_tissue_fraction"]
         )
@@ -437,8 +431,8 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         wm = jnp.asarray(wm_host, dtype=self._dtype)
         tissue_valid = jnp.asarray(tissue_valid_host)
 
-        # Nutrient faces built once, as in the original (constant in time;
-        # ratio 1 means gray matter conducts nutrient like white matter).
+        # Nutrient faces are built once (constant in time; ratio 1 means
+        # gray matter conducts nutrient like white matter).
         # The tumor faces are rebuilt every step inside the step impl.
         nutrient_faces = _mixture_face_fields(
             wm, gm, tissue_valid, float(self.params["nutrient_diffusivity"]), 1
@@ -476,9 +470,8 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             / np.power(min(dx, dy, dz), 2)
             * self.params["nt_multiplier"]
             + 300,
-            # Reaction-rate guard in the same form the FK solver uses.
-            # The original FK_2c omitted it; without it, dt can violate
-            # the ~1/rho explicit-Euler reaction bound for large rho.
+            # Reaction-rate guard: without it, dt can violate the ~1/rho
+            # explicit-Euler reaction bound for large rho.
             stopping_time * rho * 1.1,
         )
         dt = stopping_time / nt
@@ -486,7 +479,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
 
 
 class AnisotropicFKPPSolver(BaseFKPPSolver):
-    """Axis-wise diffusivity from the DTI tensor diagonal (source: FK_DTI).
+    """Axis-wise diffusivity from the DTI tensor diagonal.
 
     State key: 'cell_density'. The per-axis diffusivity field (shape
     (Nx, Ny, Nz, 3)) is derived from the tensor diagonals on the host; the
@@ -521,9 +514,9 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
     _mass_impl = staticmethod(_mass_single)
     _volume_impl = staticmethod(_volume_single)
 
-    _axial_low: NDArray
-    _axial_full_max: float
-    _brainmask: NDArray
+    _axial_lowres: NDArray
+    _axial_original_max: float
+    _brainmask_lowres: NDArray
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
         tensors = params["diffusion_tensors"]
@@ -572,20 +565,20 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
 
         axial[axial < 0] = 0
 
-        brain_mask = np.max(axial, axis=-1) > 0
+        brainmask_original = np.max(axial, axis=-1) > 0
 
         if wm is not None:
             normalization_mask = wm > 0
         else:
-            normalization_mask = brain_mask
+            normalization_mask = brainmask_original
 
         if normalization_std is not None:
-            axial[brain_mask] -= np.mean(axial[normalization_mask])
-            axial[brain_mask] /= np.std(axial[normalization_mask])
-            axial[brain_mask] *= normalization_std
-            axial[brain_mask] += 1
+            axial[brainmask_original] -= np.mean(axial[normalization_mask])
+            axial[brainmask_original] /= np.std(axial[normalization_mask])
+            axial[brainmask_original] *= normalization_std
+            axial[brainmask_original] += 1
         else:
-            axial[brain_mask] /= np.mean(axial[normalization_mask])
+            axial[brainmask_original] /= np.mean(axial[normalization_mask])
 
         if not (wm is None or gm is None or diffusivity_ratio is None):
             if self.params["verbose"]:
@@ -611,7 +604,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         axial[axial < 0] = 0
         axial[
             np.logical_and(
-                np.repeat((brain_mask > 0)[..., np.newaxis], repeats=3, axis=-1),
+                np.repeat((brainmask_original > 0)[..., np.newaxis], repeats=3, axis=-1),
                 axial < lower_limit,
             )
         ] = lower_limit
@@ -631,7 +624,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             )
 
         uniform = params["uniform_gray_matter"]
-        axial = self._axial_diffusivity_from_tensor(
+        axial_original = self._axial_diffusivity_from_tensor(
             tensors,
             wm=params["white_matter"] if uniform else None,
             gm=params["gray_matter"] if uniform else None,
@@ -639,22 +632,20 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         )
 
         factor = params["resolution_factor"]
-        low = self._downsample(axial, [factor, factor, factor, 1])
-        low[low <= 0] = 0
-        self._axial_low = low
-        # The Nt stability formula uses the max of the FULL-resolution field,
-        # before downsampling (original behavior).
-        self._axial_full_max = np.max(axial)
-        self._brainmask = np.max(low, axis=-1) > 0.00001
-        return low.shape[:3], axial.shape[:3]
+        axial_lowres = self._downsample(axial_original, [factor, factor, factor, 1])
+        axial_lowres[axial_lowres <= 0] = 0
+        self._axial_lowres = axial_lowres
+        # The Nt stability formula deliberately uses the max of the
+        # original-resolution field, before downsampling.
+        self._axial_original_max = np.max(axial_original)
+        self._brainmask_lowres = np.max(axial_lowres, axis=-1) > 0.00001
+        return axial_lowres.shape[:3], axial_original.shape[:3]
 
     def _crop_mask(self) -> NDArray:
-        return self._brainmask
+        return self._brainmask_lowres
 
     def _check_seed(self) -> None:
-        # The original checks only after cropping and diffusivity
-        # construction; checking earlier can only reorder error messages.
-        if not self._brainmask[self.seed_voxel]:
+        if not self._brainmask_lowres[self.seed_voxel]:
             raise ValueError("Origin not within brainmask")
 
     def _initialize_state(self) -> State:
@@ -670,7 +661,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
     def _device_constants(self, dt: float) -> Consts:
         del dt
         assert self._crop_box is not None
-        axial = jnp.asarray(self._axial_low[self._crop_box], dtype=self._dtype)
+        axial = jnp.asarray(self._axial_lowres[self._crop_box], dtype=self._dtype)
         diffusivity = float(self.params["diffusivity"])
         faces: FaceFields = {}
         for axis, name in enumerate(_AXES):
@@ -695,13 +686,13 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         diffusivity = self.params["diffusivity"]
         rho = self.params["rho"]
         dx, dy, dz = self.grid_spacing
-        # Scales with the max of the FULL-resolution axial diffusivity field,
-        # which is over-conservative (the simulated downsampled field's max
-        # is <= the full-res max); deliberately retained from the original.
+        # Scales with the max of the original-resolution axial diffusivity
+        # field, which is over-conservative (the downsampled field's max is
+        # <= it); deliberate — do not change.
         nt = max(
             stopping_time
             * diffusivity
-            * self._axial_full_max
+            * self._axial_original_max
             / np.power(min(dx, dy, dz), 2)
             * 8
             + 100,

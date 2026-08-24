@@ -2,10 +2,9 @@
 
 Each operator is compared with a small NumPy implementation of its documented
 semantics, written here (``_edge_shift``, ``_diffusion_term_numpy``, the
-analytic Gaussian) — no dependency on the frozen reference package. The jnp
-ports run under a local ``jax.enable_x64()`` scope so comparisons are at
-float64; expected differences are at most a few ULP from XLA transcendentals
-and scaling-order. The tensor elongation operator is checked against its
+analytic Gaussian). The jnp operators run under a local ``jax.enable_x64()``
+scope so comparisons are at float64; expected differences are at most a few
+ULP from XLA transcendentals and scaling-order. The tensor elongation operator is checked against its
 documented properties at float32 tolerance.
 """
 

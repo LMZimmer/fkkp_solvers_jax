@@ -1,12 +1,13 @@
-"""Fisher-KPP tumor growth forward solvers, JAX port of ``fisher_kpp``.
+"""Fisher-KPP tumor growth forward solvers.
 
-Public API mirrors the NumPy reference: same class names, same params dicts
-(plus two optional solver options: ``precision: "f32" | "f64"``, default
-"f32", and ``n_steps``, an explicit step count pinning
-dt = stopping_time / n_steps in place of the stability formula), same
-``Result`` dataclass semantics. The explicit-Euler time loop runs as a
-jitted ``jax.lax.scan`` on GPU when one is available, with automatic CPU
-fallback.
+Three solvers share one params-dict interface and return a ``Result``.
+Common solver options: ``precision: "f32" | "f64"`` (default "f32") selects
+the device state dtype, and ``n_steps`` pins an explicit step count
+(dt = stopping_time / n_steps) in place of the stability formula. The
+explicit-Euler time loop runs as a jitted ``jax.lax.scan`` on GPU when one
+is available, with automatic CPU fallback.
+``scripts/run_reference_solves.py`` checks that the reference results are
+matched.
 """
 
 from __future__ import annotations

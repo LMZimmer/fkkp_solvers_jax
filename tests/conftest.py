@@ -1,7 +1,7 @@
 """Shared fixtures: path setup and small synthetic phantoms.
 
-Tests cover ``fisher_kpp_jax`` only; comparison against the frozen NumPy
-reference package lives in ``scripts/run_reference_solves.py``.
+Tests cover ``fisher_kpp_jax`` only; ``scripts/run_reference_solves.py``
+checks that the reference results are matched.
 
 Runnable on CPU: ``JAX_PLATFORMS=cpu pytest tests`` must pass.
 """

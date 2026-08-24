@@ -1,5 +1,4 @@
-"""Shared solve() pipeline for the JAX Fisher-KPP forward solvers (numerics
-follow the frozen ``fisher_kpp`` reference).
+"""Shared solve() pipeline for the JAX Fisher-KPP forward solvers.
 
 The pipeline: unpack/validate params -> downsample tissue (host,
 ``scipy.ndimage.zoom``) -> grid geometry -> ad-hoc stability-derived dt (or
@@ -9,9 +8,9 @@ loop with stopping checks and optional time-series recording -> uncrop ->
 upsample (host) -> Result.
 
 Host/device split: parameter validation, ``zoom`` down/upsampling, crop-box
-computation and the final embed/upsample stay on the host in NumPy (``zoom``
-is deliberately not ported — ``jax.image.resize`` is not numerically
-equivalent). State initialization, face-diffusivity construction and the time
+computation and the final embed/upsample stay on the host in NumPy
+(``scipy.ndimage.zoom`` is deliberate — ``jax.image.resize`` is not
+numerically equivalent and must not replace it). State initialization, face-diffusivity construction and the time
 loop run on the device; the loop is compiled once per cropped shape (see
 ``time_loop._scan_driver``), and x64 is enabled locally around the device
 portion — never globally at import.
@@ -244,7 +243,7 @@ class BaseFKPPSolver(ABC):
         ``Result(success=False, stopping_criterion="error")``."""
         try:
             return self._run_pipeline()
-        except Exception as exc:  # noqa: BLE001 - originals funnel errors into the result
+        except Exception as exc:  # noqa: BLE001 - all failures become an error Result
             if self.params["verbose"]:
                 logger.debug("solver failed: %s", exc)
             return Result(
@@ -468,8 +467,8 @@ class BaseFKPPSolver(ABC):
     def _time_step_count(self) -> tuple[int, float]:
         """(N_simulation_steps, dt) from each solver's own ad-hoc stability
         formula; bypassed entirely when the ``n_steps`` param is set. The
-        three formulas remain mutually inconsistent by heritage and may be
-        unified later."""
+        three formulas are deliberately not unified — do not merge or "fix"
+        them."""
 
     def _guard_spec(self) -> GuardSpec:
         """Post-step guard spec, evaluated on the device inside the scan.

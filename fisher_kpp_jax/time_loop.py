@@ -10,6 +10,7 @@ documented at ``StepSpec``; ``_run_time_loop`` is the host-side entry point.
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import jax
@@ -69,6 +70,19 @@ def _no_guard(
     return zero_i, zero_f, zero_f
 
 
+@partial(
+    jax.jit,
+    static_argnames=(
+        "step_impl",
+        "step_static",
+        "quantity_impl",
+        "quantity_static",
+        "guard_impl",
+        "guard_static",
+        "n_steps",
+        "n_slots",
+    ),
+)
 def _scan_driver(
     state: State,
     consts: Consts,
@@ -86,7 +100,7 @@ def _scan_driver(
 ) -> dict[str, Any]:
     """Jitted explicit-Euler loop as one ``lax.scan`` with a done flag.
 
-    Reproduces the original host loop body order exactly: step -> per-step
+    Loop body order (fixed — results depend on it): step -> per-step
     quantities -> threshold-stop check (priority) -> guard check -> snapshot
     recording (skipped at a break step). After a stop, every remaining scan
     iteration is a masked no-op.
@@ -125,24 +139,19 @@ def _scan_driver(
         stop_threshold = active & threshold_hit
         stop_guard = active & jnp.logical_not(threshold_hit) & (guard_code > 0)
         stopped_now = stop_threshold | stop_guard
-        # The original records after both checks, so a break step is never
+        # Recording happens after both stop checks, so a break step is never
         # snapshotted.
         do_record = active & jnp.logical_not(stopped_now) & (slot >= 0)
 
         buffers = carry["buffers"]
         if n_slots > 0:
             slot_clipped = jnp.clip(slot, 0, n_slots - 1)
-
-            def write(buffer: jax.Array, field: jax.Array) -> jax.Array:
-                current = jax.lax.dynamic_index_in_dim(
-                    buffer, slot_clipped, 0, keepdims=False
+            buffers = {
+                k: buf.at[slot_clipped].set(
+                    jnp.where(do_record, new_state[k], buf[slot_clipped])
                 )
-                value = jnp.where(do_record, field, current)
-                return jax.lax.dynamic_update_index_in_dim(
-                    buffer, value, slot_clipped, 0
-                )
-
-            buffers = {k: write(buffers[k], new_state[k]) for k in buffers}
+                for k, buf in buffers.items()
+            }
 
         stop_kind = jnp.where(
             stop_threshold,
@@ -188,21 +197,6 @@ def _scan_driver(
     return final_carry
 
 
-_scan_driver = jax.jit(
-    _scan_driver,
-    static_argnames=(
-        "step_impl",
-        "step_static",
-        "quantity_impl",
-        "quantity_static",
-        "guard_impl",
-        "guard_static",
-        "n_steps",
-        "n_slots",
-    ),
-)
-
-
 def _run_time_loop(
     state: State,
     consts: Consts,
@@ -216,9 +210,8 @@ def _run_time_loop(
     """Host wrapper around the jitted scan driver.
 
     Maps the (possibly duplicated) ``record_steps`` onto unique snapshot
-    slots — each step is recorded at most once, matching the original
-    ``t in record_steps`` semantics — and splits each spec into its dynamic
-    device scalars and its structural static arguments.
+    slots — each step is recorded at most once — and splits each spec into
+    its dynamic device scalars and its structural static arguments.
     """
     slot_steps = np.unique(np.asarray(record_steps, dtype=np.int64))
     n_slots = int(slot_steps.size)
