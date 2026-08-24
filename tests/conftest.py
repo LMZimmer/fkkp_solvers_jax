@@ -1,4 +1,4 @@
-"""Shared fixtures: path setup and small synthetic phantoms.
+"""Shared fixtures: small synthetic phantoms.
 
 Tests cover ``fisher_kpp_jax`` only; ``scripts/run_reference_solves.py``
 checks that the reference results are matched.
@@ -8,16 +8,8 @@ Runnable on CPU: ``JAX_PLATFORMS=cpu pytest tests`` must pass.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
-
-# The fisher_kpp_jax package lives at the repo root.
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
 
 PHANTOM_N = 24
 
