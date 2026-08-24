@@ -19,7 +19,10 @@ from numpy.typing import NDArray
 from scipy.ndimage import zoom
 
 from .operators import (
+    GuardSpec,
+    QuantitySpec,
     SHRINKAGE_LIMIT,
+    StepSpec,
     VANISHING_DENSITY_LIMIT,
     _RUNNING,
     _STOP_SHRINKAGE,
@@ -380,7 +383,7 @@ class BaseFKPPSolver(ABC):
             "stop_kind": int(loop["stop_kind"]),
             "stop_step": int(loop["stop_step"]),
             "quantity": float(loop["quantity"]),
-            "guard_change": float(loop["guard_change"]),
+            "guard_mass_change": float(loop["guard_mass_change"]),
             "guard_density": float(loop["guard_density"]),
             "buffers": buffers,
         }
@@ -390,14 +393,14 @@ class BaseFKPPSolver(ABC):
         stop_kind: int,
         stop_step: int,
         dt: float,
-        guard_change: float,
+        guard_mass_change: float,
         guard_density: float,
     ) -> str | None:
         """Build the error message of a fired guard, or None if none fired."""
         if stop_kind == _STOP_SHRINKAGE:
             return (
                 "shrinkage guard fired: step-to-step cell-density sum "
-                f"decreased by {-guard_change} (> {SHRINKAGE_LIMIT:g}) "
+                f"decreased by {-guard_mass_change} (> {SHRINKAGE_LIMIT:g}) "
                 f"(at simulation time {stop_step * dt})"
             )
         if stop_kind == _STOP_VANISHING:
@@ -437,7 +440,7 @@ class BaseFKPPSolver(ABC):
             final_time = stop_step * dt
 
         guard_error = self._guard_error_message(
-            stop_kind, stop_step, dt, loop["guard_change"], loop["guard_density"]
+            stop_kind, stop_step, dt, loop["guard_mass_change"], loop["guard_density"]
         )
         if guard_error is not None and self.params["verbose"]:
             logger.info(f"Early loop exit at t={stop_step * dt}: {guard_error}")
@@ -545,23 +548,22 @@ class BaseFKPPSolver(ABC):
         Build the constant device arrays for the scan (face diffusivities,
         tissue masks), once per solve on the cropped grid.
 
-        They are passed to the scan driver as dynamic arguments, so
+        They are passed to the time scan as dynamic arguments, so
         re-solves with the same shapes and dtype reuse the compiled driver.
         """
 
     @abstractmethod
-    def _step_spec(self, dt: float) -> dict[str, Any]:
+    def _step_spec(self, dt: float) -> StepSpec:
         """
         Return the step specification for one explicit-Euler step on the
         cropped grid.
 
-        See ``operators._run_time_loop`` for the function signature and the
-        dynamic/static
+        See ``StepSpec`` for the function signature and the dynamic/static
         split. A solver that rebuilds its diffusivity every step does so
         inside the step function, from the carried state.
         """
 
-    def _quantity_spec(self) -> dict[str, Any]:
+    def _quantity_spec(self) -> QuantitySpec:
         """
         Return the stopping-quantity spec dispatched on stopping_mode.
 
@@ -599,12 +601,12 @@ class BaseFKPPSolver(ABC):
         formulas are deliberately not unified -- do not merge or "fix" them.
         """
 
-    def _guard_spec(self) -> dict[str, Any]:
+    def _guard_spec(self) -> GuardSpec:
         """
         Return the post-step guard spec, evaluated on the device inside the
         scan.
 
-        See ``operators._run_time_loop`` for the function signature. The
+        See ``GuardSpec`` for the function signature. The
         AnisotropicFKPPSolver
         overrides; the default never fires (and is pruned by XLA).
         """

@@ -5,25 +5,81 @@ Device operators use ``jax.numpy``; host operators (bounding box, embed) stay
 in NumPy because they only run once per solve, outside the jitted time loop.
 All stencils apply zero-flux (homogeneous Neumann) boundaries via edge
 replication: the ghost cell outside the array equals the boundary cell, so
-boundary faces carry zero net flux. The dynamic/static argument contract of
-the jitted time loop is documented at ``_run_time_loop``.
+boundary faces carry zero net flux. Which arguments of the jitted time loop
+are dynamic and which are static is documented at ``StepSpec``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from functools import partial
-from typing import Any
+from typing import Any, TypedDict
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from numpy.typing import NDArray
 
+
 # Empirically chosen constants of the Gaussian seed profile.
 GAUSSIAN_SEED_DIFFUSION_TIME: float = 5.0  # width of the analytic heat kernel
 GAUSSIAN_SEED_MASS: float = 250.0  # total mass of the kernel
 GAUSSIAN_SEED_FLOOR: float = 0.1  # values at or below this are zeroed
+
+
+class StepSpec(TypedDict):
+    """Step specification for the jitted time loop.
+
+    func must be defined at module level so that every solve passes the 
+    identical function object and the jit cache is reused.
+    Its required signature::
+
+        def step_func(
+            state: dict[str, jax.Array],
+            constants: dict[str, Any],
+            dynamic_scalars: dict[str, jax.Array],
+            *static_args: Any,
+        ) -> dict[str, jax.Array]: ...
+
+    dynamic_scalars holds 0-d device arrays of individual parameters
+    (changing a value never recompiles); static_args holds static
+    values (changing recompiles).
+    """
+
+    func: Callable[..., dict[str, jax.Array]]
+    dynamic_scalars: dict[str, jax.Array]
+    static_args: tuple[Any, ...]
+
+
+class QuantitySpec(TypedDict):
+    """Stopping-quantity specification, same slots as ``StepSpec``.
+
+    func is called as func(state, constants, dynamic_scalars, *static_args)
+    and returns the float64 stopping quantity.
+    """
+
+    func: Callable[..., jax.Array]
+    dynamic_scalars: dict[str, jax.Array]
+    static_args: tuple[Any, ...]
+
+
+class GuardSpec(TypedDict):
+    """Sanity check evaluated on the device after every step.
+
+    The guard compares the stepped state against the previous one to
+    detect a solve gone wrong (e.g. an explicit-Euler instability); if it
+    fires, the time loop stops and the run is reported as a failure. The
+    default guard (``_no_guard``) never fires. Same slots as ``StepSpec``.
+
+    func is called as
+    func(new_state, previous_state, constants, dynamic_scalars,
+    *static_args) and returns (code, mass change, integrated density);
+    code 0 = no guard fired, 1 = shrinkage, 2 = vanishing volume.
+    """
+
+    func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
+    dynamic_scalars: dict[str, jax.Array]
+    static_args: tuple[Any, ...]
 
 
 def shift_grid_by_one(field: jax.Array, shift: int, axis: int) -> jax.Array:
@@ -161,7 +217,8 @@ def clipped_gaussian(
     Create the initial tumor cell density: an isotropic Gaussian profile
     centered at center_voxel.
 
-    The clipping order is part of the contract: values at or below floor are
+    The clipping order is deliberate and results depend on it: values at or
+    below floor are
     zeroed first (strictly-greater keeps the value), then the profile is
     capped at 1.
 
@@ -320,7 +377,7 @@ _STOP_SHRINKAGE: int = 2
 _STOP_VANISHING: int = 3
 
 SCAN_TRACE_COUNT: int = 0
-"""Number of times the scan driver has been traced in this process
+"""Number of times the time scan has been traced in this process
 (diagnostic: identical consecutive solves must not increase it)."""
 
 
@@ -350,7 +407,7 @@ def _no_guard(
         "n_slots",
     ),
 )
-def _scan_driver(
+def _run_time_scan(
     state: dict[str, jax.Array],
     constants: dict[str, Any],
     dynamics: dict[str, Any],
@@ -375,11 +432,9 @@ def _scan_driver(
 
     This is a single module-level jitted function: the step, quantity and
     guard functions and their static argument tuples are stable across
-    solves, while device arrays and
-    physical scalars are dynamic arguments (the ``_run_time_loop`` spec
-    contract), so
-    re-solves retrace only on a shape/dtype/step-count change (see
-    SCAN_TRACE_COUNT).
+    solves, while device arrays and physical scalars are dynamic arguments
+    (see ``StepSpec``), so re-solves retrace
+    only on a shape/dtype/step-count change (see SCAN_TRACE_COUNT).
 
     Args:
         state: Initial device state on the cropped grid.
@@ -387,11 +442,11 @@ def _scan_driver(
         dynamics: Each function's 0-d device scalars under the keys "step",
             "quantity" and "guard", plus the float64 "stopping_threshold".
         slot_ids: Snapshot slot of each step (-1: no snapshot).
-        step_func: Step function, see ``_run_time_loop``.
+        step_func: Step function, see ``StepSpec``.
         step_static: Static arguments of the step function.
-        quantity_func: Stopping-quantity function, see ``_run_time_loop``.
+        quantity_func: Stopping-quantity function, see ``QuantitySpec``.
         quantity_static: Static arguments of the quantity function.
-        guard_func: Post-step guard function, see ``_run_time_loop``.
+        guard_func: Post-step guard function, see ``GuardSpec``.
         guard_static: Static arguments of the guard function.
         n_steps: Number of scan iterations.
         n_slots: Number of snapshot slots.
@@ -414,7 +469,7 @@ def _scan_driver(
             new_state, constants, dynamics["quantity"], *quantity_static
         )
         threshold_hit = quantity >= dynamics["stopping_threshold"]
-        guard_code, guard_change, guard_density = guard_func(
+        guard_code, guard_mass_change, guard_density = guard_func(
             new_state, prev, constants, dynamics["guard"], *guard_static
         )
 
@@ -452,7 +507,9 @@ def _scan_driver(
             # The loop's last computed stopping quantity: frozen at the value
             # of the stopping step once the loop is done.
             "quantity": jnp.where(active, quantity, carry["quantity"]),
-            "guard_change": jnp.where(stop_guard, guard_change, carry["guard_change"]),
+            "guard_mass_change": jnp.where(
+                stop_guard, guard_mass_change, carry["guard_mass_change"]
+            ),
             "guard_density": jnp.where(
                 stop_guard, guard_density, carry["guard_density"]
             ),
@@ -467,7 +524,7 @@ def _scan_driver(
         "stop_kind": jnp.asarray(_RUNNING, dtype=jnp.int32),
         "stop_step": jnp.asarray(0, dtype=jnp.int32),
         "quantity": jnp.asarray(0.0, dtype=jnp.float64),
-        "guard_change": jnp.asarray(0.0, dtype=jnp.float64),
+        "guard_mass_change": jnp.asarray(0.0, dtype=jnp.float64),
         "guard_density": jnp.asarray(0.0, dtype=jnp.float64),
         "n_recorded": jnp.asarray(0, dtype=jnp.int32),
         "buffers": {
@@ -482,48 +539,31 @@ def _scan_driver(
 def _run_time_loop(
     state: dict[str, jax.Array],
     constants: dict[str, Any],
-    step_spec: dict[str, Any],
-    quantity_spec: dict[str, Any],
-    guard_spec: dict[str, Any],
+    step_spec: StepSpec,
+    quantity_spec: QuantitySpec,
+    guard_spec: GuardSpec,
     n_steps: int,
     stopping_threshold: float,
     record_steps: NDArray,
 ) -> dict[str, Any]:
     """
-    Prepare the host-side inputs and call the jitted scan driver.
+    Prepare the host-side inputs and call the jitted time scan.
 
     Maps the (possibly duplicated) record_steps onto unique snapshot slots --
     each step is recorded at most once.
 
-    Each spec (step_spec, quantity_spec, guard_spec) is a dict with the keys
-    'func', 'dynamic_scalars' and 'static_args'. 'func' is a module-level
-    function; module level gives it a stable identity, so the jit cache
-    persists across solves. The step and stopping-quantity functions are
-    called as func(state, constants, dynamic_scalars, *static_args) and
-    return the stepped state and the float64 stopping quantity respectively;
-    the guard function is called as func(new_state, previous_state,
-    constants, dynamic_scalars, *static_args) and returns (code, shrinkage
-    change, integrated density), where code 0 = no guard fired,
-    1 = shrinkage, 2 = vanishing volume. 'dynamic_scalars' is a dict of
-    named 0-d device arrays (a jit pytree with a stable treedef): every
-    physical parameter a sweep or optimizer would vary (dt, rates,
-    thresholds) goes here, already cast on the host to its use dtype, so
-    changing its value never recompiles. 'static_args' is a hashable tuple
-    holding only structural values (grid spacing, voxel volume -- geometry
-    that cannot change without a shape change).
-
     Args:
         state: Initial device state on the cropped grid.
         constants: Constant device arrays consumed by the functions.
-        step_spec: Step specification, see above.
-        quantity_spec: Stopping-quantity specification, see above.
-        guard_spec: Post-step guard specification, see above.
+        step_spec: Step specification, see ``StepSpec``.
+        quantity_spec: Stopping-quantity specification, see ``QuantitySpec``.
+        guard_spec: Post-step guard specification, see ``GuardSpec``.
         n_steps: Number of time steps.
         stopping_threshold: Threshold on the stopping quantity.
         record_steps: Step indices at which snapshots are recorded.
 
     Returns:
-        The final scan carry, see ``_scan_driver``.
+        The final scan carry, see ``_run_time_scan``.
     """
     slot_steps = np.unique(np.asarray(record_steps, dtype=np.int64))
     n_slots = int(slot_steps.size)
@@ -537,7 +577,7 @@ def _run_time_loop(
         # f64 to match the f64 stopping-quantity reduction it is compared to.
         "stopping_threshold": jnp.asarray(stopping_threshold, dtype=jnp.float64),
     }
-    return _scan_driver(
+    return _run_time_scan(
         state,
         constants,
         dynamics,

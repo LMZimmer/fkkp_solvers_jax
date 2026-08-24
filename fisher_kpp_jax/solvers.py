@@ -2,8 +2,8 @@
 ``TwoCompartmentWithNutrientFKPPSolver`` and ``AnisotropicFKPPSolver``.
 
 The device code is purely functional: each solver's step is a module-level
-function with a stable identity, so the jitted scan driver's cache persists
-across solves (see ``operators._run_time_loop``).
+function with a stable identity, so the jitted time scan's cache persists
+across solves (see ``operators.StepSpec``).
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ from .operators import (
     GAUSSIAN_SEED_DIFFUSION_TIME,
     GAUSSIAN_SEED_FLOOR,
     GAUSSIAN_SEED_MASS,
+    GuardSpec,
     SHRINKAGE_LIMIT,
+    StepSpec,
     VANISHING_DENSITY_LIMIT,
     diffusion_term,
     elongate_tensor_along_principal_axis,
@@ -109,8 +111,8 @@ def _mixture_face_fields(
     return faces
 
 
-# --- module-level device functions (stable identity so the jitted scan
-# --- driver's cache persists across solves; see operators._scan_driver) ---
+# --- module-level device functions (stable identity so the jitted time
+# --- scan's cache persists across solves; see operators._run_time_scan) ---
 
 
 def _single_field_step(
@@ -379,7 +381,7 @@ class FKPPSolver(BaseFKPPSolver):
         )
         return {"face_diffusivities": faces}
 
-    def _step_spec(self, dt: float) -> dict[str, Any]:
+    def _step_spec(self, dt: float) -> StepSpec:
         dynamic_scalars = {
             "dt": self._dynamic_scalar(dt),
             "rho": self._dynamic_scalar(self.params["rho"]),
@@ -504,7 +506,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             "nutrient_faces": nutrient_faces,
         }
 
-    def _step_spec(self, dt: float) -> dict[str, Any]:
+    def _step_spec(self, dt: float) -> StepSpec:
         param_keys = (
             "white_matter_diffusivity",
             "diffusivity_ratio",
@@ -752,7 +754,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             faces[f"bwd_{name}"] = diffusivity * shift_grid_by_one(face, 1, axis=axis)
         return {"face_diffusivities": faces}
 
-    def _step_spec(self, dt: float) -> dict[str, Any]:
+    def _step_spec(self, dt: float) -> StepSpec:
         dynamic_scalars = {
             "dt": self._dynamic_scalar(dt),
             "rho": self._dynamic_scalar(self.params["rho"]),
@@ -763,7 +765,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             "static_args": (self.grid_spacing,),
         }
 
-    def _guard_spec(self) -> dict[str, Any]:
+    def _guard_spec(self) -> GuardSpec:
         """DTI shrinkage/vanishing guards -- semantics at ``_dti_guard``."""
         return {
             "func": _dti_guard,
