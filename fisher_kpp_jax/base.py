@@ -72,7 +72,7 @@ class Result:
     error: str | None = None
 
 
-def _merge_params(
+def _merge_parameters(
     params: Mapping[str, Any],
     required: frozenset[str],
     defaults: Mapping[str, Any],
@@ -188,7 +188,7 @@ class BaseFKPPSolver(ABC):
     _volume_impl: ClassVar[Callable[..., jax.Array]]
 
     def __init__(self, params: Mapping[str, Any]) -> None:
-        merged = _merge_params(
+        merged = _merge_parameters(
             params, self._REQUIRED, self._DEFAULTS, type(self).__name__
         )
         _validate_parameters(merged, type(self).__name__)
