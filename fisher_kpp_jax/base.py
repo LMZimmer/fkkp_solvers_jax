@@ -19,12 +19,7 @@ from numpy.typing import NDArray
 from scipy.ndimage import zoom
 
 from .operators import (
-    Constants,
-    GuardSpec,
-    QuantitySpec,
     SHRINKAGE_LIMIT,
-    State,
-    StepSpec,
     VANISHING_DENSITY_LIMIT,
     _RUNNING,
     _STOP_SHRINKAGE,
@@ -267,12 +262,14 @@ class BaseFKPPSolver(ABC):
             )
 
     def _run_pipeline(self) -> Result:
-        original_shape = self._setup_grid()
+        original_shape, _ = self._setup_grid()
         n_steps, dt = self._resolve_time_stepping()
         loop = self._run_device_loop(n_steps, dt)
         return self._assemble_result(loop, dt, original_shape)
 
-    def _setup_grid(self) -> tuple[int, int, int]:
+    def _setup_grid(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         """
         Downsample the input fields and set up the grid geometry.
 
@@ -280,7 +277,8 @@ class BaseFKPPSolver(ABC):
         seed check.
 
         Returns:
-            The full-resolution 3D grid shape, used to upsample the results.
+            (full-resolution 3D grid shape, low-resolution 3D grid shape).
+            The full-resolution shape is used to upsample the results.
         """
         params = self.params
         resolution_factor = params["resolution_factor"]
@@ -300,7 +298,7 @@ class BaseFKPPSolver(ABC):
             int(params["gaussian_seed_z_fraction"] * nz),
         )
         self._check_seed()
-        return original_shape
+        return original_shape, lowres_shape
 
     def _resolve_time_stepping(self) -> tuple[int, float]:
         """
@@ -314,7 +312,6 @@ class BaseFKPPSolver(ABC):
             n_steps, dt = self._time_step_count()
             dt = float(dt)
         else:
-            # Explicit step count: bypasses the solver's stability formula.
             n_steps = int(self.params["n_steps"])
             dt = float(self.params["stopping_time"]) / n_steps
         if self.params["verbose"]:
@@ -337,7 +334,7 @@ class BaseFKPPSolver(ABC):
         """
         params = self.params
         n_snapshots: int | None = params["n_time_series_snapshots"]
-        record_steps = self._record_steps(n_steps, n_snapshots)
+        record_steps = self._get_record_steps(n_steps, n_snapshots)
 
         # x64 is enabled locally (never globally on import): the state keeps
         # its explicit f32/f64 dtype either way, while the stopping-quantity
@@ -352,7 +349,7 @@ class BaseFKPPSolver(ABC):
             self._crop_box = box
             state_cropped = {k: v[box] for k, v in state_lowres.items()}
 
-            constants = self._device_constants(dt)
+            constants = self._build_device_constants(dt)
 
             loop = _run_time_loop(
                 state_cropped,
@@ -507,7 +504,7 @@ class BaseFKPPSolver(ABC):
         )
         return np.array(zoom(field, factor, order=1))
 
-    def _record_steps(self, n_steps: int, n_records: int | None) -> NDArray:
+    def _get_record_steps(self, n_steps: int, n_records: int | None) -> NDArray:
         """Step indices at which snapshots are recorded (empty for None)."""
         if n_records is None:
             return np.empty(0, dtype=int)
@@ -520,8 +517,8 @@ class BaseFKPPSolver(ABC):
         self,
     ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         """
-        Downsample the solver's tissue/diffusivity input fields (host) and
-        store them on self.
+        Downsample the solver's tissue/diffusivity input fields preserving FOV
+        (host and store them on self.
 
         Returns:
             (low-resolution 3D grid shape, full-resolution 3D grid shape).
@@ -536,14 +533,14 @@ class BaseFKPPSolver(ABC):
         """
 
     @abstractmethod
-    def _initialize_state(self) -> State:
+    def _initialize_state(self) -> dict[str, jax.Array]:
         """
         Return the device state on the full low-resolution grid, at the
         ``precision`` dtype.
         """
 
     @abstractmethod
-    def _device_constants(self, dt: float) -> Constants:
+    def _build_device_constants(self, dt: float) -> dict[str, Any]:
         """
         Build the constant device arrays for the scan (face diffusivities,
         tissue masks), once per solve on the cropped grid.
@@ -553,17 +550,18 @@ class BaseFKPPSolver(ABC):
         """
 
     @abstractmethod
-    def _step_spec(self, dt: float) -> StepSpec:
+    def _step_spec(self, dt: float) -> dict[str, Any]:
         """
-        Return the ``StepSpec`` for one explicit-Euler step on the cropped
-        grid.
+        Return the step specification for one explicit-Euler step on the
+        cropped grid.
 
-        See ``StepSpec`` for the function signature and the dynamic/static
+        See ``operators._run_time_loop`` for the function signature and the
+        dynamic/static
         split. A solver that rebuilds its diffusivity every step does so
         inside the step function, from the carried state.
         """
 
-    def _quantity_spec(self) -> QuantitySpec:
+    def _quantity_spec(self) -> dict[str, Any]:
         """
         Return the stopping-quantity spec dispatched on stopping_mode.
 
@@ -601,12 +599,13 @@ class BaseFKPPSolver(ABC):
         formulas are deliberately not unified -- do not merge or "fix" them.
         """
 
-    def _guard_spec(self) -> GuardSpec:
+    def _guard_spec(self) -> dict[str, Any]:
         """
         Return the post-step guard spec, evaluated on the device inside the
         scan.
 
-        See ``GuardSpec`` for the function signature. The AnisotropicFKPPSolver
+        See ``operators._run_time_loop`` for the function signature. The
+        AnisotropicFKPPSolver
         overrides; the default never fires (and is pruned by XLA).
         """
         return {"func": _no_guard, "dynamic_scalars": {}, "static_args": ()}

@@ -3,7 +3,7 @@
 
 The device code is purely functional: each solver's step is a module-level
 function with a stable identity, so the jitted scan driver's cache persists
-across solves (see ``operators.StepSpec``).
+across solves (see ``operators._run_time_loop``).
 """
 
 from __future__ import annotations
@@ -25,18 +25,13 @@ from .operators import (
     GAUSSIAN_SEED_MASS,
     SHRINKAGE_LIMIT,
     VANISHING_DENSITY_LIMIT,
-    Constants,
-    FaceFields,
-    GuardSpec,
-    State,
-    StepSpec,
     diffusion_term,
-    edge_shift,
     elongate_tensor_along_principal_axis,
     face_average,
     logistic_growth,
     logistic_sigmoid,
     masked_face_average,
+    shift_grid_by_one,
 )
 
 # Tissue-occupancy threshold defining the crop mask.
@@ -84,7 +79,7 @@ def _mixture_face_fields(
     valid_mask: jax.Array,
     diffusivity: float | jax.Array,
     ratio: float | jax.Array,
-) -> FaceFields:
+) -> dict[str, jax.Array]:
     """
     Build white/gray-matter mixture face diffusivities (device).
 
@@ -101,15 +96,16 @@ def _mixture_face_fields(
         ratio: White-to-gray-matter diffusivity ratio.
 
     Returns:
-        The face diffusivities, see ``FaceFields``.
+        The face diffusivities: keys 'fwd_x/y/z' and 'bwd_x/y/z', each the
+        shape of the input grid; see ``diffusion_term``.
     """
-    faces: FaceFields = {}
+    faces: dict[str, jax.Array] = {}
     for axis, name in enumerate(_AXES):
         wm_face = masked_face_average(wm, valid_mask, axis)
         gm_face = masked_face_average(gm, valid_mask, axis)
         fwd = diffusivity * (wm_face + gm_face / ratio)
         faces[f"fwd_{name}"] = fwd
-        faces[f"bwd_{name}"] = edge_shift(fwd, 1, axis=axis)
+        faces[f"bwd_{name}"] = shift_grid_by_one(fwd, 1, axis=axis)
     return faces
 
 
@@ -118,11 +114,11 @@ def _mixture_face_fields(
 
 
 def _single_field_step(
-    state: State,
-    constants: Constants,
+    state: dict[str, jax.Array],
+    constants: dict[str, Any],
     dynamic_scalars: dict[str, jax.Array],
     spacing: tuple[float, float, float],
-) -> State:
+) -> dict[str, jax.Array]:
     """
     Perform one Euler step of the single-field solvers (FKPPSolver and
     AnisotropicFKPPSolver).
@@ -130,8 +126,8 @@ def _single_field_step(
     The face diffusivities are constant in time and come from constants.
 
     Args:
-        state: State with key 'cell_density'.
-        constants: Constant device arrays with key 'faces'.
+        state: State dict with key 'cell_density'.
+        constants: Constant device arrays with key 'face_diffusivities'.
         dynamic_scalars: 0-d device scalars 'dt' and 'rho'.
         spacing: Grid spacing (dx, dy, dz) in mm.
 
@@ -141,17 +137,17 @@ def _single_field_step(
     dt = dynamic_scalars["dt"]
     rho = dynamic_scalars["rho"]
     u = state["cell_density"]
-    diffusion = diffusion_term(u, constants["faces"], spacing)
+    diffusion = diffusion_term(u, constants["face_diffusivities"], spacing)
     delta_u = (diffusion + logistic_growth(u, rho)) * dt
     return {"cell_density": u + delta_u}
 
 
 def _two_compartment_step(
-    state: State,
-    constants: Constants,
+    state: dict[str, jax.Array],
+    constants: dict[str, Any],
     dynamic_scalars: dict[str, jax.Array],
     spacing: tuple[float, float, float],
-) -> State:
+) -> dict[str, jax.Array]:
     """
     Perform one Euler step of the proliferative/necrotic/nutrient system.
 
@@ -159,7 +155,8 @@ def _two_compartment_step(
     updates see the already-updated proliferative field.
 
     Args:
-        state: State with keys 'proliferative', 'necrotic' and 'nutrient'.
+        state: State dict with keys 'proliferative', 'necrotic' and
+            'nutrient'.
         constants: Constant device arrays with keys 'wm', 'gm',
             'tissue_valid' and 'nutrient_faces'.
         dynamic_scalars: 0-d device scalars, see
@@ -224,8 +221,8 @@ def _two_compartment_step(
 
 
 def _mass_single(
-    state: State,
-    constants: Constants,
+    state: dict[str, jax.Array],
+    constants: dict[str, Any],
     dynamic_scalars: dict[str, jax.Array],
     voxel_volume: float,
 ) -> jax.Array:
@@ -235,8 +232,8 @@ def _mass_single(
 
 
 def _mass_two_compartment(
-    state: State,
-    constants: Constants,
+    state: dict[str, jax.Array],
+    constants: dict[str, Any],
     dynamic_scalars: dict[str, jax.Array],
     voxel_volume: float,
 ) -> jax.Array:
@@ -253,8 +250,8 @@ def _mass_two_compartment(
 
 
 def _volume_single(
-    state: State,
-    constants: Constants,
+    state: dict[str, jax.Array],
+    constants: dict[str, Any],
     dynamic_scalars: dict[str, jax.Array],
     voxel_volume: float,
 ) -> jax.Array:
@@ -269,8 +266,8 @@ def _volume_single(
 
 
 def _volume_two_compartment(
-    state: State,
-    constants: Constants,
+    state: dict[str, jax.Array],
+    constants: dict[str, Any],
     dynamic_scalars: dict[str, jax.Array],
     voxel_volume: float,
 ) -> jax.Array:
@@ -283,9 +280,9 @@ def _volume_two_compartment(
 
 
 def _dti_guard(
-    new_state: State,
-    previous_state: State,
-    constants: Constants,
+    new_state: dict[str, jax.Array],
+    previous_state: dict[str, jax.Array],
+    constants: dict[str, Any],
     dynamic_scalars: dict[str, jax.Array],
     voxel_volume: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -360,10 +357,10 @@ class FKPPSolver(BaseFKPPSolver):
     def _crop_mask(self) -> NDArray:
         return (self._gm_lowres + self._wm_lowres) >= CROP_TISSUE_THRESHOLD
 
-    def _initialize_state(self) -> State:
+    def _initialize_state(self) -> dict[str, jax.Array]:
         return {"cell_density": self._gaussian_seed()}
 
-    def _device_constants(self, dt: float) -> Constants:
+    def _build_device_constants(self, dt: float) -> dict[str, Any]:
         del dt
         assert self._crop_box is not None
         gm_host = self._gm_lowres[self._crop_box]
@@ -380,9 +377,9 @@ class FKPPSolver(BaseFKPPSolver):
             float(self.params["white_matter_diffusivity"]),
             float(self.params["diffusivity_ratio"]),
         )
-        return {"faces": faces}
+        return {"face_diffusivities": faces}
 
-    def _step_spec(self, dt: float) -> StepSpec:
+    def _step_spec(self, dt: float) -> dict[str, Any]:
         dynamic_scalars = {
             "dt": self._dynamic_scalar(dt),
             "rho": self._dynamic_scalar(self.params["rho"]),
@@ -464,7 +461,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
     def _crop_mask(self) -> NDArray:
         return (self._gm_lowres + self._wm_lowres) >= CROP_TISSUE_THRESHOLD
 
-    def _initialize_state(self) -> State:
+    def _initialize_state(self) -> dict[str, jax.Array]:
         proliferative = self._gaussian_seed()
         necrotic = jnp.zeros(proliferative.shape, dtype=self._dtype)
         nutrient = jnp.ones(proliferative.shape, dtype=self._dtype)
@@ -480,7 +477,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             "nutrient": nutrient,
         }
 
-    def _device_constants(self, dt: float) -> Constants:
+    def _build_device_constants(self, dt: float) -> dict[str, Any]:
         del dt
         assert self._crop_box is not None
         gm_host = self._gm_lowres[self._crop_box]
@@ -507,7 +504,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             "nutrient_faces": nutrient_faces,
         }
 
-    def _step_spec(self, dt: float) -> StepSpec:
+    def _step_spec(self, dt: float) -> dict[str, Any]:
         param_keys = (
             "white_matter_diffusivity",
             "diffusivity_ratio",
@@ -734,7 +731,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         if not self._brainmask_lowres[self.seed_voxel]:
             raise ValueError("Initial tumor position is outside the brain mask.")
 
-    def _initialize_state(self) -> State:
+    def _initialize_state(self) -> dict[str, jax.Array]:
         cell_density = self._gaussian_seed()
         if self.params["verbose"]:
             logger.info(
@@ -743,19 +740,19 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             )
         return {"cell_density": cell_density}
 
-    def _device_constants(self, dt: float) -> Constants:
+    def _build_device_constants(self, dt: float) -> dict[str, Any]:
         del dt
         assert self._crop_box is not None
         axial = jnp.asarray(self._axial_lowres[self._crop_box], dtype=self._dtype)
         diffusivity = float(self.params["diffusivity"])
-        faces: FaceFields = {}
+        faces: dict[str, jax.Array] = {}
         for axis, name in enumerate(_AXES):
             face = face_average(axial[:, :, :, axis], axis)
             faces[f"fwd_{name}"] = face * diffusivity
-            faces[f"bwd_{name}"] = diffusivity * edge_shift(face, 1, axis=axis)
-        return {"faces": faces}
+            faces[f"bwd_{name}"] = diffusivity * shift_grid_by_one(face, 1, axis=axis)
+        return {"face_diffusivities": faces}
 
-    def _step_spec(self, dt: float) -> StepSpec:
+    def _step_spec(self, dt: float) -> dict[str, Any]:
         dynamic_scalars = {
             "dt": self._dynamic_scalar(dt),
             "rho": self._dynamic_scalar(self.params["rho"]),
@@ -766,7 +763,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             "static_args": (self.grid_spacing,),
         }
 
-    def _guard_spec(self) -> GuardSpec:
+    def _guard_spec(self) -> dict[str, Any]:
         """DTI shrinkage/vanishing guards -- semantics at ``_dti_guard``."""
         return {
             "func": _dti_guard,

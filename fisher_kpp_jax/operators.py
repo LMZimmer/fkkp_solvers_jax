@@ -6,7 +6,7 @@ in NumPy because they only run once per solve, outside the jitted time loop.
 All stencils apply zero-flux (homogeneous Neumann) boundaries via edge
 replication: the ghost cell outside the array equals the boundary cell, so
 boundary faces carry zero net flux. The dynamic/static argument contract of
-the jitted time loop is documented at ``StepSpec``.
+the jitted time loop is documented at ``_run_time_loop``.
 """
 
 from __future__ import annotations
@@ -20,21 +20,13 @@ import jax.numpy as jnp
 import numpy as np
 from numpy.typing import NDArray
 
-FaceFields = dict[str, jax.Array]
-"""Keys: 'fwd_x', 'fwd_y', 'fwd_z', 'bwd_x', 'bwd_y', 'bwd_z'.
-
-'fwd' along an axis is the forward face value (between cells i and i+1);
-'bwd' is its edge-replicated shift by +1 (see ``edge_shift``), the backward
-face (between cells i-1 and i).
-"""
-
 # Empirically chosen constants of the Gaussian seed profile.
 GAUSSIAN_SEED_DIFFUSION_TIME: float = 5.0  # width of the analytic heat kernel
 GAUSSIAN_SEED_MASS: float = 250.0  # total mass of the kernel
 GAUSSIAN_SEED_FLOOR: float = 0.1  # values at or below this are zeroed
 
 
-def edge_shift(field: jax.Array, shift: int, axis: int) -> jax.Array:
+def shift_grid_by_one(field: jax.Array, shift: int, axis: int) -> jax.Array:
     """
     Shift a field by one cell along an axis with edge replication.
 
@@ -80,7 +72,7 @@ def face_average(field: jax.Array, axis: int) -> jax.Array:
     Returns:
         The face-averaged field, same shape as field.
     """
-    return (edge_shift(field, -1, axis=axis) + field) / 2
+    return (shift_grid_by_one(field, -1, axis=axis) + field) / 2
 
 
 def masked_face_average(
@@ -101,13 +93,13 @@ def masked_face_average(
     Returns:
         The masked face-averaged field, same shape as field.
     """
-    condition = jnp.logical_and(edge_shift(valid_mask, -1, axis=axis), valid_mask)
-    return jnp.where(condition, (edge_shift(field, -1, axis=axis) + field) / 2, 0)
+    condition = jnp.logical_and(shift_grid_by_one(valid_mask, -1, axis=axis), valid_mask)
+    return jnp.where(condition, (shift_grid_by_one(field, -1, axis=axis) + field) / 2, 0)
 
 
 def diffusion_term(
     u: jax.Array,
-    diffusivity: FaceFields,
+    diffusivity: dict[str, jax.Array],
     spacing: tuple[float, float, float],
 ) -> jax.Array:
     """
@@ -115,7 +107,12 @@ def diffusion_term(
 
     Args:
         u: Cell-centered density field.
-        diffusivity: Per-axis face diffusivities (see ``FaceFields``).
+        diffusivity: Per-axis face diffusivities with keys 'fwd_x', 'fwd_y',
+            'fwd_z', 'bwd_x', 'bwd_y', 'bwd_z', each the shape of u. 'fwd'
+            along an axis is the forward face value (between cells i and
+            i+1); 'bwd' is its edge-replicated shift by +1 (see
+            ``shift_grid_by_one``), the backward face (between cells i-1
+            and i).
         spacing: Grid spacing (dx, dy, dz) in mm.
 
     Returns:
@@ -126,16 +123,16 @@ def diffusion_term(
     dx, dy, dz = spacing
     d = diffusivity
     div_x = 1 / (dx * dx) * (
-        d["bwd_x"] * (edge_shift(u, 1, axis=0) - u)
-        - d["fwd_x"] * (u - edge_shift(u, -1, axis=0))
+        d["bwd_x"] * (shift_grid_by_one(u, 1, axis=0) - u)
+        - d["fwd_x"] * (u - shift_grid_by_one(u, -1, axis=0))
     )
     div_y = 1 / (dy * dy) * (
-        d["bwd_y"] * (edge_shift(u, 1, axis=1) - u)
-        - d["fwd_y"] * (u - edge_shift(u, -1, axis=1))
+        d["bwd_y"] * (shift_grid_by_one(u, 1, axis=1) - u)
+        - d["fwd_y"] * (u - shift_grid_by_one(u, -1, axis=1))
     )
     div_z = 1 / (dz * dz) * (
-        d["bwd_z"] * (edge_shift(u, 1, axis=2) - u)
-        - d["fwd_z"] * (u - edge_shift(u, -1, axis=2))
+        d["bwd_z"] * (shift_grid_by_one(u, 1, axis=2) - u)
+        - d["fwd_z"] * (u - shift_grid_by_one(u, -1, axis=2))
     )
     return div_x + div_y + div_z
 
@@ -322,50 +319,15 @@ _STOP_THRESHOLD: int = 1
 _STOP_SHRINKAGE: int = 2
 _STOP_VANISHING: int = 3
 
-State = dict[str, jax.Array]
-Constants = dict[str, Any]
-
-StepSpec = dict[str, Any]
-"""Step specification: a dict with keys 'func', 'dynamic_scalars' and
-'static_args'.
-
-'func' is a module-level function called as
-func(state, constants, dynamic_scalars, *static_args); module level gives it
-a stable identity, so the jit cache persists across solves. 'dynamic_scalars'
-is a dict of named 0-d device arrays (a jit pytree with a stable treedef):
-every physical parameter a sweep or optimizer would vary (dt, rates,
-thresholds) goes here, already cast on the host to its use dtype, so changing
-its value never recompiles. 'static_args' is a hashable tuple holding only
-structural values (grid spacing, voxel volume -- geometry that cannot change
-without a shape change).
-"""
-
-QuantitySpec = dict[str, Any]
-"""Stopping-quantity specification with the same keys as ``StepSpec``.
-
-The function is called as
-func(state, constants, dynamic_scalars, *static_args)
-and returns the float64 stopping quantity.
-"""
-
-GuardSpec = dict[str, Any]
-"""Post-step guard specification with the same keys as ``StepSpec``.
-
-The function is called as
-func(new_state, previous_state, constants, dynamic_scalars, *static_args)
-and returns (code, shrinkage change, integrated density); code 0 = no guard
-fired, 1 = shrinkage, 2 = vanishing volume.
-"""
-
 SCAN_TRACE_COUNT: int = 0
 """Number of times the scan driver has been traced in this process
 (diagnostic: identical consecutive solves must not increase it)."""
 
 
 def _no_guard(
-    new_state: State,
-    previous_state: State,
-    constants: Constants,
+    new_state: dict[str, jax.Array],
+    previous_state: dict[str, jax.Array],
+    constants: dict[str, Any],
     dynamic_scalars: dict[str, jax.Array],
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Default guard: never fires (pruned by XLA)."""
@@ -389,12 +351,12 @@ def _no_guard(
     ),
 )
 def _scan_driver(
-    state: State,
-    constants: Constants,
+    state: dict[str, jax.Array],
+    constants: dict[str, Any],
     dynamics: dict[str, Any],
     slot_ids: jax.Array,
     *,
-    step_func: Callable[..., State],
+    step_func: Callable[..., dict[str, jax.Array]],
     step_static: tuple[Any, ...],
     quantity_func: Callable[..., jax.Array],
     quantity_static: tuple[Any, ...],
@@ -414,7 +376,8 @@ def _scan_driver(
     This is a single module-level jitted function: the step, quantity and
     guard functions and their static argument tuples are stable across
     solves, while device arrays and
-    physical scalars are dynamic arguments (the ``StepSpec`` contract), so
+    physical scalars are dynamic arguments (the ``_run_time_loop`` spec
+    contract), so
     re-solves retrace only on a shape/dtype/step-count change (see
     SCAN_TRACE_COUNT).
 
@@ -424,11 +387,11 @@ def _scan_driver(
         dynamics: Each function's 0-d device scalars under the keys "step",
             "quantity" and "guard", plus the float64 "stopping_threshold".
         slot_ids: Snapshot slot of each step (-1: no snapshot).
-        step_func: Step function, see ``StepSpec``.
+        step_func: Step function, see ``_run_time_loop``.
         step_static: Static arguments of the step function.
-        quantity_func: Stopping-quantity function, see ``QuantitySpec``.
+        quantity_func: Stopping-quantity function, see ``_run_time_loop``.
         quantity_static: Static arguments of the quantity function.
-        guard_func: Post-step guard function, see ``GuardSpec``.
+        guard_func: Post-step guard function, see ``_run_time_loop``.
         guard_static: Static arguments of the guard function.
         n_steps: Number of scan iterations.
         n_slots: Number of snapshot slots.
@@ -517,11 +480,11 @@ def _scan_driver(
 
 
 def _run_time_loop(
-    state: State,
-    constants: Constants,
-    step_spec: StepSpec,
-    quantity_spec: QuantitySpec,
-    guard_spec: GuardSpec,
+    state: dict[str, jax.Array],
+    constants: dict[str, Any],
+    step_spec: dict[str, Any],
+    quantity_spec: dict[str, Any],
+    guard_spec: dict[str, Any],
     n_steps: int,
     stopping_threshold: float,
     record_steps: NDArray,
@@ -532,12 +495,29 @@ def _run_time_loop(
     Maps the (possibly duplicated) record_steps onto unique snapshot slots --
     each step is recorded at most once.
 
+    Each spec (step_spec, quantity_spec, guard_spec) is a dict with the keys
+    'func', 'dynamic_scalars' and 'static_args'. 'func' is a module-level
+    function; module level gives it a stable identity, so the jit cache
+    persists across solves. The step and stopping-quantity functions are
+    called as func(state, constants, dynamic_scalars, *static_args) and
+    return the stepped state and the float64 stopping quantity respectively;
+    the guard function is called as func(new_state, previous_state,
+    constants, dynamic_scalars, *static_args) and returns (code, shrinkage
+    change, integrated density), where code 0 = no guard fired,
+    1 = shrinkage, 2 = vanishing volume. 'dynamic_scalars' is a dict of
+    named 0-d device arrays (a jit pytree with a stable treedef): every
+    physical parameter a sweep or optimizer would vary (dt, rates,
+    thresholds) goes here, already cast on the host to its use dtype, so
+    changing its value never recompiles. 'static_args' is a hashable tuple
+    holding only structural values (grid spacing, voxel volume -- geometry
+    that cannot change without a shape change).
+
     Args:
         state: Initial device state on the cropped grid.
         constants: Constant device arrays consumed by the functions.
-        step_spec: Step specification, see ``StepSpec``.
-        quantity_spec: Stopping-quantity specification, see ``QuantitySpec``.
-        guard_spec: Post-step guard specification, see ``GuardSpec``.
+        step_spec: Step specification, see above.
+        quantity_spec: Stopping-quantity specification, see above.
+        guard_spec: Post-step guard specification, see above.
         n_steps: Number of time steps.
         stopping_threshold: Threshold on the stopping quantity.
         record_steps: Step indices at which snapshots are recorded.
