@@ -1,20 +1,12 @@
 """Stateless numerical operators and the jitted time loop for the JAX
 Fisher-KPP solvers.
 
-Device operators use ``jax.numpy``; host operators (bounding box, embed)
-stay in NumPy because they only run once per solve, outside the jitted time
-loop.
-
-Boundary convention: all stencils apply zero-flux (homogeneous Neumann)
-boundaries via edge replication — the ghost cell outside the array equals
-the boundary cell, so boundary faces carry zero net flux.
-
-The time loop is a single module-level jitted scan driver
-(``_scan_driver``): statics are stable across solves, while device arrays
-and physical scalars are dynamic arguments, so re-solves retrace only on a
-shape/dtype/step-count change. The dynamic/static contract each solver must
-follow is documented at ``StepSpec``; ``_run_time_loop`` is the host-side
-entry point.
+Device operators use ``jax.numpy``; host operators (bounding box, embed) stay
+in NumPy because they only run once per solve, outside the jitted time loop.
+All stencils apply zero-flux (homogeneous Neumann) boundaries via edge
+replication: the ghost cell outside the array equals the boundary cell, so
+boundary faces carry zero net flux. The dynamic/static argument contract of
+the jitted time loop is documented at ``StepSpec``.
 """
 
 from __future__ import annotations
@@ -43,12 +35,21 @@ GAUSSIAN_SEED_FLOOR: float = 0.1  # values at or below this are zeroed
 
 
 def edge_shift(field: jax.Array, shift: int, axis: int) -> jax.Array:
-    """Unit shift with edge replication.
+    """
+    Shift a field by one cell along an axis with edge replication.
 
-    Shifts ``field`` by one cell along ``axis``; the entries vacated by the
-    shift are filled with the array edge value (ghost cell equals boundary
-    cell), which realizes zero-flux boundaries in the stencils below. Only
-    unit shifts (+1 / -1) are supported; anything else raises ValueError.
+    The entries vacated by the shift are filled with the array edge value
+    (ghost cell equals boundary cell), which realizes zero-flux boundaries
+    in the stencils below.
+
+    Args:
+        field: Field to shift.
+        shift: Shift direction; only unit shifts (+1 / -1) are supported,
+            anything else raises ValueError.
+        axis: Axis to shift along.
+
+    Returns:
+        The shifted field, same shape as field.
     """
     pad_width = [(0, 0)] * field.ndim
     index: list[slice] = [slice(None)] * field.ndim
@@ -60,16 +61,24 @@ def edge_shift(field: jax.Array, shift: int, axis: int) -> jax.Array:
         pad_width[axis] = (0, 1)
         index[axis] = slice(1, n + 1)
     else:
-        raise ValueError("shift must be +1 or -1")
+        raise ValueError("shift must be +1 or -1.")
     return jnp.pad(field, pad_width, mode="edge")[tuple(index)]
 
 
 def face_average(field: jax.Array, axis: int) -> jax.Array:
-    """Arithmetic average of a cell-centered field onto forward faces.
+    """
+    Average a cell-centered field onto forward faces.
 
     For axis=0: out[i, j, k] = (field[i, j, k] + field[i+1, j, k]) / 2, the
-    value on the face between cells i and i+1 (zero-flux edge replication at
-    the boundary, see module docstring).
+    value on the face between cells i and i+1, with zero-flux edge
+    replication at the boundary.
+
+    Args:
+        field: Cell-centered field.
+        axis: Axis along which to build the faces.
+
+    Returns:
+        The face-averaged field, same shape as field.
     """
     return (edge_shift(field, -1, axis=axis) + field) / 2
 
@@ -77,9 +86,20 @@ def face_average(field: jax.Array, axis: int) -> jax.Array:
 def masked_face_average(
     field: jax.Array, valid_mask: jax.Array, axis: int
 ) -> jax.Array:
-    """Like ``face_average``, but a face is zeroed unless both adjacent cells
-    satisfy ``valid_mask`` — blocks flux across faces touching invalid cells
-    (e.g. CSF, background, fully necrotic tissue).
+    """
+    Average a cell-centered field onto forward faces, zeroing invalid faces.
+
+    Like ``face_average``, but a face is zeroed unless both adjacent cells
+    satisfy valid_mask -- this blocks flux across faces touching invalid
+    cells (e.g. CSF, background, fully necrotic tissue).
+
+    Args:
+        field: Cell-centered field.
+        valid_mask: Boolean mask of valid cells.
+        axis: Axis along which to build the faces.
+
+    Returns:
+        The masked face-averaged field, same shape as field.
     """
     condition = jnp.logical_and(edge_shift(valid_mask, -1, axis=axis), valid_mask)
     return jnp.where(condition, (edge_shift(field, -1, axis=axis) + field) / 2, 0)
@@ -90,12 +110,18 @@ def diffusion_term(
     diffusivity: FaceFields,
     spacing: tuple[float, float, float],
 ) -> jax.Array:
-    """Conservative finite-volume discretization of div(D grad u).
+    """
+    Compute the conservative finite-volume discretization of div(D grad u).
 
-    Uses per-axis face diffusivities (see ``FaceFields``) with zero-flux
-    boundaries: the edge-replicated ghost cell equals the boundary cell, so
-    the flux through a boundary face is exactly zero. ``spacing`` is
-    (dx, dy, dz) in mm.
+    Args:
+        u: Cell-centered density field.
+        diffusivity: Per-axis face diffusivities (see ``FaceFields``).
+        spacing: Grid spacing (dx, dy, dz) in mm.
+
+    Returns:
+        The diffusion term, same shape as u. Boundary faces carry zero flux:
+        the edge-replicated ghost cell equals the boundary cell, so the flux
+        through a boundary face is exactly zero.
     """
     dx, dy, dz = spacing
     d = diffusivity
@@ -115,12 +141,12 @@ def diffusion_term(
 
 
 def logistic_growth(u: jax.Array, rho: float) -> jax.Array:
-    """rho * u * (1 - u)."""
+    """Compute the logistic growth term rho * u * (1 - u)."""
     return rho * (u * (1 - u))
 
 
 def logistic_sigmoid(x: jax.Array) -> jax.Array:
-    """1 / (1 + exp(-x))."""
+    """Compute the logistic sigmoid 1 / (1 + exp(-x))."""
     return 1 / (1 + jnp.exp(-x))
 
 
@@ -134,14 +160,26 @@ def clipped_gaussian(
     mass: float = GAUSSIAN_SEED_MASS,
     floor: float = GAUSSIAN_SEED_FLOOR,
 ) -> jax.Array:
-    """Isotropic Gaussian profile centered at ``center_voxel``; the initial
-    tumor cell density.
+    """
+    Create the initial tumor cell density: an isotropic Gaussian profile
+    centered at center_voxel.
 
-    The clipping order is part of the contract: values at or below ``floor``
-    are zeroed first (strictly-greater keeps the value), then the profile is
-    capped at 1. ``diffusion_time`` and ``mass`` are the analytic heat
-    kernel's width and total mass, ``scale`` widens the seed, and the whole
-    profile is evaluated at ``dtype``.
+    The clipping order is part of the contract: values at or below floor are
+    zeroed first (strictly-greater keeps the value), then the profile is
+    capped at 1.
+
+    Args:
+        shape: Grid shape of the output field.
+        center_voxel: Voxel index of the profile center.
+        spacing: Grid spacing (dx, dy, dz) in mm.
+        scale: Widens the seed by scaling the voxel coordinates.
+        dtype: Dtype at which the whole profile is evaluated.
+        diffusion_time: Width of the analytic heat kernel.
+        mass: Total mass of the analytic heat kernel.
+        floor: Values at or below this are zeroed.
+
+    Returns:
+        The clipped Gaussian profile of the given shape and dtype.
     """
     xv, yv, zv = jnp.meshgrid(
         jnp.arange(0, shape[0], dtype=dtype),
@@ -170,11 +208,19 @@ def clipped_gaussian(
 def tissue_bounding_box(
     mask: NDArray, margin: int = 2
 ) -> tuple[slice, slice, slice]:
-    """Axis-aligned bounding box of the True region of ``mask``.
+    """
+    Compute the axis-aligned bounding box of the True region of mask.
 
-    Expanded by ``margin`` voxels and clipped to the array bounds. Host-side
-    (NumPy): runs once per solve and its output (static slices) determines
-    the jitted shapes.
+    Host-side (NumPy): runs once per solve and its output (static slices)
+    determines the jitted shapes.
+
+    Args:
+        mask: Boolean 3D array.
+        margin: Number of voxels the box is expanded by (clipped to the
+            array bounds).
+
+    Returns:
+        A tuple of three slices selecting the bounding box.
     """
     indices = np.argwhere(mask)
     min_coords = np.maximum(indices.min(axis=0) - margin, 0)
@@ -189,7 +235,17 @@ def tissue_bounding_box(
 def embed(
     field: NDArray, box: tuple[slice, ...], full_shape: tuple[int, ...]
 ) -> NDArray:
-    """Place a cropped field into a float64 zero array of full_shape at box."""
+    """
+    Place a cropped field into a float64 zero array of the full shape.
+
+    Args:
+        field: Cropped field.
+        box: Slices at which the field is placed.
+        full_shape: Shape of the output array.
+
+    Returns:
+        A float64 array of shape full_shape with field placed at box.
+    """
     full = np.zeros(full_shape)
     full[box] = field
     return full
@@ -198,24 +254,34 @@ def embed(
 def elongate_tensor_along_principal_axis(
     tensors: NDArray, factor: float
 ) -> NDArray:
-    """Scale each (..., 3, 3) tensor along its principal eigenvector by factor.
+    """
+    Scale each (..., 3, 3) tensor along its principal eigenvector.
 
     Each tensor is eigendecomposed (batched ``jnp.linalg.eigh`` in float32),
-    its largest eigenvalue is multiplied by ``factor``, and half of the
+    its largest eigenvalue is multiplied by factor, and half of the
     resulting increase is subtracted from each of the two remaining
-    eigenvalues, so the eigenvalue sum — the tensor trace — is preserved up
-    to float32 round-off. Eigenvectors are unchanged; returns float32 NumPy.
+    eigenvalues, so the eigenvalue sum -- the tensor trace -- is preserved
+    up to float32 round-off. Eigenvectors are unchanged.
+
+    Args:
+        tensors: Array of tensors, shape (..., 3, 3).
+        factor: Scaling factor applied to the largest eigenvalue.
+
+    Returns:
+        The elongated tensors as a float32 NumPy array of the same shape.
     """
     tensor_array = jnp.asarray(np.asarray(tensors), dtype=jnp.float32)
 
-    e, v = jnp.linalg.eigh(tensor_array)
-    max_eigenvalue_indices = jnp.argmax(e, axis=-1, keepdims=True)
-    max_eigenvalues = jnp.take_along_axis(e, max_eigenvalue_indices, axis=-1)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(tensor_array)
+    max_eigenvalue_indices = jnp.argmax(eigenvalues, axis=-1, keepdims=True)
+    max_eigenvalues = jnp.take_along_axis(
+        eigenvalues, max_eigenvalue_indices, axis=-1
+    )
     scaled_max_eigenvalues = max_eigenvalues * factor
     difference = scaled_max_eigenvalues - max_eigenvalues
 
     mask = jnp.put_along_axis(
-        jnp.ones_like(e, dtype=bool),
+        jnp.ones_like(eigenvalues, dtype=bool),
         max_eigenvalue_indices,
         False,
         axis=-1,
@@ -224,15 +290,23 @@ def elongate_tensor_along_principal_axis(
 
     # Trace-preserving adjustment: the two non-max eigenvalues each absorb
     # half of the max eigenvalue's increase.
-    e_final = jnp.where(mask, e - difference / 2, e)
-    e_final = jnp.put_along_axis(
-        e_final, max_eigenvalue_indices, scaled_max_eigenvalues, axis=-1, inplace=False
+    final_eigenvalues = jnp.where(mask, eigenvalues - difference / 2, eigenvalues)
+    final_eigenvalues = jnp.put_along_axis(
+        final_eigenvalues,
+        max_eigenvalue_indices,
+        scaled_max_eigenvalues,
+        axis=-1,
+        inplace=False,
     )
 
-    # Reconstruct the tensor
-    diagonal = e_final[..., None, :] * jnp.eye(3, dtype=e_final.dtype)
-    tensor_array_prime = v @ diagonal @ jnp.swapaxes(v, -2, -1)
-    return np.asarray(tensor_array_prime, dtype=np.float32)
+    # Reconstruct the tensor from the adjusted eigendecomposition
+    diagonal = final_eigenvalues[..., None, :] * jnp.eye(
+        3, dtype=final_eigenvalues.dtype
+    )
+    elongated_tensors = (
+        eigenvectors @ diagonal @ jnp.swapaxes(eigenvectors, -2, -1)
+    )
+    return np.asarray(elongated_tensors, dtype=np.float32)
 
 
 # --- jitted time loop ---
@@ -249,41 +323,52 @@ _STOP_SHRINKAGE: int = 2
 _STOP_VANISHING: int = 3
 
 State = dict[str, jax.Array]
-Consts = dict[str, Any]
-#: (impl, dynamic scalars, static args) triples. The impl is a module-level
-#: function (stable identity, so the jit cache persists across solves). The
-#: dynamic scalars are a dict of named 0-d device arrays (a jit pytree with
-#: a stable treedef) — every PHYSICAL parameter a sweep or optimizer would
-#: vary (dt, rates, thresholds) goes here, already cast on the host to its
-#: use dtype, so changing its value never recompiles. The static args tuple
-#: is hashable and holds only structural values (grid spacing, voxel volume
-#: — geometry that cannot change without a shape change). The step impl is
-#: called step_impl(state, consts, dyn, *static).
-StepSpec = tuple[Callable[..., State], dict[str, jax.Array], tuple[Any, ...]]
-#: quantity_impl(state, consts, dyn, *static) -> f64 stopping quantity.
-QuantitySpec = tuple[Callable[..., jax.Array], dict[str, jax.Array], tuple[Any, ...]]
-#: guard_impl(new_state, prev_state, consts, dyn, *static) ->
-#: (code, shrinkage change, integrated density); code 0 = no guard fired,
-#: 1 = shrinkage, 2 = vanishing volume.
-GuardSpec = tuple[
-    Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
-    dict[str, jax.Array],
-    tuple[Any, ...],
-]
+Constants = dict[str, Any]
 
-#: Number of times the scan driver has been traced in this process
-#: (diagnostic: identical consecutive solves must not increase it).
+StepSpec = dict[str, Any]
+"""Step specification: a dict with keys 'impl', 'dynamic_scalars' and
+'static_args'.
+
+'impl' is a module-level function called as
+impl(state, constants, dynamic_scalars, *static_args); module level gives it
+a stable identity, so the jit cache persists across solves. 'dynamic_scalars'
+is a dict of named 0-d device arrays (a jit pytree with a stable treedef):
+every physical parameter a sweep or optimizer would vary (dt, rates,
+thresholds) goes here, already cast on the host to its use dtype, so changing
+its value never recompiles. 'static_args' is a hashable tuple holding only
+structural values (grid spacing, voxel volume -- geometry that cannot change
+without a shape change).
+"""
+
+QuantitySpec = dict[str, Any]
+"""Stopping-quantity specification with the same keys as ``StepSpec``.
+
+The impl is called as impl(state, constants, dynamic_scalars, *static_args)
+and returns the float64 stopping quantity.
+"""
+
+GuardSpec = dict[str, Any]
+"""Post-step guard specification with the same keys as ``StepSpec``.
+
+The impl is called as
+impl(new_state, previous_state, constants, dynamic_scalars, *static_args)
+and returns (code, shrinkage change, integrated density); code 0 = no guard
+fired, 1 = shrinkage, 2 = vanishing volume.
+"""
+
 SCAN_TRACE_COUNT: int = 0
+"""Number of times the scan driver has been traced in this process
+(diagnostic: identical consecutive solves must not increase it)."""
 
 
 def _no_guard(
     new_state: State,
     previous_state: State,
-    consts: Consts,
-    dyn: dict[str, jax.Array],
+    constants: Constants,
+    dynamic_scalars: dict[str, jax.Array],
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Default guard: never fires (pruned by XLA)."""
-    del new_state, previous_state, consts, dyn
+    del new_state, previous_state, constants, dynamic_scalars
     zero_i = jnp.asarray(0, dtype=jnp.int32)
     zero_f = jnp.asarray(0.0, dtype=jnp.float64)
     return zero_i, zero_f, zero_f
@@ -304,7 +389,7 @@ def _no_guard(
 )
 def _scan_driver(
     state: State,
-    consts: Consts,
+    constants: Constants,
     dynamics: dict[str, Any],
     slot_ids: jax.Array,
     *,
@@ -317,28 +402,41 @@ def _scan_driver(
     n_steps: int,
     n_slots: int,
 ) -> dict[str, Any]:
-    """Jitted explicit-Euler loop as one ``lax.scan`` with a done flag.
+    """
+    Run the explicit-Euler time loop as one jitted ``lax.scan``.
 
-    Loop body order (fixed — results depend on it): step -> per-step
+    The loop body order is fixed -- results depend on it: step -> per-step
     quantities -> threshold-stop check (priority) -> guard check -> snapshot
     recording (skipped at a break step). After a stop, every remaining scan
     iteration is a masked no-op.
 
-    A single module-level jitted function: statics are stable across solves,
-    while device arrays and physical scalars are dynamic arguments (the
-    ``StepSpec`` contract), so re-solves retrace only on a shape/dtype/
-    step-count change (see SCAN_TRACE_COUNT).
+    This is a single module-level jitted function: the impls and their
+    static argument tuples are stable across solves, while device arrays and
+    physical scalars are dynamic arguments (the ``StepSpec`` contract), so
+    re-solves retrace only on a shape/dtype/step-count change (see
+    SCAN_TRACE_COUNT).
 
-    Calling conventions for the impls and their dynamic/static splits are
-    documented at ``StepSpec``/``QuantitySpec``/``GuardSpec``. ``dynamics``
-    holds each impl's 0-d device scalars under "step"/"quantity"/"guard",
-    plus the f64 "stopping_threshold"; ``slot_ids`` maps each step to its
-    snapshot slot (-1: none). Returns the final scan carry: final state,
-    stop bookkeeping scalars, snapshot buffers and the recorded-frame count
-    (device values).
+    Args:
+        state: Initial device state on the cropped grid.
+        constants: Constant device arrays consumed by the impls.
+        dynamics: Each impl's 0-d device scalars under the keys "step",
+            "quantity" and "guard", plus the float64 "stopping_threshold".
+        slot_ids: Snapshot slot of each step (-1: no snapshot).
+        step_impl: Step impl, see ``StepSpec``.
+        step_static: Static arguments of the step impl.
+        quantity_impl: Stopping-quantity impl, see ``QuantitySpec``.
+        quantity_static: Static arguments of the quantity impl.
+        guard_impl: Post-step guard impl, see ``GuardSpec``.
+        guard_static: Static arguments of the guard impl.
+        n_steps: Number of scan iterations.
+        n_slots: Number of snapshot slots.
+
+    Returns:
+        The final scan carry: final state, stop bookkeeping scalars,
+        snapshot buffers and the recorded-frame count (device values).
     """
     global SCAN_TRACE_COUNT
-    SCAN_TRACE_COUNT += 1  # trace-time side effect only, by design
+    SCAN_TRACE_COUNT += 1  # incremented once per trace (diagnostic)
 
     xs = (jnp.arange(n_steps, dtype=jnp.int32), slot_ids)
 
@@ -346,13 +444,13 @@ def _scan_driver(
         t, slot = x
         prev = carry["state"]
         active = carry["active"]
-        new_state = step_impl(prev, consts, dynamics["step"], *step_static)
+        new_state = step_impl(prev, constants, dynamics["step"], *step_static)
         quantity = quantity_impl(
-            new_state, consts, dynamics["quantity"], *quantity_static
+            new_state, constants, dynamics["quantity"], *quantity_static
         )
         threshold_hit = quantity >= dynamics["stopping_threshold"]
         guard_code, guard_change, guard_density = guard_impl(
-            new_state, prev, consts, dynamics["guard"], *guard_static
+            new_state, prev, constants, dynamics["guard"], *guard_static
         )
 
         stop_threshold = active & threshold_hit
@@ -398,7 +496,7 @@ def _scan_driver(
         }
         return next_carry, None
 
-    carry0 = {
+    initial_carry = {
         "state": state,
         "active": jnp.asarray(True),
         "stop_kind": jnp.asarray(_RUNNING, dtype=jnp.int32),
@@ -412,13 +510,13 @@ def _scan_driver(
             for k, v in state.items()
         },
     }
-    final_carry, _ = jax.lax.scan(body, carry0, xs)
+    final_carry, _ = jax.lax.scan(body, initial_carry, xs)
     return final_carry
 
 
 def _run_time_loop(
     state: State,
-    consts: Consts,
+    constants: Constants,
     step_spec: StepSpec,
     quantity_spec: QuantitySpec,
     guard_spec: GuardSpec,
@@ -426,38 +524,48 @@ def _run_time_loop(
     stopping_threshold: float,
     record_steps: NDArray,
 ) -> dict[str, Any]:
-    """Host wrapper around the jitted scan driver.
+    """
+    Prepare the host-side inputs and call the jitted scan driver.
 
-    Maps the (possibly duplicated) ``record_steps`` onto unique snapshot
-    slots — each step is recorded at most once — and splits each spec into
-    its dynamic device scalars and its structural static arguments.
+    Maps the (possibly duplicated) record_steps onto unique snapshot slots --
+    each step is recorded at most once.
+
+    Args:
+        state: Initial device state on the cropped grid.
+        constants: Constant device arrays consumed by the impls.
+        step_spec: Step specification, see ``StepSpec``.
+        quantity_spec: Stopping-quantity specification, see ``QuantitySpec``.
+        guard_spec: Post-step guard specification, see ``GuardSpec``.
+        n_steps: Number of time steps.
+        stopping_threshold: Threshold on the stopping quantity.
+        record_steps: Step indices at which snapshots are recorded.
+
+    Returns:
+        The final scan carry, see ``_scan_driver``.
     """
     slot_steps = np.unique(np.asarray(record_steps, dtype=np.int64))
     n_slots = int(slot_steps.size)
     slot_ids = np.full(n_steps, -1, dtype=np.int32)
     if n_slots:
         slot_ids[slot_steps] = np.arange(n_slots, dtype=np.int32)
-    step_impl, step_dyn, step_static = step_spec
-    quantity_impl, quantity_dyn, quantity_static = quantity_spec
-    guard_impl, guard_dyn, guard_static = guard_spec
     dynamics = {
-        "step": step_dyn,
-        "quantity": quantity_dyn,
-        "guard": guard_dyn,
+        "step": step_spec["dynamic_scalars"],
+        "quantity": quantity_spec["dynamic_scalars"],
+        "guard": guard_spec["dynamic_scalars"],
         # f64 to match the f64 stopping-quantity reduction it is compared to.
         "stopping_threshold": jnp.asarray(stopping_threshold, dtype=jnp.float64),
     }
     return _scan_driver(
         state,
-        consts,
+        constants,
         dynamics,
         jnp.asarray(slot_ids),
-        step_impl=step_impl,
-        step_static=step_static,
-        quantity_impl=quantity_impl,
-        quantity_static=quantity_static,
-        guard_impl=guard_impl,
-        guard_static=guard_static,
+        step_impl=step_spec["impl"],
+        step_static=step_spec["static_args"],
+        quantity_impl=quantity_spec["impl"],
+        quantity_static=quantity_spec["static_args"],
+        guard_impl=guard_spec["impl"],
+        guard_static=guard_spec["static_args"],
         n_steps=n_steps,
         n_slots=n_slots,
     )

@@ -1,28 +1,13 @@
-"""Shared solve() pipeline for the JAX Fisher-KPP forward solvers.
+"""Shared solve() pipeline and result type of the JAX Fisher-KPP solvers.
 
-The pipeline: unpack/validate params -> downsample tissue (host,
-``scipy.ndimage.zoom``) -> grid geometry -> ad-hoc stability-derived dt (or
-the explicit ``n_steps`` override) -> Gaussian seed (device) -> bounding-box
-crop -> face diffusivities (device) -> jitted ``jax.lax.scan`` explicit-Euler
-loop with stopping checks and optional time-series recording -> uncrop ->
-upsample (host) -> Result.
-
-Host/device split: parameter validation, ``zoom`` down/upsampling, crop-box
-computation and the final embed/upsample stay on the host in NumPy
-(``scipy.ndimage.zoom`` is deliberate — ``jax.image.resize`` is not
-numerically equivalent and must not replace it). State initialization, face-diffusivity construction and the time
-loop run on the device; the loop is compiled once per cropped shape (see
-``operators._scan_driver``), and x64 is enabled locally around the device
-portion — never globally at import.
-
-Stopping semantics are documented on ``Result`` and the ``_quantity_spec``
-hook; the dynamic/static argument contract that keeps re-solves from
-recompiling is documented at ``operators.StepSpec``.
+``BaseFKPPSolver.solve`` owns the pipeline -- validate parameters,
+downsample the tissue fields on the host, crop to the tissue bounding box,
+run the jitted time loop on the device, embed and upsample the results --
+and subclasses fill in the solver-specific hooks.
 """
 
 from __future__ import annotations
 
-import logging
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -32,11 +17,12 @@ from typing import Any, ClassVar, Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+from loguru import logger
 from numpy.typing import NDArray
 from scipy.ndimage import zoom
 
 from .operators import (
-    Consts,
+    Constants,
     GuardSpec,
     QuantitySpec,
     SHRINKAGE_LIMIT,
@@ -54,19 +40,30 @@ from .operators import (
     tissue_bounding_box,
 )
 
-logger = logging.getLogger(__name__)
-
 CROP_MARGIN: int = 2  # voxels of margin left around the crop mask
+
+DEFAULT_DENSITY_THRESHOLD: float = 0.5
 
 
 @dataclass(slots=True)
 class Result:
-    """Solver outcome.
+    """
+    Outcome of a solver run.
 
-    ``final_stopping_quantity`` is the last value of the quantity compared
-    against ``stopping_threshold``: total cell mass for ``stopping_mode="mass"``
-    (an integrated density, not a physical volume), thresholded volume for
-    ``stopping_mode="volume"``.
+    Attributes:
+        success: Whether the solve completed without an error.
+        initial_state: Initial fields on the full-resolution grid.
+        final_state: Final fields on the full-resolution grid.
+        final_time: Simulation time at which the loop ended.
+        final_stopping_quantity: Last value of the quantity compared against
+            stopping_threshold: total cell mass for stopping_mode="mass" (an
+            integrated density, not a physical volume), thresholded volume
+            for stopping_mode="volume".
+        stopping_criterion: What ended the run: "time", "threshold" or
+            "error".
+        time_series: Recorded snapshots per field, or None if none were
+            requested.
+        error: Description of the failure or fired guard, else None.
     """
 
     success: bool
@@ -79,75 +76,88 @@ class Result:
     error: str | None = None
 
 
-DEFAULT_DENSITY_THRESHOLD: float = 0.5
-
-
 def _merge_params(
     params: Mapping[str, Any],
     required: frozenset[str],
     defaults: Mapping[str, Any],
     solver_name: str,
 ) -> dict[str, Any]:
-    """Strict parameter merge: unknown keys and missing required keys raise.
+    """
+    Merge user parameters with the solver defaults, strictly: unknown keys
+    and missing required keys raise.
 
-    ``stopping_volume`` is accepted as a deprecated alias of
-    ``stopping_threshold`` (the quantity it thresholds is only a physical
-    volume in "volume" mode); supplying both raises.
+    stopping_volume is accepted as a deprecated alias of stopping_threshold
+    (the quantity it thresholds is only a physical volume in "volume" mode);
+    supplying both raises.
+
+    Args:
+        params: User-supplied parameters.
+        required: Names of the required parameters.
+        defaults: Default values of the optional parameters.
+        solver_name: Solver class name, used in error messages.
+
+    Returns:
+        The merged parameter dict.
     """
     params = dict(params)
     if "stopping_volume" in params:
         if "stopping_threshold" in params:
             raise ValueError(
                 f"{solver_name}: pass only one of 'stopping_threshold' and its "
-                "deprecated alias 'stopping_volume'"
+                "deprecated alias 'stopping_volume'."
             )
         warnings.warn(
             f"{solver_name}: 'stopping_volume' is deprecated, use "
-            "'stopping_threshold' (identical semantics)",
+            "'stopping_threshold' (identical semantics).",
             DeprecationWarning,
             stacklevel=3,
         )
         params["stopping_threshold"] = params.pop("stopping_volume")
     unknown = sorted(set(params) - required - set(defaults))
     if unknown:
-        raise ValueError(f"{solver_name}: unknown parameter(s): {unknown}")
+        raise ValueError(f"{solver_name}: unknown parameter(s): {unknown}.")
     missing = sorted(required - set(params))
     if missing:
-        raise KeyError(f"{solver_name}: missing required parameter(s): {missing}")
+        raise KeyError(f"{solver_name}: missing required parameter(s): {missing}.")
     merged = dict(defaults)
     merged.update(params)
     return merged
 
 
 def _validate_parameters(merged: dict[str, Any], solver_name: str) -> None:
-    """Value checks shared by all solvers, run right after the schema merge.
+    """
+    Check the parameter values shared by all solvers, right after the schema
+    merge.
 
     density_threshold is only meaningful for "volume" mode and is rejected
     otherwise (no silent unused parameters); in "volume" mode it is the one
     default filled in here (logged), because it depends on stopping_mode.
+
+    Args:
+        merged: Merged parameter dict, modified in place.
+        solver_name: Solver class name, used in error messages.
     """
     mode = merged["stopping_mode"]
     if mode not in ("mass", "volume"):
         raise ValueError(
-            f"{solver_name}: stopping_mode must be 'mass' or 'volume', got {mode!r}"
+            f"{solver_name}: stopping_mode must be 'mass' or 'volume', got {mode!r}."
         )
     if mode == "mass":
         if merged["density_threshold"] is not None:
             raise ValueError(
                 f"{solver_name}: density_threshold is only valid with "
-                "stopping_mode='volume'"
+                "stopping_mode='volume'."
             )
     elif merged["density_threshold"] is None:
         merged["density_threshold"] = DEFAULT_DENSITY_THRESHOLD
         logger.info(
-            "%s: density_threshold not set, defaulting to %s",
-            solver_name,
-            DEFAULT_DENSITY_THRESHOLD,
+            f"{solver_name}: density_threshold not set, defaulting to "
+            f"{DEFAULT_DENSITY_THRESHOLD}."
         )
     if merged["precision"] not in ("f32", "f64"):
         raise ValueError(
             f"{solver_name}: precision must be 'f32' or 'f64', "
-            f"got {merged['precision']!r}"
+            f"got {merged['precision']!r}."
         )
     n_steps = merged["n_steps"]
     if n_steps is not None and not (
@@ -157,7 +167,7 @@ def _validate_parameters(merged: dict[str, Any], solver_name: str) -> None:
     ):
         raise ValueError(
             f"{solver_name}: n_steps must be a positive integer or None, "
-            f"got {n_steps!r}"
+            f"got {n_steps!r}."
         )
 
 
@@ -165,28 +175,36 @@ def _validate_seed_fractions(params: Mapping[str, Any]) -> None:
     for axis in "xyz":
         key = f"gaussian_seed_{axis}_fraction"
         if not 0 <= params[key] <= 1:
-            raise ValueError(f"{key} must be between 0 and 1")
+            raise ValueError(f"{key} must be between 0 and 1.")
 
 
 class BaseFKPPSolver(ABC):
-    """Template method: solve() owns the shared pipeline; subclasses fill hooks.
+    """
+    Base class implementing the shared solve() pipeline as a template method.
 
     __init__ merges and validates params against the class's _REQUIRED /
-    _DEFAULTS schema. Grid attributes (grid_shape, grid_spacing, seed_voxel)
-    are populated by solve() after downsampling, before any hook that uses
-    them is called.
+    _DEFAULTS schema; subclasses implement the solver-specific hooks.
+
+    Attributes:
+        params: Merged and validated solver parameters.
+        grid_shape: Low-resolution 3D grid shape, populated by solve() after
+            downsampling, before any hook that uses it is called.
+        grid_spacing: Grid spacing in mm after downsampling, populated by
+            solve() alongside grid_shape.
+        seed_voxel: Voxel index of the Gaussian seed center, populated by
+            solve() alongside grid_shape.
     """
 
     grid_shape: tuple[int, int, int]
-    grid_spacing: tuple[float, float, float]  # mm, post-downsampling
+    grid_spacing: tuple[float, float, float]
     seed_voxel: tuple[int, int, int]
 
-    #: Parameter schema, defined per solver class.
+    # Parameter schema, defined per solver class.
     _REQUIRED: ClassVar[frozenset[str]]
     _DEFAULTS: ClassVar[dict[str, Any]]
-    #: Stopping-quantity device impls consumed by ``_quantity_spec``:
-    #: module-level functions wrapped in ``staticmethod`` (stable identity
-    #: for the jit cache), set per solver class.
+    # Stopping-quantity device impls consumed by _quantity_spec:
+    # module-level functions wrapped in staticmethod (stable identity for
+    # the jit cache), set per solver class.
     _mass_impl: ClassVar[Callable[..., jax.Array]]
     _volume_impl: ClassVar[Callable[..., jax.Array]]
 
@@ -205,7 +223,7 @@ class BaseFKPPSolver(ABC):
 
     @property
     def voxel_volume(self) -> float:
-        """Product of grid_spacing components (mm^3)."""
+        """Product of the grid_spacing components (mm^3)."""
         dx, dy, dz = self.grid_spacing
         return dx * dy * dz
 
@@ -214,8 +232,10 @@ class BaseFKPPSolver(ABC):
         """Device state dtype selected by the ``precision`` parameter."""
         return jnp.float64 if self.params["precision"] == "f64" else jnp.float32
 
-    def _dyn_scalar(self, value: Any) -> jax.Array:
-        """Physical scalar as a dynamic 0-d device array at the state dtype.
+    def _dynamic_scalar(self, value: Any) -> jax.Array:
+        """
+        Convert a physical scalar to a dynamic 0-d device array at the state
+        dtype.
 
         Casting on the host keeps the value out of the jit cache key while
         matching closure-literal numerics exactly: a weak f64 Python float
@@ -225,8 +245,11 @@ class BaseFKPPSolver(ABC):
         return jnp.asarray(float(value), dtype=self._dtype)
 
     def _gaussian_seed(self) -> jax.Array:
-        """Clipped-Gaussian initial tumor density on the full low-res grid,
-        from the gaussian_seed_* params, at the ``precision`` dtype."""
+        """
+        Create the clipped-Gaussian initial tumor density on the full
+        low-resolution grid, from the gaussian_seed_* params, at the
+        ``precision`` dtype.
+        """
         return clipped_gaussian(
             self.grid_shape,
             self.seed_voxel,
@@ -241,13 +264,20 @@ class BaseFKPPSolver(ABC):
     # --- shared pipeline ---
 
     def solve(self) -> Result:
-        """Run the full pipeline; never raises — any failure is returned as
-        ``Result(success=False, stopping_criterion="error")``."""
+        """
+        Run the full pipeline.
+
+        Never raises: any failure is returned as Result(success=False,
+        stopping_criterion="error").
+
+        Returns:
+            The Result of the run.
+        """
         try:
             return self._run_pipeline()
         except Exception as exc:  # noqa: BLE001 - all failures become an error Result
             if self.params["verbose"]:
-                logger.debug("solver failed: %s", exc)
+                logger.error(f"Solver failed: {exc}")
             return Result(
                 success=False,
                 initial_state={},
@@ -259,10 +289,22 @@ class BaseFKPPSolver(ABC):
             )
 
     def _run_pipeline(self) -> Result:
+        original_shape = self._setup_grid()
+        n_steps, dt = self._resolve_time_stepping()
+        loop = self._run_device_loop(n_steps, dt)
+        return self._assemble_result(loop, dt, original_shape)
+
+    def _setup_grid(self) -> tuple[int, int, int]:
+        """
+        Downsample the input fields and set up the grid geometry.
+
+        Populates grid_shape, grid_spacing and seed_voxel, then runs the
+        seed check.
+
+        Returns:
+            The full-resolution 3D grid shape, used to upsample the results.
+        """
         params = self.params
-        stopping_time = float(params["stopping_time"])
-        stopping_threshold = float(params["stopping_threshold"])
-        verbose = bool(params["verbose"])
         resolution_factor = params["resolution_factor"]
 
         lowres_shape, original_shape = self._prepare_fields()
@@ -280,26 +322,51 @@ class BaseFKPPSolver(ABC):
             int(params["gaussian_seed_z_fraction"] * nz),
         )
         self._check_seed()
+        return original_shape
 
-        if params["n_steps"] is None:
+    def _resolve_time_stepping(self) -> tuple[int, float]:
+        """
+        Choose the number of simulation time steps and the step size dt.
+
+        Returns:
+            (n_steps, dt): the solver's own stability formula by default, or
+            the explicit n_steps override (dt = stopping_time / n_steps).
+        """
+        if self.params["n_steps"] is None:
             n_steps, dt = self._time_step_count()
             dt = float(dt)
         else:
             # Explicit step count: bypasses the solver's stability formula.
-            n_steps = int(params["n_steps"])
-            dt = stopping_time / n_steps
-        if verbose:
-            logger.debug("number of simulation timesteps: %d", n_steps)
+            n_steps = int(self.params["n_steps"])
+            dt = float(self.params["stopping_time"]) / n_steps
+        if self.params["verbose"]:
+            logger.info(f"Number of simulation timesteps: {n_steps}")
+        return n_steps, dt
 
+    def _run_device_loop(self, n_steps: int, dt: float) -> dict[str, Any]:
+        """
+        Initialize the device state, crop it to the tissue bounding box and
+        run the jitted time loop.
+
+        Args:
+            n_steps: Number of time steps.
+            dt: Time step size.
+
+        Returns:
+            Host-side loop outputs: the initial low-resolution state, the
+            final cropped state, the stop bookkeeping values and the
+            recorded snapshot buffers (None unless snapshots were requested).
+        """
+        params = self.params
         n_snapshots: int | None = params["n_time_series_snapshots"]
         record_steps = self._record_steps(n_steps, n_snapshots)
 
-        # x64 is enabled locally (config-safe, never globally on import): the
-        # state keeps its explicit f32/f64 dtype either way, while the
-        # stopping-quantity and guard reductions always run in float64.
+        # x64 is enabled locally (never globally on import): the state keeps
+        # its explicit f32/f64 dtype either way, while the stopping-quantity
+        # and guard reductions always run in float64.
         with jax.enable_x64():
             state_lowres = self._initialize_state()
-            state_lowres_initial = {
+            initial_state = {
                 k: np.asarray(v, dtype=np.float64) for k, v in state_lowres.items()
             }
 
@@ -307,26 +374,21 @@ class BaseFKPPSolver(ABC):
             self._crop_box = box
             state_cropped = {k: v[box] for k, v in state_lowres.items()}
 
-            consts = self._device_constants(dt)
+            constants = self._device_constants(dt)
 
             loop = _run_time_loop(
                 state_cropped,
-                consts,
+                constants,
                 self._step_spec(dt),
                 self._quantity_spec(),
                 self._guard_spec(),
                 n_steps,
-                stopping_threshold,
+                float(params["stopping_threshold"]),
                 record_steps,
             )
-            state_cropped_final = {
+            final_state_cropped = {
                 k: np.asarray(v, dtype=np.float64) for k, v in loop["state"].items()
             }
-            stop_kind = int(loop["stop_kind"])
-            stop_step = int(loop["stop_step"])
-            stopping_quantity = float(loop["quantity"])
-            guard_change = float(loop["guard_change"])
-            guard_density = float(loop["guard_density"])
             n_recorded = int(loop["n_recorded"])
             buffers = (
                 {
@@ -337,34 +399,82 @@ class BaseFKPPSolver(ABC):
                 else None
             )
 
-        if stop_kind == _RUNNING:
-            final_time = stopping_time
-        else:
-            final_time = stop_step * dt
+        return {
+            "initial_state": initial_state,
+            "final_state_cropped": final_state_cropped,
+            "stop_kind": int(loop["stop_kind"]),
+            "stop_step": int(loop["stop_step"]),
+            "quantity": float(loop["quantity"]),
+            "guard_change": float(loop["guard_change"]),
+            "guard_density": float(loop["guard_density"]),
+            "buffers": buffers,
+        }
 
-        guard_error: str | None = None
+    def _guard_error_message(
+        self,
+        stop_kind: int,
+        stop_step: int,
+        dt: float,
+        guard_change: float,
+        guard_density: float,
+    ) -> str | None:
+        """Build the error message of a fired guard, or None if none fired."""
         if stop_kind == _STOP_SHRINKAGE:
-            guard_error = (
+            return (
                 "shrinkage guard fired: step-to-step cell-density sum "
                 f"decreased by {-guard_change} (> {SHRINKAGE_LIMIT:g}) "
                 f"(at simulation time {stop_step * dt})"
             )
-        elif stop_kind == _STOP_VANISHING:
-            guard_error = (
+        if stop_kind == _STOP_VANISHING:
+            return (
                 "vanishing-volume guard fired: integrated cell density "
                 f"{guard_density} < {VANISHING_DENSITY_LIMIT:g} "
                 f"(at simulation time {stop_step * dt})"
             )
-        if guard_error is not None and verbose:
-            logger.debug("early loop exit at t=%s: %s", stop_step * dt, guard_error)
+        return None
 
-        state_lowres_final = {
-            k: embed(v, box, lowres_shape) for k, v in state_cropped_final.items()
+    def _assemble_result(
+        self,
+        loop: dict[str, Any],
+        dt: float,
+        original_shape: tuple[int, int, int],
+    ) -> Result:
+        """
+        Embed the cropped loop outputs into the full low-resolution grid,
+        upsample them to the original resolution and build the Result.
+
+        Args:
+            loop: Host-side loop outputs of _run_device_loop.
+            dt: Time step size.
+            original_shape: Full-resolution 3D grid shape.
+
+        Returns:
+            The assembled Result.
+        """
+        stop_kind = loop["stop_kind"]
+        stop_step = loop["stop_step"]
+        lowres_shape = self.grid_shape
+        box = self._crop_box
+
+        if stop_kind == _RUNNING:
+            final_time = float(self.params["stopping_time"])
+        else:
+            final_time = stop_step * dt
+
+        guard_error = self._guard_error_message(
+            stop_kind, stop_step, dt, loop["guard_change"], loop["guard_density"]
+        )
+        if guard_error is not None and self.params["verbose"]:
+            logger.info(f"Early loop exit at t={stop_step * dt}: {guard_error}")
+
+        final_state = {
+            k: embed(v, box, lowres_shape)
+            for k, v in loop["final_state_cropped"].items()
         }
 
-        result_time_series: dict[str, NDArray] | None = None
-        if buffers is not None:
-            result_time_series = {
+        time_series: dict[str, NDArray] | None = None
+        if loop["buffers"] is not None:
+            time_series = {
                 key: np.array(
                     [
                         self._upsample_to(
@@ -373,7 +483,7 @@ class BaseFKPPSolver(ABC):
                         for frame_cropped in frames
                     ]
                 )
-                for key, frames in buffers.items()
+                for key, frames in loop["buffers"].items()
             }
 
         if guard_error is not None:
@@ -387,25 +497,32 @@ class BaseFKPPSolver(ABC):
             success=guard_error is None,
             initial_state={
                 k: self._upsample_to(v, original_shape)
-                for k, v in state_lowres_initial.items()
+                for k, v in loop["initial_state"].items()
             },
             final_state={
                 k: self._upsample_to(v, original_shape)
-                for k, v in state_lowres_final.items()
+                for k, v in final_state.items()
             },
             final_time=final_time,
-            final_stopping_quantity=stopping_quantity,
+            final_stopping_quantity=loop["quantity"],
             stopping_criterion=stopping_criterion,
-            time_series=result_time_series,
+            time_series=time_series,
             error=guard_error,
         )
 
     def _downsample(
         self, field: NDArray, factor: float | Sequence[float], order: int = 1
     ) -> NDArray:
+        """
+        Downsample a host field with ``scipy.ndimage.zoom``.
+
+        ``scipy.ndimage.zoom`` is deliberate -- ``jax.image.resize`` is not
+        numerically equivalent and must not replace it.
+        """
         return zoom(field, factor, order=order)
 
     def _upsample_to(self, field: NDArray, shape: tuple[int, ...]) -> NDArray:
+        """Upsample a host field to shape with a linear ``scipy.ndimage.zoom``."""
         # Per-axis zoom factor new size / old size, then a linear zoom up.
         factor = tuple(
             new_sz / float(orig_sz) for new_sz, orig_sz in zip(shape, field.shape)
@@ -413,6 +530,7 @@ class BaseFKPPSolver(ABC):
         return np.array(zoom(field, factor, order=1))
 
     def _record_steps(self, n_steps: int, n_records: int | None) -> NDArray:
+        """Step indices at which snapshots are recorded (empty for None)."""
         if n_records is None:
             return np.empty(0, dtype=int)
         return np.linspace(0, n_steps - 1, n_records, dtype=int)
@@ -421,67 +539,102 @@ class BaseFKPPSolver(ABC):
 
     @abstractmethod
     def _prepare_fields(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-        """Downsample the solver's tissue/diffusivity input fields (host) and
-        store them on self. Returns (low-res 3D grid shape, full-res 3D
-        shape)."""
+        """
+        Downsample the solver's tissue/diffusivity input fields (host) and
+        store them on self.
+
+        Returns:
+            (low-resolution 3D grid shape, full-resolution 3D grid shape).
+        """
 
     @abstractmethod
     def _crop_mask(self) -> NDArray:
-        """Boolean host mask whose bounding box defines the simulation
-        subdomain. Tissue occupancy for the tissue-based solvers, brainmask
-        for the DTI solver."""
+        """
+        Return the boolean host mask whose bounding box defines the
+        simulation subdomain: tissue occupancy for the tissue-based solvers,
+        brain mask for the DTI solver.
+        """
 
     @abstractmethod
     def _initialize_state(self) -> State:
-        """Device state on the full low-res grid, at the ``precision`` dtype."""
+        """
+        Return the device state on the full low-resolution grid, at the
+        ``precision`` dtype.
+        """
 
     @abstractmethod
-    def _device_constants(self, dt: float) -> Consts:
-        """Constant device arrays for the scan (face diffusivities, tissue
-        masks), built once per solve on the cropped grid. Passed to the scan
-        driver as dynamic arguments, so re-solves with the same shapes and
-        dtype reuse the compiled driver."""
+    def _device_constants(self, dt: float) -> Constants:
+        """
+        Build the constant device arrays for the scan (face diffusivities,
+        tissue masks), once per solve on the cropped grid.
+
+        They are passed to the scan driver as dynamic arguments, so
+        re-solves with the same shapes and dtype reuse the compiled driver.
+        """
 
     @abstractmethod
     def _step_spec(self, dt: float) -> StepSpec:
-        """``StepSpec`` for one explicit-Euler step on the cropped grid:
-        step_impl(state, consts, dyn, *static). See the ``StepSpec`` contract
-        for the dynamic/static split. A solver that rebuilds its diffusivity
-        every step does so inside step_impl, from the carried state."""
+        """
+        Return the ``StepSpec`` for one explicit-Euler step on the cropped
+        grid.
+
+        See ``StepSpec`` for the impl signature and the dynamic/static
+        split. A solver that rebuilds its diffusivity every step does so
+        inside the impl, from the carried state.
+        """
 
     def _quantity_spec(self) -> QuantitySpec:
-        """Stopping-quantity spec dispatched on stopping_mode — see
-        ``Result.final_stopping_quantity``: total cell mass (``_mass_impl``,
-        the default) or voxel_volume * count(cell density > density_threshold)
+        """
+        Return the stopping-quantity spec dispatched on stopping_mode.
+
+        See ``Result.final_stopping_quantity``: total cell mass
+        (``_mass_impl``, the default) or
+        voxel_volume * count(cell density > density_threshold)
         (``_volume_impl``). The reduction runs in float64 regardless of the
         state dtype; which fields count as cell density is documented on the
-        per-solver impls."""
+        per-solver impls.
+        """
         if self.params["stopping_mode"] == "volume":
-            dyn = {
-                "density_threshold": self._dyn_scalar(
+            dynamic_scalars = {
+                "density_threshold": self._dynamic_scalar(
                     self.params["density_threshold"]
                 )
             }
-            return self._volume_impl, dyn, (self.voxel_volume,)
-        return self._mass_impl, {}, (self.voxel_volume,)
+            return {
+                "impl": self._volume_impl,
+                "dynamic_scalars": dynamic_scalars,
+                "static_args": (self.voxel_volume,),
+            }
+        return {
+            "impl": self._mass_impl,
+            "dynamic_scalars": {},
+            "static_args": (self.voxel_volume,),
+        }
 
     @abstractmethod
     def _time_step_count(self) -> tuple[int, float]:
-        """(N_simulation_steps, dt) from each solver's own ad-hoc stability
-        formula; bypassed entirely when the ``n_steps`` param is set. The
-        three formulas are deliberately not unified — do not merge or "fix"
-        them."""
+        """
+        Return (N_simulation_steps, dt) from the solver's own ad-hoc
+        stability formula.
+
+        Bypassed entirely when the ``n_steps`` param is set. The three
+        formulas are deliberately not unified -- do not merge or "fix" them.
+        """
 
     def _guard_spec(self) -> GuardSpec:
-        """Post-step guard spec, evaluated on the device inside the scan.
+        """
+        Return the post-step guard spec, evaluated on the device inside the
+        scan.
 
-        guard_impl(new_state, prev_state, consts, dyn, *static) returns
-        (code, shrinkage value, integrated density) with code 0 when no
-        guard fires. The AnisotropicFKPPSolver overrides; the default never
-        fires (and is pruned by XLA)."""
-        return _no_guard, {}, ()
+        See ``GuardSpec`` for the impl signature. The AnisotropicFKPPSolver
+        overrides; the default never fires (and is pruned by XLA).
+        """
+        return {"impl": _no_guard, "dynamic_scalars": {}, "static_args": ()}
 
     def _check_seed(self) -> None:
-        """Raise if the seed voxel lies outside the solver's simulated
-        tissue. Runs once grid geometry and the seed voxel are known; the
-        default accepts any seed (the two-compartment solver never checks)."""
+        """
+        Raise if the seed voxel lies outside the solver's simulated tissue.
+
+        Runs once grid geometry and the seed voxel are known; the default
+        accepts any seed (the two-compartment solver never checks).
+        """

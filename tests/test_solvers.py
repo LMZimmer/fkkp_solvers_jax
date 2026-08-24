@@ -244,7 +244,7 @@ def test_seed_outside_tissue_errors(tissue_phantom):
     result = FKPPSolver(params).solve()
     assert result.success is False
     assert result.stopping_criterion == "error"
-    assert result.error == "Initial tumor position is outside the brain matter"
+    assert result.error == "Initial tumor position is outside the brain matter."
 
 
 def test_stopping_volume_deprecated_alias(tissue_phantom):
