@@ -410,7 +410,7 @@ def _no_guard(
 def _run_time_scan(
     state: dict[str, jax.Array],
     constants: dict[str, Any],
-    dynamics: dict[str, Any],
+    dynamic_args: dict[str, Any],
     slot_ids: jax.Array,
     *,
     step_func: Callable[..., dict[str, jax.Array]],
@@ -439,8 +439,9 @@ def _run_time_scan(
     Args:
         state: Initial device state on the cropped grid.
         constants: Constant device arrays consumed by the functions.
-        dynamics: Each function's 0-d device scalars under the keys "step",
-            "quantity" and "guard", plus the float64 "stopping_threshold".
+        dynamic_args: Each function's 0-d device scalars under the keys
+            "step", "quantity" and "guard", plus the float64
+            "stopping_threshold".
         slot_ids: Snapshot slot of each step (-1: no snapshot).
         step_func: Step function, see ``StepSpec``.
         step_static: Static arguments of the step function.
@@ -452,8 +453,18 @@ def _run_time_scan(
         n_slots: Number of snapshot slots.
 
     Returns:
-        The final scan carry: final state, stop bookkeeping scalars,
-        snapshot buffers and the recorded-frame count (device values).
+        The final scan carry: a dict of device values with keys
+        'state' (the fields after the last active step),
+        'active' (False if a stop fired),
+        'stop_kind' (_RUNNING, _STOP_THRESHOLD, _STOP_SHRINKAGE or
+        _STOP_VANISHING),
+        'stop_step' (step index at which the loop stopped, 0 if it never
+        did),
+        'quantity' (stopping quantity of the last active step, float64),
+        'guard_mass_change' and 'guard_density' (guard diagnostics of the
+        stopping step, 0.0 unless a guard fired) and
+        'buffers' / 'n_recorded' (per-field snapshot arrays of shape
+        (n_slots, *field_shape) and the number of frames written).
     """
     global SCAN_TRACE_COUNT
     SCAN_TRACE_COUNT += 1  # incremented once per trace (diagnostic)
@@ -464,13 +475,15 @@ def _run_time_scan(
         t, slot = x
         prev = carry["state"]
         active = carry["active"]
-        new_state = step_func(prev, constants, dynamics["step"], *step_static)
-        quantity = quantity_func(
-            new_state, constants, dynamics["quantity"], *quantity_static
+        new_state = step_func(
+            prev, constants, dynamic_args["step"], *step_static
         )
-        threshold_hit = quantity >= dynamics["stopping_threshold"]
+        quantity = quantity_func(
+            new_state, constants, dynamic_args["quantity"], *quantity_static
+        )
+        threshold_hit = quantity >= dynamic_args["stopping_threshold"]
         guard_code, guard_mass_change, guard_density = guard_func(
-            new_state, prev, constants, dynamics["guard"], *guard_static
+            new_state, prev, constants, dynamic_args["guard"], *guard_static
         )
 
         stop_threshold = active & threshold_hit
@@ -547,10 +560,7 @@ def _run_time_loop(
     record_steps: NDArray,
 ) -> dict[str, Any]:
     """
-    Prepare the host-side inputs and call the jitted time scan.
-
-    Maps the (possibly duplicated) record_steps onto unique snapshot slots --
-    each step is recorded at most once.
+    Prepare the host-side inputs and call the time scan (jitted loop).
 
     Args:
         state: Initial device state on the cropped grid.
@@ -563,14 +573,16 @@ def _run_time_loop(
         record_steps: Step indices at which snapshots are recorded.
 
     Returns:
-        The final scan carry, see ``_run_time_scan``.
+        Dict: the final fields under 'state', the stop bookkeeping
+        scalars ('stop_kind', 'stop_step', 'quantity', 'guard_mass_change', 
+        'guard_density') and the snapshot buffers ('buffers', 'n_recorded').
     """
     slot_steps = np.unique(np.asarray(record_steps, dtype=np.int64))
     n_slots = int(slot_steps.size)
     slot_ids = np.full(n_steps, -1, dtype=np.int32)
     if n_slots:
         slot_ids[slot_steps] = np.arange(n_slots, dtype=np.int32)
-    dynamics = {
+    dynamic_args = {
         "step": step_spec["dynamic_scalars"],
         "quantity": quantity_spec["dynamic_scalars"],
         "guard": guard_spec["dynamic_scalars"],
@@ -580,7 +592,7 @@ def _run_time_loop(
     return _run_time_scan(
         state,
         constants,
-        dynamics,
+        dynamic_args,
         jnp.asarray(slot_ids),
         step_func=step_spec["func"],
         step_static=step_spec["static_args"],
