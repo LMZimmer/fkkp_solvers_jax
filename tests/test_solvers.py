@@ -19,6 +19,7 @@ from fisher_kpp_jax import (
     FKPPSolver,
     TwoCompartmentWithNutrientFKPPSolver,
 )
+from fisher_kpp_jax import time_loop
 
 # f64 keeps the invariant checks tight; the f32 path is covered by
 # test_f32_vs_f64_agreement and the (default-precision) retrace test.
@@ -298,33 +299,31 @@ def test_volume_stopping_mode(tissue_phantom):
 def test_no_retrace_on_repeat_solve(tissue_phantom):
     """Solves must reuse the compiled scan driver.
 
-    After a warm-up solve, zero new traces (base.SCAN_TRACE_COUNT is a
+    After a warm-up solve, zero new traces (time_loop.SCAN_TRACE_COUNT is a
     trace-time counter) are allowed for (a) identical re-solves and (b)
     re-solves that change only PHYSICAL parameters — the sweep/inverse-loop
     case: physical scalars are dynamic arguments, never jit-static. The rho
     values sit on the diffusion-bound branch of the nt formula, so n_steps
     (a legitimate static) is unchanged."""
-    from fisher_kpp_jax import base
-
     gm, wm = tissue_phantom
     params = fk_params(gm, wm)
     FKPPSolver(params).solve()  # warm-up: may trace (once) if not already cached
-    before = base.SCAN_TRACE_COUNT
+    before = time_loop.SCAN_TRACE_COUNT
     FKPPSolver(params).solve()
     FKPPSolver(params).solve()
-    assert base.SCAN_TRACE_COUNT == before
+    assert time_loop.SCAN_TRACE_COUNT == before
     # physical-parameter-only changes (stopping threshold, rho):
     FKPPSolver({**params, "stopping_threshold": 500.0}).solve()
     FKPPSolver({**params, "rho": 0.16}).solve()
-    assert base.SCAN_TRACE_COUNT == before
+    assert time_loop.SCAN_TRACE_COUNT == before
 
     params_2c = fk2c_params(gm, wm)
     TwoCompartmentWithNutrientFKPPSolver(params_2c).solve()  # warm-up
-    before = base.SCAN_TRACE_COUNT
+    before = time_loop.SCAN_TRACE_COUNT
     TwoCompartmentWithNutrientFKPPSolver(
         {**params_2c, "rho": 0.16, "necrosis_rate": 0.5}
     ).solve()
-    assert base.SCAN_TRACE_COUNT == before
+    assert time_loop.SCAN_TRACE_COUNT == before
 
 
 # Loose tolerance for f32 vs f64 on a short solve (a few hundred explicit

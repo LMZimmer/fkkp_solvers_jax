@@ -30,15 +30,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.ndimage import binary_dilation
 
-from .base import (
-    BaseFKPPSolver,
-    Consts,
-    GuardSpec,
-    SHRINKAGE_LIMIT,
-    State,
-    StepSpec,
-    VANISHING_DENSITY_LIMIT,
-)
+from .base import BaseFKPPSolver
 from .operators import (
     GAUSSIAN_SEED_DIFFUSION_TIME,
     GAUSSIAN_SEED_FLOOR,
@@ -51,6 +43,14 @@ from .operators import (
     logistic_growth,
     logistic_sigmoid,
     masked_face_average,
+)
+from .time_loop import (
+    Consts,
+    GuardSpec,
+    SHRINKAGE_LIMIT,
+    State,
+    StepSpec,
+    VANISHING_DENSITY_LIMIT,
 )
 
 logger = logging.getLogger(__name__)
