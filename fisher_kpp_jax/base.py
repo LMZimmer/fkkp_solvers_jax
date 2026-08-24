@@ -1,14 +1,11 @@
-"""Shared solve() pipeline and result type of the JAX Fisher-KPP solvers.
-
-``BaseFKPPSolver.solve`` owns the pipeline -- validate parameters,
-downsample the tissue fields on the host, crop to the tissue bounding box,
-run the jitted time loop on the device, embed and upsample the results --
-and subclasses fill in the solver-specific hooks.
+"""
+``BaseFKPPSolver`` implements the pipeline (validate parameters,
+downsample the tissue fields (on host), crop to the bounding box,
+time stepping (on device), embed and upsample the results.
 """
 
 from __future__ import annotations
 
-import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -40,7 +37,7 @@ from .operators import (
     tissue_bounding_box,
 )
 
-CROP_MARGIN: int = 2  # voxels of margin left around the crop mask
+CROP_MARGIN: int = 2
 
 DEFAULT_DENSITY_THRESHOLD: float = 0.5
 
@@ -56,14 +53,13 @@ class Result:
         final_state: Final fields on the full-resolution grid.
         final_time: Simulation time at which the loop ended.
         final_stopping_quantity: Last value of the quantity compared against
-            stopping_threshold: total cell mass for stopping_mode="mass" (an
-            integrated density, not a physical volume), thresholded volume
-            for stopping_mode="volume".
+            stopping_threshold: total cell mass for stopping_mode="mass", 
+            volume for stopping_mode="volume".
         stopping_criterion: What ended the run: "time", "threshold" or
             "error".
         time_series: Recorded snapshots per field, or None if none were
             requested.
-        error: Description of the failure or fired guard, else None.
+        error: Description of the failure, else None.
     """
 
     success: bool
@@ -86,10 +82,6 @@ def _merge_params(
     Merge user parameters with the solver defaults, strictly: unknown keys
     and missing required keys raise.
 
-    stopping_volume is accepted as a deprecated alias of stopping_threshold
-    (the quantity it thresholds is only a physical volume in "volume" mode);
-    supplying both raises.
-
     Args:
         params: User-supplied parameters.
         required: Names of the required parameters.
@@ -100,19 +92,6 @@ def _merge_params(
         The merged parameter dict.
     """
     params = dict(params)
-    if "stopping_volume" in params:
-        if "stopping_threshold" in params:
-            raise ValueError(
-                f"{solver_name}: pass only one of 'stopping_threshold' and its "
-                "deprecated alias 'stopping_volume'."
-            )
-        warnings.warn(
-            f"{solver_name}: 'stopping_volume' is deprecated, use "
-            "'stopping_threshold' (identical semantics).",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        params["stopping_threshold"] = params.pop("stopping_volume")
     unknown = sorted(set(params) - required - set(defaults))
     if unknown:
         raise ValueError(f"{solver_name}: unknown parameter(s): {unknown}.")
