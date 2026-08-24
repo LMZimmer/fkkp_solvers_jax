@@ -1,14 +1,12 @@
-"""The three JAX Fisher-KPP forward solvers (port of ``fisher_kpp.solvers``).
-
-Numerical behavior follows the NumPy reference (see that module's
-docstrings for the deliberate quirks inherited from TumorGrowthToolkit:
-zero-flux boundaries, the FK_2c stopping-mass voxel-volume fix and
-reaction-rate dt guard, the DTI guard-exit failure semantics, and the
-mutually inconsistent per-solver time-step formulas — all retained).
+"""The three JAX Fisher-KPP forward solvers (port of ``fisher_kpp.solvers``,
+whose docstrings document the deliberate quirks retained here: zero-flux
+boundaries, the FK_2c stopping-mass voxel-volume fix and reaction-rate dt
+guard, the DTI guard-exit failure semantics, and the mutually inconsistent
+per-solver time-step formulas).
 
 Port-specific notes:
   - The device code is purely functional: each solver's step is a
-    module-level impl (see ``StepSpec`` in ``base``); in-place ``u += ...``
+    module-level impl (see ``time_loop.StepSpec``); in-place ``u += ...``
     updates become explicit functional updates with the same evaluation
     order (FK_2c's sequential/aliasing semantics are documented at
     ``_two_compartment_step``).
@@ -83,6 +81,7 @@ _COMMON_DEFAULTS: dict[str, Any] = {
     "precision": "f32",  # device state dtype: "f32" (default) or "f64"
 }
 
+
 def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
     if not (isinstance(gm, np.ndarray) and isinstance(wm, np.ndarray)):
         raise ValueError("gray_matter and white_matter must be numpy arrays")
@@ -145,9 +144,9 @@ def _two_compartment_step(
     dyn: dict[str, jax.Array],
     spacing: tuple[float, float, float],
 ) -> State:
-    """One Euler step of the P/N/S system, sequential as in the original:
-    the necrotic and nutrient updates see the already-updated proliferative
-    field."""
+    """One Euler step of the proliferative/necrotic/nutrient system,
+    sequential as in the original: the necrotic and nutrient updates see
+    the already-updated proliferative field."""
     dt = dyn["dt"]
     necrosis_rate = dyn["necrosis_rate"]
     proliferative = state["proliferative"]
@@ -171,13 +170,11 @@ def _two_compartment_step(
         -NECROSIS_SWITCH_STEEPNESS * (nutrient - dyn["nutrient_threshold"])
     )
 
-    # Sequential updates as in the original: the necrotic and nutrient
-    # updates below see the already-updated proliferative field.
     tumor_diffusion = diffusion_term(proliferative, tumor_faces, spacing)
     delta_proliferative = (
         tumor_diffusion
         + dyn["rho"]
-        * jnp.multiply(nutrient, proliferative)
+        * (nutrient * proliferative)
         * (1 - proliferative - necrotic)
         - necrosis_rate * proliferative * switch
     ) * dt
@@ -211,10 +208,9 @@ def _mass_single(
 def _mass_pn(
     state: State, consts: Consts, dyn: dict[str, jax.Array], voxel_volume: float
 ) -> jax.Array:
-    """FK_2c integrated cell density: voxel_volume * (sum(P) + sum(N)), in
-    f64. The voxel-volume factor multiplies BOTH terms; the original FK_2c
-    dropped it on the necrotic term (mixed units) — an intentional deviation
-    whenever a finite stopping_threshold is set in "mass" mode."""
+    """FK_2c integrated cell density, f64: voxel_volume * (sum(P) + sum(N)),
+    intentionally applying the voxel-volume factor to BOTH terms — unlike
+    the original, which dropped it on the necrotic term (mixed units)."""
     del consts, dyn
     return voxel_volume * (
         jnp.sum(state["proliferative"], dtype=jnp.float64)
@@ -254,8 +250,10 @@ def _dti_guard(
     """Shrinkage/vanishing guards of the DTI solver.
 
     Thresholds (SHRINKAGE_LIMIT, VANISHING_DENSITY_LIMIT) and check order are
-    unchanged from the original (shrinkage takes precedence). Sums run in
-    float64 regardless of state dtype."""
+    unchanged from the original (shrinkage takes precedence); sums run in
+    float64 regardless of state dtype. A firing guard is reported as
+    Result(success=False, stopping_criterion="error") with final_time at the
+    actual exit step."""
     del consts, dyn
     new_sum = jnp.sum(new_state["cell_density"], dtype=jnp.float64)
     prev_sum = jnp.sum(previous_state["cell_density"], dtype=jnp.float64)
@@ -308,7 +306,7 @@ class FKPPSolver(BaseFKPPSolver):
         self._wm_low = self._downsample(self.params["white_matter"], factor)
         return self._gm_low.shape, self.params["gray_matter"].shape
 
-    def _check_seed_early(self) -> None:
+    def _check_seed(self) -> None:
         i, j, k = self.seed_voxel
         if self._gm_low[i, j, k] == 0 and self._wm_low[i, j, k] == 0:
             raise ValueError("Initial tumor position is outside the brain matter")
@@ -349,12 +347,10 @@ class FKPPSolver(BaseFKPPSolver):
         diffusivity_wm = self.params["white_matter_diffusivity"]
         rho = self.params["rho"]
         dx, dy, dz = self.grid_spacing
-        nt = np.max(
-            [
-                stopping_time * diffusivity_wm / np.power(np.min([dx, dy, dz]), 2) * 8
-                + 100,
-                stopping_time * rho * 1.1,
-            ]
+        # np.power kept deliberately: CPython's ** is not bit-identical to it.
+        nt = max(
+            stopping_time * diffusivity_wm / np.power(min(dx, dy, dz), 2) * 8 + 100,
+            stopping_time * rho * 1.1,
         )
         dt = stopping_time / nt
         return int(np.ceil(nt)), dt
@@ -474,18 +470,16 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         diffusivity_nutrient = self.params["nutrient_diffusivity"]
         rho = self.params["rho"]
         dx, dy, dz = self.grid_spacing
-        nt = np.max(
-            [
-                stopping_time
-                * np.max([diffusivity_wm, diffusivity_nutrient])
-                / np.power(np.min([dx, dy, dz]), 2)
-                * self.params["nt_multiplier"]
-                + 300,
-                # Reaction-rate guard in the same form the FK solver uses.
-                # The original FK_2c omitted it; without it, dt can violate
-                # the ~1/rho explicit-Euler reaction bound for large rho.
-                stopping_time * rho * 1.1,
-            ]
+        nt = max(
+            stopping_time
+            * max(diffusivity_wm, diffusivity_nutrient)
+            / np.power(min(dx, dy, dz), 2)
+            * self.params["nt_multiplier"]
+            + 300,
+            # Reaction-rate guard in the same form the FK solver uses.
+            # The original FK_2c omitted it; without it, dt can violate
+            # the ~1/rho explicit-Euler reaction bound for large rho.
+            stopping_time * rho * 1.1,
         )
         dt = stopping_time / nt
         return int(np.ceil(nt)), dt
@@ -561,11 +555,9 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
 
         ``wm``/``gm``/``diffusivity_ratio`` are None unless
         uniform_gray_matter is set; all other inputs come from self.params.
-        Host-side NumPy, unchanged from the reference: replicates the
-        original makeXYZ_rgb_from_tensor normalization and clipping logic
-        exactly, in its original operation order (including the sequential
-        in-place mean/std normalization, where the std is computed on the
-        already mean-shifted field).
+        Host-side NumPy. The operation order is protected numerics — in
+        particular the sequential in-place mean/std normalization, where
+        the std is computed on the already mean-shifted field.
         """
         exponent = self.params["tensor_exponent"]
         linear_term = self.params["tensor_linear_term"]
@@ -659,9 +651,9 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
     def _crop_mask(self) -> NDArray:
         return self._brainmask
 
-    def _check_seed_late(self) -> None:
-        # The original checks the (uncropped) brainmask inside its try block,
-        # after cropping and diffusivity construction.
+    def _check_seed(self) -> None:
+        # The original checks only after cropping and diffusivity
+        # construction; checking earlier can only reorder error messages.
         if not self._brainmask[self.seed_voxel]:
             raise ValueError("Origin not within brainmask")
 
@@ -695,11 +687,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         return _single_field_step, dyn, (self.grid_spacing,)
 
     def _guard_spec(self) -> GuardSpec:
-        """Shrinkage/vanishing guards (see _dti_guard), evaluated inside the
-        scan. As in the reference — and unlike the upstream original — a
-        firing guard is reported as Result(success=False,
-        stopping_criterion="error") with final_time at the actual exit step.
-        """
+        """DTI shrinkage/vanishing guards — semantics at ``_dti_guard``."""
         return _dti_guard, {}, (self.voxel_volume,)
 
     def _time_step_count(self) -> tuple[int, float]:
@@ -710,16 +698,14 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         # Scales with the max of the FULL-resolution axial diffusivity field,
         # which is over-conservative (the simulated downsampled field's max
         # is <= the full-res max); deliberately retained from the original.
-        nt = np.max(
-            [
-                stopping_time
-                * diffusivity
-                * self._axial_full_max
-                / np.power(np.min([dx, dy, dz]), 2)
-                * 8
-                + 100,
-                stopping_time * rho * 1.1,
-            ]
+        nt = max(
+            stopping_time
+            * diffusivity
+            * self._axial_full_max
+            / np.power(min(dx, dy, dz), 2)
+            * 8
+            + 100,
+            stopping_time * rho * 1.1,
         )
         dt = stopping_time / nt
         return int(np.ceil(nt)), dt

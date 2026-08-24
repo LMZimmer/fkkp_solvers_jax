@@ -234,9 +234,12 @@ stopping_criterion / final_stopping_quantity, lines 206, 223-224).
 15. Cosmetic heritage-call-style sweep (one pass, numerically identical).
     - jnp.multiply(u, 1 - u) -> u * (1 - u) (operators.py:110,
       solvers.py:182); jnp.power(x, 2) -> x**2 (operators.py:155).
-    - np.max([a, b]) / np.min([dx, dy, dz]) / np.power(m, 2) on Python
-      floats in the three _time_step_count methods (solvers.py:349-355,
-      473-487, 703-713) -> max/min/** builtins (IEEE-double identical).
+    - np.max([a, b]) / np.min([dx, dy, dz]) on Python floats in the three
+      _time_step_count methods (solvers.py:349-355, 473-487, 703-713) ->
+      max/min builtins (pure selection, value-identical). CORRECTION during
+      implementation: np.power(m, 2) must STAY — measured NOT bit-identical
+      to CPython's ** (numpy pow vs libm pow, ~0.1% of inputs), and a 1-ULP
+      change in nt can flip ceil(nt) into a different step count.
     - solve()'s `self.params.get("verbose", False)` (base.py:241) ->
       `self.params["verbose"]` — defaults guarantee the key exists.
     - Missing blank line before _validate_tissue_arrays (solvers.py:85).

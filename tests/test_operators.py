@@ -49,6 +49,16 @@ def _diffusion_term_numpy(u: np.ndarray, faces: dict, spacing: tuple) -> np.ndar
     return out
 
 
+def _random_faces(rng: np.random.Generator) -> dict:
+    """Random face diffusivities; each bwd field is the shifted fwd field."""
+    faces = {}
+    for axis, name in enumerate("xyz"):
+        fwd = rng.random(SHAPE)
+        faces[f"fwd_{name}"] = fwd
+        faces[f"bwd_{name}"] = _edge_shift(fwd, 1, axis)
+    return faces
+
+
 @pytest.mark.parametrize("axis", [0, 1, 2])
 @pytest.mark.parametrize("shift", [1, -1])
 def test_edge_shift(axis: int, shift: int) -> None:
@@ -89,11 +99,7 @@ def test_masked_face_average(axis: int) -> None:
 def test_diffusion_term() -> None:
     rng = np.random.default_rng(10)
     u = rng.random(SHAPE)
-    faces = {}
-    for axis, name in enumerate("xyz"):
-        fwd = rng.random(SHAPE)
-        faces[f"fwd_{name}"] = fwd
-        faces[f"bwd_{name}"] = _edge_shift(fwd, 1, axis)
+    faces = _random_faces(rng)
     ours = _x64(jax_ops.diffusion_term, u, faces, SPACING)
     expected = _diffusion_term_numpy(u, faces, SPACING)
     np.testing.assert_allclose(ours, expected, rtol=1e-12, atol=1e-13)
@@ -103,22 +109,13 @@ def test_diffusion_term_conserves_mass() -> None:
     """Zero-flux boundaries: the divergence sums to zero over the grid."""
     rng = np.random.default_rng(11)
     u = rng.random(SHAPE)
-    faces = {}
-    for axis, name in enumerate("xyz"):
-        fwd = rng.random(SHAPE)
-        faces[f"fwd_{name}"] = fwd
-        faces[f"bwd_{name}"] = _edge_shift(fwd, 1, axis)
+    faces = _random_faces(rng)
     term = _x64(jax_ops.diffusion_term, u, faces, SPACING)
     assert abs(term.sum()) < 1e-11
 
 
 def test_diffusion_term_zero_for_uniform_field() -> None:
-    faces = {}
-    rng = np.random.default_rng(12)
-    for axis, name in enumerate("xyz"):
-        fwd = rng.random(SHAPE)
-        faces[f"fwd_{name}"] = fwd
-        faces[f"bwd_{name}"] = _edge_shift(fwd, 1, axis)
+    faces = _random_faces(np.random.default_rng(12))
     term = _x64(jax_ops.diffusion_term, np.full(SHAPE, 0.7), faces, SPACING)
     np.testing.assert_array_equal(term, np.zeros(SHAPE))
 

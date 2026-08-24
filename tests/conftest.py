@@ -22,12 +22,16 @@ if str(_ROOT) not in sys.path:
 PHANTOM_N = 24
 
 
+def _radius_grid(n: int) -> np.ndarray:
+    """Distance of each voxel from the grid center, shape (n, n, n)."""
+    idx = np.indices((n, n, n))
+    return np.sqrt(((idx - (n - 1) / 2) ** 2).sum(axis=0))
+
+
 @pytest.fixture(scope="session")
 def tissue_phantom() -> tuple[np.ndarray, np.ndarray]:
     """(gray_matter, white_matter): spherical WM core with a GM shell, 24^3."""
-    n = PHANTOM_N
-    idx = np.indices((n, n, n))
-    r = np.sqrt(((idx - (n - 1) / 2) ** 2).sum(axis=0))
+    r = _radius_grid(PHANTOM_N)
     wm = (r < 6).astype(np.float64)
     gm = ((r >= 6) & (r < 9)).astype(np.float64)
     return gm, wm
@@ -40,7 +44,5 @@ def tensor_phantom() -> np.ndarray:
     rng = np.random.default_rng(42)
     b = rng.normal(size=(n, n, n, 3, 3))
     tensors = b @ b.transpose(0, 1, 2, 4, 3) * 0.05 + 0.3 * np.eye(3)
-    idx = np.indices((n, n, n))
-    r = np.sqrt(((idx - (n - 1) / 2) ** 2).sum(axis=0))
-    tensors[r >= 9] = 0.0
+    tensors[_radius_grid(n) >= 9] = 0.0
     return tensors

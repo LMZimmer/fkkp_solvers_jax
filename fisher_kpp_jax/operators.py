@@ -107,7 +107,7 @@ def diffusion_term(
 
 def logistic_growth(u: jax.Array, rho: float) -> jax.Array:
     """rho * u * (1 - u)."""
-    return rho * jnp.multiply(u, 1 - u)
+    return rho * (u * (1 - u))
 
 
 def logistic_sigmoid(x: jax.Array) -> jax.Array:
@@ -128,12 +128,11 @@ def clipped_gaussian(
     """Isotropic Gaussian profile centered at ``center_voxel``; the initial
     tumor cell density.
 
-    Reproduces the original ``gauss_sol3d`` exactly, including its clipping
-    order: values at or below ``floor`` are zeroed first (strictly-greater
-    keeps the value), then the profile is capped at 1. ``diffusion_time``
-    ("Dt") and ``mass`` ("M") are the analytic heat kernel's width and total
-    mass, ``scale`` widens the seed, and the whole profile is evaluated at
-    ``dtype``.
+    The clipping order is part of the contract: values at or below ``floor``
+    are zeroed first (strictly-greater keeps the value), then the profile is
+    capped at 1. ``diffusion_time`` and ``mass`` are the analytic heat
+    kernel's width and total mass, ``scale`` widens the seed, and the whole
+    profile is evaluated at ``dtype``.
     """
     xv, yv, zv = jnp.meshgrid(
         jnp.arange(0, shape[0], dtype=dtype),
@@ -152,8 +151,7 @@ def clipped_gaussian(
         dtype=dtype,
     )
     gauss = amplitude * jnp.exp(
-        -(jnp.power(x_scaled, 2) + jnp.power(y_scaled, 2) + jnp.power(z_scaled, 2))
-        / (4 * diffusion_time)
+        -(x_scaled**2 + y_scaled**2 + z_scaled**2) / (4 * diffusion_time)
     )
     gauss = jnp.where(gauss > floor, gauss, 0)
     gauss = jnp.where(gauss > 1, jnp.asarray(1.0, dtype=dtype), gauss)

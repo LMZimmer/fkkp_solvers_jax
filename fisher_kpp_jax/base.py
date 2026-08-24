@@ -1,11 +1,12 @@
-"""Shared solve() pipeline for the JAX Fisher-KPP forward solvers.
+"""Shared solve() pipeline for the JAX Fisher-KPP forward solvers (numerics
+follow the frozen ``fisher_kpp`` reference).
 
-The pipeline mirrors ``fisher_kpp.base`` step by step: unpack/validate params
--> downsample tissue (host, ``scipy.ndimage.zoom``) -> grid geometry -> ad-hoc
-stability-derived dt (or the explicit ``n_steps`` override) -> Gaussian seed
-(device) -> bounding-box crop -> face diffusivities (device) -> jitted
-``jax.lax.scan`` explicit-Euler loop with stopping checks and optional
-time-series recording -> uncrop -> upsample (host) -> Result.
+The pipeline: unpack/validate params -> downsample tissue (host,
+``scipy.ndimage.zoom``) -> grid geometry -> ad-hoc stability-derived dt (or
+the explicit ``n_steps`` override) -> Gaussian seed (device) -> bounding-box
+crop -> face diffusivities (device) -> jitted ``jax.lax.scan`` explicit-Euler
+loop with stopping checks and optional time-series recording -> uncrop ->
+upsample (host) -> Result.
 
 Host/device split: parameter validation, ``zoom`` down/upsampling, crop-box
 computation and the final embed/upsample stay on the host in NumPy (``zoom``
@@ -72,7 +73,7 @@ class Result:
     final_state: dict[str, NDArray]
     final_time: float
     final_stopping_quantity: float
-    stopping_criterion: Literal["time", "volume", "error"]
+    stopping_criterion: Literal["time", "threshold", "error"]
     time_series: dict[str, NDArray] | None = None
     error: str | None = None
 
@@ -114,7 +115,34 @@ def _merge_params(
         raise KeyError(f"{solver_name}: missing required parameter(s): {missing}")
     merged = dict(defaults)
     merged.update(params)
-    _validate_stopping_params(merged, solver_name)
+    return merged
+
+
+def _validate_parameters(merged: dict[str, Any], solver_name: str) -> None:
+    """Value checks shared by all solvers, run right after the schema merge.
+
+    density_threshold is only meaningful for "volume" mode and is rejected
+    otherwise (no silent unused parameters); in "volume" mode it is the one
+    default filled in here (logged), because it depends on stopping_mode.
+    """
+    mode = merged["stopping_mode"]
+    if mode not in ("mass", "volume"):
+        raise ValueError(
+            f"{solver_name}: stopping_mode must be 'mass' or 'volume', got {mode!r}"
+        )
+    if mode == "mass":
+        if merged["density_threshold"] is not None:
+            raise ValueError(
+                f"{solver_name}: density_threshold is only valid with "
+                "stopping_mode='volume'"
+            )
+    elif merged["density_threshold"] is None:
+        merged["density_threshold"] = DEFAULT_DENSITY_THRESHOLD
+        logger.info(
+            "%s: density_threshold not set, defaulting to %s",
+            solver_name,
+            DEFAULT_DENSITY_THRESHOLD,
+        )
     if merged["precision"] not in ("f32", "f64"):
         raise ValueError(
             f"{solver_name}: precision must be 'f32' or 'f64', "
@@ -130,28 +158,6 @@ def _merge_params(
             f"{solver_name}: n_steps must be a positive integer or None, "
             f"got {n_steps!r}"
         )
-    return merged
-
-
-def _validate_stopping_params(merged: dict[str, Any], solver_name: str) -> None:
-    """stopping_mode / density_threshold validation, shared by all solvers.
-
-    density_threshold is only meaningful for "volume" mode and is rejected
-    otherwise (no silent unused parameters).
-    """
-    mode = merged["stopping_mode"]
-    if mode not in ("mass", "volume"):
-        raise ValueError(
-            f"{solver_name}: stopping_mode must be 'mass' or 'volume', got {mode!r}"
-        )
-    if mode == "mass":
-        if merged["density_threshold"] is not None:
-            raise ValueError(
-                f"{solver_name}: density_threshold is only valid with "
-                "stopping_mode='volume'"
-            )
-    elif merged["density_threshold"] is None:
-        merged["density_threshold"] = DEFAULT_DENSITY_THRESHOLD
 
 
 def _validate_seed_fractions(params: Mapping[str, Any]) -> None:
@@ -187,6 +193,7 @@ class BaseFKPPSolver(ABC):
         merged = _merge_params(
             params, self._REQUIRED, self._DEFAULTS, type(self).__name__
         )
+        _validate_parameters(merged, type(self).__name__)
         _validate_seed_fractions(merged)
         self._validate_extra(merged)
         self.params = merged
@@ -238,7 +245,7 @@ class BaseFKPPSolver(ABC):
         try:
             return self._run_pipeline()
         except Exception as exc:  # noqa: BLE001 - originals funnel errors into the result
-            if self.params.get("verbose", False):
+            if self.params["verbose"]:
                 logger.debug("solver failed: %s", exc)
             return Result(
                 success=False,
@@ -271,7 +278,7 @@ class BaseFKPPSolver(ABC):
             int(params["gaussian_seed_y_fraction"] * ny),
             int(params["gaussian_seed_z_fraction"] * nz),
         )
-        self._check_seed_early()
+        self._check_seed()
 
         if params["n_steps"] is None:
             n_steps, dt = self._time_step_count()
@@ -300,7 +307,6 @@ class BaseFKPPSolver(ABC):
             state_cropped = {k: v[box] for k, v in state_lowres.items()}
 
             consts = self._device_constants(dt)
-            self._check_seed_late()
 
             loop = _run_time_loop(
                 state_cropped,
@@ -370,10 +376,9 @@ class BaseFKPPSolver(ABC):
             }
 
         if guard_error is not None:
-            stopping_criterion: Literal["time", "volume", "error"] = "error"
+            stopping_criterion: Literal["time", "threshold", "error"] = "error"
         elif stop_kind == _STOP_THRESHOLD:
-            # Heritage public value for any threshold stop, "mass" mode too.
-            stopping_criterion = "volume"
+            stopping_criterion = "threshold"
         else:
             stopping_criterion = "time"
 
@@ -400,8 +405,7 @@ class BaseFKPPSolver(ABC):
         return zoom(field, factor, order=order)
 
     def _upsample_to(self, field: NDArray, shape: tuple[int, ...]) -> NDArray:
-        # Reproduces the originals' extrapolate_factor: new size / old size
-        # per axis, then a linear zoom back up.
+        # Per-axis zoom factor new size / old size, then a linear zoom up.
         factor = tuple(
             new_sz / float(orig_sz) for new_sz, orig_sz in zip(shape, field.shape)
         )
@@ -476,10 +480,7 @@ class BaseFKPPSolver(ABC):
         fires (and is pruned by XLA)."""
         return _no_guard, {}, ()
 
-    def _check_seed_early(self) -> None:
-        """Seed-position guard right after grid geometry is known (the
-        original FK solver checks here, before the time-step count)."""
-
-    def _check_seed_late(self) -> None:
-        """Seed-position guard after cropping and diffusivity construction
-        (the original DTI solver raises at this point in its pipeline)."""
+    def _check_seed(self) -> None:
+        """Raise if the seed voxel lies outside the solver's simulated
+        tissue. Runs once grid geometry and the seed voxel are known; the
+        default accepts any seed (the two-compartment solver never checks)."""

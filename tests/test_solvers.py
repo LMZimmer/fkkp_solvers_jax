@@ -32,6 +32,11 @@ _COMMON = dict(
     precision="f64",
 )
 
+# Loose tolerance for f32 vs f64 on a short solve (a few hundred explicit
+# Euler steps of O(1) fields): observed max-abs difference is ~1e-4; assert
+# 2e-3 max-abs on the final field and 1e-3 relative on the stopping quantity.
+F32_ATOL = 2e-3
+
 
 def fk_params(gm: np.ndarray, wm: np.ndarray, **overrides) -> dict:
     params = dict(
@@ -70,6 +75,18 @@ def dti_params(tensors: np.ndarray, **overrides) -> dict:
     )
     params.update(overrides)
     return params
+
+
+# Solver class + params builder over the (tissue_phantom, tensor_phantom)
+# fixtures, keyed by the parametrize id.
+SOLVER_CASES = {
+    "fk": (FKPPSolver, lambda tissue, tensors: fk_params(*tissue)),
+    "fk2c": (
+        TwoCompartmentWithNutrientFKPPSolver,
+        lambda tissue, tensors: fk2c_params(*tissue),
+    ),
+    "dti": (AnisotropicFKPPSolver, lambda tissue, tensors: dti_params(tensors)),
+}
 
 
 def assert_successful_time_solve(result, state_keys: set[str], full_shape: tuple):
@@ -151,7 +168,7 @@ def test_dti_uniform_gray_matter_solve(tensor_phantom, tissue_phantom):
 
 def test_stopping_threshold_early_exit(tissue_phantom):
     """Crossing the stopping threshold stops the loop at that step:
-    stopping_criterion='volume', final_time = crossing step * dt, and
+    stopping_criterion='threshold', final_time = crossing step * dt, and
     snapshots scheduled after the crossing are dropped."""
     gm, wm = tissue_phantom
     params = fk_params(
@@ -160,7 +177,7 @@ def test_stopping_threshold_early_exit(tissue_phantom):
     solver = FKPPSolver(params)
     result = solver.solve()
     assert result.success
-    assert result.stopping_criterion == "volume"
+    assert result.stopping_criterion == "threshold"
     assert 0.0 < result.final_time < 40.0
     assert result.final_stopping_quantity >= 300.0
     # final_time is a whole number of steps.
@@ -180,7 +197,7 @@ def test_n_steps_override(tissue_phantom):
     )
     result = FKPPSolver(params).solve()
     assert result.success
-    assert result.stopping_criterion == "volume"
+    assert result.stopping_criterion == "threshold"
     # final_time is a whole number of override steps; the stability formula's
     # own dt (~0.297 here, vs the override's 0.02) would not divide it.
     n_taken = result.final_time / (40 / 2000)
@@ -293,7 +310,7 @@ def test_volume_stopping_mode(tissue_phantom):
     solver = FKPPSolver(params)
     result = solver.solve()
     assert result.success
-    assert result.stopping_criterion == "volume"
+    assert result.stopping_criterion == "threshold"
     assert result.final_stopping_quantity >= 50.0
     # The quantity is a whole number of voxels times the voxel volume.
     count = result.final_stopping_quantity / solver.voxel_volume
@@ -330,21 +347,10 @@ def test_no_retrace_on_repeat_solve(tissue_phantom):
     assert time_loop.SCAN_TRACE_COUNT == before
 
 
-# Loose tolerance for f32 vs f64 on a short solve (a few hundred explicit
-# Euler steps of O(1) fields): observed max-abs difference is ~1e-4; assert
-# 2e-3 max-abs on the final field and 1e-3 relative on the stopping quantity.
-F32_ATOL = 2e-3
-
-
-@pytest.mark.parametrize("solver_kind", ["fk", "fk2c", "dti"])
+@pytest.mark.parametrize("solver_kind", list(SOLVER_CASES))
 def test_f32_vs_f64_agreement(solver_kind, tissue_phantom, tensor_phantom):
-    gm, wm = tissue_phantom
-    if solver_kind == "fk":
-        cls, params = FKPPSolver, fk_params(gm, wm)
-    elif solver_kind == "fk2c":
-        cls, params = TwoCompartmentWithNutrientFKPPSolver, fk2c_params(gm, wm)
-    else:
-        cls, params = AnisotropicFKPPSolver, dti_params(tensor_phantom)
+    cls, build_params = SOLVER_CASES[solver_kind]
+    params = build_params(tissue_phantom, tensor_phantom)
     res32 = cls({**params, "precision": "f32"}).solve()
     res64 = cls({**params, "precision": "f64"}).solve()
     assert res32.success and res64.success, (res32.error, res64.error)
