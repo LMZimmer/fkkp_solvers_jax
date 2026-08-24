@@ -189,9 +189,7 @@ class BaseFKPPSolver(ABC):
     _REQUIRED: ClassVar[frozenset[str]]
     _DEFAULTS: ClassVar[dict[str, Any]]
     
-    # Stopping-quantity device functions consumed by _quantity_spec:
-    # module-level functions wrapped in staticmethod (stable identity for
-    # the jit cache), set per solver class.
+    # Early stopping functions on device consumed by _quantity_spec, set per solver class.
     _mass_func: ClassVar[Callable[..., jax.Array]]
     _volume_func: ClassVar[Callable[..., jax.Array]]
 
@@ -208,7 +206,7 @@ class BaseFKPPSolver(ABC):
         self._crop_box: tuple[slice, slice, slice] | None = None
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
-        """Solver-specific validation beyond the shared schema merge."""
+        """Solver-specific validation beyond the shared parameters."""
 
     @property
     def voxel_volume(self) -> float:
@@ -223,21 +221,17 @@ class BaseFKPPSolver(ABC):
 
     def _dynamic_scalar(self, value: Any) -> jax.Array:
         """
-        Convert a physical scalar to a dynamic 0-d device array at the state
-        dtype.
+        Cast a scalar to a 0-d device array of dtype.
 
-        Casting on the host keeps the value out of the jit cache key while
-        matching closure-literal numerics exactly: a weak f64 Python float
-        combined with an f32 array is likewise computed at f32 after
-        rounding the scalar.
+        As an array it is a dynamic jit argument, so changing its value
+        never triggers recompilation.
         """
         return jnp.asarray(float(value), dtype=self._dtype)
 
     def _gaussian_seed(self) -> jax.Array:
         """
         Create the clipped-Gaussian initial tumor density on the full
-        low-resolution grid, from the gaussian_seed_* params, at the
-        ``precision`` dtype.
+        low-resolution grid.
         """
         return clipped_gaussian(
             self.grid_shape,
@@ -250,14 +244,9 @@ class BaseFKPPSolver(ABC):
             floor=self.params["gaussian_seed_floor"],
         )
 
-    # --- shared pipeline ---
-
     def solve(self) -> Result:
         """
         Run the full pipeline.
-
-        Never raises: any failure is returned as Result(success=False,
-        stopping_criterion="error").
 
         Returns:
             The Result of the run.
@@ -296,7 +285,7 @@ class BaseFKPPSolver(ABC):
         params = self.params
         resolution_factor = params["resolution_factor"]
 
-        lowres_shape, original_shape = self._prepare_fields()
+        lowres_shape, original_shape = self._prepare_input_fields()
         self.grid_shape = lowres_shape
         vx, vy, vz = params["voxel_size_mm"]
         self.grid_spacing = (
@@ -527,7 +516,9 @@ class BaseFKPPSolver(ABC):
     # --- hooks ---
 
     @abstractmethod
-    def _prepare_fields(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    def _prepare_input_fields(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         """
         Downsample the solver's tissue/diffusivity input fields (host) and
         store them on self.

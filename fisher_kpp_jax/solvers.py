@@ -68,12 +68,12 @@ _COMMON_DEFAULTS: dict[str, Any] = {
 
 def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
     if not (isinstance(gm, np.ndarray) and isinstance(wm, np.ndarray)):
-        raise ValueError("gray_matter and white_matter must be numpy arrays.")
+        raise ValueError("gray_matter_pbmap and white_matter_pbmap must be numpy arrays.")
     if not (gm.ndim == 3 and wm.ndim == 3):
-        raise ValueError("gray_matter and white_matter must be 3D arrays.")
+        raise ValueError("gray_matter_pbmap and white_matter_pbmap must be 3D arrays.")
     if gm.shape != wm.shape:
         raise ValueError(
-            "gray_matter and white_matter shapes differ: "
+            "gray_matter_pbmap and white_matter_pbmap shapes differ: "
             f"{gm.shape} vs {wm.shape}."
         )
 
@@ -323,8 +323,8 @@ class FKPPSolver(BaseFKPPSolver):
         {
             "white_matter_diffusivity",
             "rho",
-            "gray_matter",
-            "white_matter",
+            "gray_matter_pbmap",
+            "white_matter_pbmap",
             "gaussian_seed_x_fraction",
             "gaussian_seed_y_fraction",
             "gaussian_seed_z_fraction",
@@ -342,13 +342,15 @@ class FKPPSolver(BaseFKPPSolver):
     _wm_lowres: NDArray
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
-        _validate_tissue_arrays(params["gray_matter"], params["white_matter"])
+        _validate_tissue_arrays(params["gray_matter_pbmap"], params["white_matter_pbmap"])
 
-    def _prepare_fields(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    def _prepare_input_fields(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         factor = self.params["resolution_factor"]
-        self._gm_lowres = self._downsample(self.params["gray_matter"], factor)
-        self._wm_lowres = self._downsample(self.params["white_matter"], factor)
-        return self._gm_lowres.shape, self.params["gray_matter"].shape
+        self._gm_lowres = self._downsample(self.params["gray_matter_pbmap"], factor)
+        self._wm_lowres = self._downsample(self.params["white_matter_pbmap"], factor)
+        return self._gm_lowres.shape, self.params["gray_matter_pbmap"].shape
 
     def _check_seed(self) -> None:
         i, j, k = self.seed_voxel
@@ -428,8 +430,8 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             "nutrient_threshold",
             "nutrient_diffusivity",
             "nutrient_consumption_rate",
-            "gray_matter",
-            "white_matter",
+            "gray_matter_pbmap",
+            "white_matter_pbmap",
             "gaussian_seed_x_fraction",
             "gaussian_seed_y_fraction",
             "gaussian_seed_z_fraction",
@@ -449,13 +451,15 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
     _wm_lowres: NDArray
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
-        _validate_tissue_arrays(params["gray_matter"], params["white_matter"])
+        _validate_tissue_arrays(params["gray_matter_pbmap"], params["white_matter_pbmap"])
 
-    def _prepare_fields(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    def _prepare_input_fields(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         factor = self.params["resolution_factor"]
-        self._gm_lowres = self._downsample(self.params["gray_matter"], factor)
-        self._wm_lowres = self._downsample(self.params["white_matter"], factor)
-        return self._gm_lowres.shape, self.params["gray_matter"].shape
+        self._gm_lowres = self._downsample(self.params["gray_matter_pbmap"], factor)
+        self._wm_lowres = self._downsample(self.params["white_matter_pbmap"], factor)
+        return self._gm_lowres.shape, self.params["gray_matter_pbmap"].shape
 
     def _crop_mask(self) -> NDArray:
         return (self._gm_lowres + self._wm_lowres) >= CROP_TISSUE_THRESHOLD
@@ -573,8 +577,8 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         "tensor_exponent": 1,
         "tensor_linear_term": 0,
         "uniform_gray_matter": False,
-        "gray_matter": None,
-        "white_matter": None,
+        "gray_matter_pbmap": None,
+        "white_matter_pbmap": None,
         "diffusivity_upper_limit": 2,
         "diffusivity_lower_limit": 0,
     }
@@ -597,11 +601,11 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
                 f"(Nx, Ny, Nz, 3, 3), got {tensors.shape}."
             )
         if params["uniform_gray_matter"] and (
-            params["gray_matter"] is None or params["white_matter"] is None
+            params["gray_matter_pbmap"] is None or params["white_matter_pbmap"] is None
         ):
             raise KeyError(
                 "AnisotropicFKPPSolver: uniform_gray_matter=True requires "
-                "gray_matter and white_matter."
+                "gray_matter_pbmap and white_matter_pbmap."
             )
 
     def _axial_diffusivity_from_tensor(
@@ -691,7 +695,9 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
 
         return axial
 
-    def _prepare_fields(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    def _prepare_input_fields(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         params = self.params
         scaling = params["ellipsoid_scaling"]
         if params["verbose"]:
@@ -706,8 +712,8 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         uniform = params["uniform_gray_matter"]
         axial_original = self._axial_diffusivity_from_tensor(
             tensors,
-            wm=params["white_matter"] if uniform else None,
-            gm=params["gray_matter"] if uniform else None,
+            wm=params["white_matter_pbmap"] if uniform else None,
+            gm=params["gray_matter_pbmap"] if uniform else None,
             diffusivity_ratio=params["diffusivity_ratio"] if uniform else None,
         )
 
