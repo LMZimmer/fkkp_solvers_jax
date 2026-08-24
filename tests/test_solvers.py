@@ -277,6 +277,10 @@ def test_param_validation_errors(tissue_phantom):
         FKPPSolver(fk_params(gm, wm, n_steps=0))
     with pytest.raises(ValueError):
         FKPPSolver(fk_params(gm, wm, n_steps=12.5))
+    with pytest.raises(ValueError, match="3D"):
+        FKPPSolver(fk_params(gm, np.zeros((4, 4))))
+    with pytest.raises(ValueError, match="diffusion_tensors"):
+        AnisotropicFKPPSolver(dti_params(np.zeros((4, 4, 4, 3))))
 
 
 def test_volume_stopping_mode(tissue_phantom):

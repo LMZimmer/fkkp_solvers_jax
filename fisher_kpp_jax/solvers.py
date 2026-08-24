@@ -37,7 +37,7 @@ from .operators import (
     GAUSSIAN_SEED_MASS,
     FaceFields,
     diffusion_term,
-    edge_roll,
+    edge_shift,
     elongate_tensor_along_principal_axis,
     face_average,
     logistic_growth,
@@ -84,11 +84,15 @@ _COMMON_DEFAULTS: dict[str, Any] = {
 }
 
 def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
-    assert isinstance(gm, np.ndarray), "gray_matter must be a numpy array"
-    assert isinstance(wm, np.ndarray), "white_matter must be a numpy array"
-    assert gm.ndim == 3, "gray_matter must be a 3D numpy array"
-    assert wm.ndim == 3, "white_matter must be a 3D numpy array"
-    assert gm.shape == wm.shape
+    if not (isinstance(gm, np.ndarray) and isinstance(wm, np.ndarray)):
+        raise ValueError("gray_matter and white_matter must be numpy arrays")
+    if not (gm.ndim == 3 and wm.ndim == 3):
+        raise ValueError("gray_matter and white_matter must be 3D arrays")
+    if gm.shape != wm.shape:
+        raise ValueError(
+            "gray_matter and white_matter shapes differ: "
+            f"{gm.shape} vs {wm.shape}"
+        )
 
 
 def _mixture_face_fields(
@@ -111,7 +115,7 @@ def _mixture_face_fields(
         gm_face = masked_face_average(gm, valid_mask, axis)
         fwd = diffusivity * (wm_face + gm_face / ratio)
         faces[f"fwd_{name}"] = fwd
-        faces[f"bwd_{name}"] = edge_roll(fwd, 1, axis=axis)
+        faces[f"bwd_{name}"] = edge_shift(fwd, 1, axis=axis)
     return faces
 
 
@@ -122,12 +126,13 @@ def _mixture_face_fields(
 def _single_field_step(
     state: State,
     consts: Consts,
-    dyn: tuple[jax.Array, ...],
+    dyn: dict[str, jax.Array],
     spacing: tuple[float, float, float],
 ) -> State:
     """One Euler step of the single-field solvers (FK and DTI): the face
     diffusivities are constant in time and come from consts."""
-    dt, rho = dyn
+    dt = dyn["dt"]
+    rho = dyn["rho"]
     u = state["cell_density"]
     diffusion = diffusion_term(u, consts["faces"], spacing)
     delta_u = (diffusion + logistic_growth(u, rho)) * dt
@@ -137,22 +142,14 @@ def _single_field_step(
 def _two_compartment_step(
     state: State,
     consts: Consts,
-    dyn: tuple[jax.Array, ...],
+    dyn: dict[str, jax.Array],
     spacing: tuple[float, float, float],
 ) -> State:
     """One Euler step of the P/N/S system, sequential as in the original:
     the necrotic and nutrient updates see the already-updated proliferative
     field."""
-    (
-        dt,
-        diffusivity_wm,
-        ratio,
-        rho,
-        necrosis_rate,
-        consumption_rate,
-        nutrient_threshold,
-        max_tumor_occupancy,
-    ) = dyn
+    dt = dyn["dt"]
+    necrosis_rate = dyn["necrosis_rate"]
     proliferative = state["proliferative"]
     necrotic = state["necrotic"]
     nutrient = state["nutrient"]
@@ -160,18 +157,18 @@ def _two_compartment_step(
     # Per-step tumor-diffusivity rebuild from the carried state: on step t
     # this is the post-step P and N of step t-1 (the initial state on step
     # 0), reproducing the reference's effective post-step aliasing semantics.
-    occupancy_valid = (proliferative + necrotic) <= max_tumor_occupancy
+    occupancy_valid = (proliferative + necrotic) <= dyn["max_tumor_occupancy"]
     tumor_faces = _mixture_face_fields(
         consts["wm"],
         consts["gm"],
         jnp.logical_and(consts["tissue_valid"], occupancy_valid),
-        diffusivity_wm,
-        ratio,
+        dyn["white_matter_diffusivity"],
+        dyn["diffusivity_ratio"],
     )
 
     # Descending switch on the nutrient level (original smooth_heaviside).
     switch = logistic_sigmoid(
-        -NECROSIS_SWITCH_STEEPNESS * (nutrient - nutrient_threshold)
+        -NECROSIS_SWITCH_STEEPNESS * (nutrient - dyn["nutrient_threshold"])
     )
 
     # Sequential updates as in the original: the necrotic and nutrient
@@ -179,7 +176,9 @@ def _two_compartment_step(
     tumor_diffusion = diffusion_term(proliferative, tumor_faces, spacing)
     delta_proliferative = (
         tumor_diffusion
-        + rho * jnp.multiply(nutrient, proliferative) * (1 - proliferative - necrotic)
+        + dyn["rho"]
+        * jnp.multiply(nutrient, proliferative)
+        * (1 - proliferative - necrotic)
         - necrosis_rate * proliferative * switch
     ) * dt
     proliferative = proliferative + delta_proliferative
@@ -189,7 +188,8 @@ def _two_compartment_step(
 
     nutrient_diffusion = diffusion_term(nutrient, consts["nutrient_faces"], spacing)
     delta_nutrient = (
-        nutrient_diffusion - consumption_rate * nutrient * proliferative
+        nutrient_diffusion
+        - dyn["nutrient_consumption_rate"] * nutrient * proliferative
     ) * dt
     nutrient = nutrient + delta_nutrient
 
@@ -201,7 +201,7 @@ def _two_compartment_step(
 
 
 def _mass_single(
-    state: State, consts: Consts, dyn: tuple[jax.Array, ...], voxel_volume: float
+    state: State, consts: Consts, dyn: dict[str, jax.Array], voxel_volume: float
 ) -> jax.Array:
     """Integrated cell density of the single-field solvers, summed in f64."""
     del consts, dyn
@@ -209,7 +209,7 @@ def _mass_single(
 
 
 def _mass_pn(
-    state: State, consts: Consts, dyn: tuple[jax.Array, ...], voxel_volume: float
+    state: State, consts: Consts, dyn: dict[str, jax.Array], voxel_volume: float
 ) -> jax.Array:
     """FK_2c integrated cell density: voxel_volume * (sum(P) + sum(N)), in
     f64. The voxel-volume factor multiplies BOTH terms; the original FK_2c
@@ -223,22 +223,22 @@ def _mass_pn(
 
 
 def _volume_single(
-    state: State, consts: Consts, dyn: tuple[jax.Array, ...], voxel_volume: float
+    state: State, consts: Consts, dyn: dict[str, jax.Array], voxel_volume: float
 ) -> jax.Array:
     """Thresholded volume of the single-field solvers; the density threshold
     is a dynamic 0-d scalar at the state dtype."""
     del consts
-    (threshold,) = dyn
+    threshold = dyn["density_threshold"]
     count = jnp.count_nonzero(state["cell_density"] > threshold)
     return voxel_volume * count.astype(jnp.float64)
 
 
 def _volume_pn(
-    state: State, consts: Consts, dyn: tuple[jax.Array, ...], voxel_volume: float
+    state: State, consts: Consts, dyn: dict[str, jax.Array], voxel_volume: float
 ) -> jax.Array:
     """Thresholded volume of P + N (the nutrient field is never included)."""
     del consts
-    (threshold,) = dyn
+    threshold = dyn["density_threshold"]
     density = state["proliferative"] + state["necrotic"]
     count = jnp.count_nonzero(density > threshold)
     return voxel_volume * count.astype(jnp.float64)
@@ -248,7 +248,7 @@ def _dti_guard(
     new_state: State,
     previous_state: State,
     consts: Consts,
-    dyn: tuple[jax.Array, ...],
+    dyn: dict[str, jax.Array],
     voxel_volume: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Shrinkage/vanishing guards of the DTI solver.
@@ -338,7 +338,10 @@ class FKPPSolver(BaseFKPPSolver):
         return {"faces": faces}
 
     def _step_spec(self, dt: float) -> StepSpec:
-        dyn = (self._dyn_scalar(dt), self._dyn_scalar(self.params["rho"]))
+        dyn = {
+            "dt": self._dyn_scalar(dt),
+            "rho": self._dyn_scalar(self.params["rho"]),
+        }
         return _single_field_step, dyn, (self.grid_spacing,)
 
     def _time_step_count(self) -> tuple[int, float]:
@@ -452,16 +455,17 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         }
 
     def _step_spec(self, dt: float) -> StepSpec:
-        dyn = (
-            self._dyn_scalar(dt),
-            self._dyn_scalar(self.params["white_matter_diffusivity"]),
-            self._dyn_scalar(self.params["diffusivity_ratio"]),
-            self._dyn_scalar(self.params["rho"]),
-            self._dyn_scalar(self.params["necrosis_rate"]),
-            self._dyn_scalar(self.params["nutrient_consumption_rate"]),
-            self._dyn_scalar(self.params["nutrient_threshold"]),
-            self._dyn_scalar(self.params["max_tumor_occupancy"]),
+        param_keys = (
+            "white_matter_diffusivity",
+            "diffusivity_ratio",
+            "rho",
+            "necrosis_rate",
+            "nutrient_consumption_rate",
+            "nutrient_threshold",
+            "max_tumor_occupancy",
         )
+        dyn = {k: self._dyn_scalar(self.params[k]) for k in param_keys}
+        dyn["dt"] = self._dyn_scalar(dt)
         return _two_compartment_step, dyn, (self.grid_spacing,)
 
     def _time_step_count(self) -> tuple[int, float]:
@@ -528,6 +532,16 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
     _brainmask: NDArray
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
+        tensors = params["diffusion_tensors"]
+        if not isinstance(tensors, np.ndarray):
+            raise ValueError(
+                "AnisotropicFKPPSolver: diffusion_tensors must be a numpy array"
+            )
+        if tensors.ndim != 5 or tensors.shape[-2:] != (3, 3):
+            raise ValueError(
+                "AnisotropicFKPPSolver: diffusion_tensors must have shape "
+                f"(Nx, Ny, Nz, 3, 3), got {tensors.shape}"
+            )
         if params["uniform_gray_matter"] and (
             params["gray_matter"] is None or params["white_matter"] is None
         ):
@@ -632,13 +646,6 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             diffusivity_ratio=params["diffusivity_ratio"] if uniform else None,
         )
 
-        assert isinstance(axial, np.ndarray), (
-            "axial diffusivity must be a numpy array"
-        )
-        assert axial.ndim == 4, (
-            "axial diffusivity must be a 4D array with last dimension 3"
-        )
-
         factor = params["resolution_factor"]
         low = self._downsample(axial, [factor, factor, factor, 1])
         low[low <= 0] = 0
@@ -677,11 +684,14 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         for axis, name in enumerate(_AXES):
             face = face_average(axial[:, :, :, axis], axis)
             faces[f"fwd_{name}"] = face * diffusivity
-            faces[f"bwd_{name}"] = diffusivity * edge_roll(face, 1, axis=axis)
+            faces[f"bwd_{name}"] = diffusivity * edge_shift(face, 1, axis=axis)
         return {"faces": faces}
 
     def _step_spec(self, dt: float) -> StepSpec:
-        dyn = (self._dyn_scalar(dt), self._dyn_scalar(self.params["rho"]))
+        dyn = {
+            "dt": self._dyn_scalar(dt),
+            "rho": self._dyn_scalar(self.params["rho"]),
+        }
         return _single_field_step, dyn, (self.grid_spacing,)
 
     def _guard_spec(self) -> GuardSpec:
@@ -690,7 +700,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         firing guard is reported as Result(success=False,
         stopping_criterion="error") with final_time at the actual exit step.
         """
-        return _dti_guard, (), (self.voxel_volume,)
+        return _dti_guard, {}, (self.voxel_volume,)
 
     def _time_step_count(self) -> tuple[int, float]:
         stopping_time = self.params["stopping_time"]

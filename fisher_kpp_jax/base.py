@@ -257,15 +257,15 @@ class BaseFKPPSolver(ABC):
         verbose = bool(params["verbose"])
         resolution_factor = params["resolution_factor"]
 
-        low_shape, full_shape = self._prepare_fields()
-        self.grid_shape = low_shape
+        lowres_shape, original_shape = self._prepare_fields()
+        self.grid_shape = lowres_shape
         vx, vy, vz = params["voxel_size_mm"]
         self.grid_spacing = (
             vx / resolution_factor,
             vy / resolution_factor,
             vz / resolution_factor,
         )
-        nx, ny, nz = low_shape
+        nx, ny, nz = lowres_shape
         self.seed_voxel = (
             int(params["gaussian_seed_x_fraction"] * nx),
             int(params["gaussian_seed_y_fraction"] * ny),
@@ -290,20 +290,20 @@ class BaseFKPPSolver(ABC):
         # state keeps its explicit f32/f64 dtype either way, while the
         # stopping-quantity and guard reductions always run in float64.
         with jax.enable_x64():
-            state_full = self._initialize_state()
-            initial_snapshot = {
-                k: np.asarray(v, dtype=np.float64) for k, v in state_full.items()
+            state_lowres = self._initialize_state()
+            state_lowres_initial = {
+                k: np.asarray(v, dtype=np.float64) for k, v in state_lowres.items()
             }
 
             box = tissue_bounding_box(self._crop_mask(), margin=CROP_MARGIN)
             self._crop_box = box
-            state = {k: v[box] for k, v in state_full.items()}
+            state_cropped = {k: v[box] for k, v in state_lowres.items()}
 
             consts = self._device_constants(dt)
             self._check_seed_late()
 
             loop = _run_time_loop(
-                state,
+                state_cropped,
                 consts,
                 self._step_spec(dt),
                 self._quantity_spec(),
@@ -312,7 +312,7 @@ class BaseFKPPSolver(ABC):
                 stopping_threshold,
                 record_steps,
             )
-            final_state_low = {
+            state_cropped_final = {
                 k: np.asarray(v, dtype=np.float64) for k, v in loop["state"].items()
             }
             stop_kind = int(loop["stop_kind"])
@@ -351,8 +351,8 @@ class BaseFKPPSolver(ABC):
         if guard_error is not None and verbose:
             logger.debug("early loop exit at t=%s: %s", stop_step * dt, guard_error)
 
-        final_low = {
-            k: embed(v, box, low_shape) for k, v in final_state_low.items()
+        state_lowres_final = {
+            k: embed(v, box, lowres_shape) for k, v in state_cropped_final.items()
         }
 
         result_time_series: dict[str, NDArray] | None = None
@@ -360,8 +360,10 @@ class BaseFKPPSolver(ABC):
             result_time_series = {
                 key: np.array(
                     [
-                        self._upsample_to(embed(frame, box, low_shape), full_shape)
-                        for frame in frames
+                        self._upsample_to(
+                            embed(frame_cropped, box, lowres_shape), original_shape
+                        )
+                        for frame_cropped in frames
                     ]
                 )
                 for key, frames in buffers.items()
@@ -378,10 +380,12 @@ class BaseFKPPSolver(ABC):
         return Result(
             success=guard_error is None,
             initial_state={
-                k: self._upsample_to(v, full_shape) for k, v in initial_snapshot.items()
+                k: self._upsample_to(v, original_shape)
+                for k, v in state_lowres_initial.items()
             },
             final_state={
-                k: self._upsample_to(v, full_shape) for k, v in final_low.items()
+                k: self._upsample_to(v, original_shape)
+                for k, v in state_lowres_final.items()
             },
             final_time=final_time,
             final_stopping_quantity=stopping_quantity,
@@ -448,9 +452,13 @@ class BaseFKPPSolver(ABC):
         state dtype; which fields count as cell density is documented on the
         per-solver impls."""
         if self.params["stopping_mode"] == "volume":
-            dyn = (self._dyn_scalar(self.params["density_threshold"]),)
+            dyn = {
+                "density_threshold": self._dyn_scalar(
+                    self.params["density_threshold"]
+                )
+            }
             return self._volume_impl, dyn, (self.voxel_volume,)
-        return self._mass_impl, (), (self.voxel_volume,)
+        return self._mass_impl, {}, (self.voxel_volume,)
 
     @abstractmethod
     def _time_step_count(self) -> tuple[int, float]:
@@ -466,7 +474,7 @@ class BaseFKPPSolver(ABC):
         (code, shrinkage value, integrated density) with code 0 when no
         guard fires. The AnisotropicFKPPSolver overrides; the default never
         fires (and is pruned by XLA)."""
-        return _no_guard, (), ()
+        return _no_guard, {}, ()
 
     def _check_seed_early(self) -> None:
         """Seed-position guard right after grid geometry is known (the

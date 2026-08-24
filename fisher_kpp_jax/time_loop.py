@@ -32,21 +32,22 @@ State = dict[str, jax.Array]
 Consts = dict[str, Any]
 #: (impl, dynamic scalars, static args) triples. The impl is a module-level
 #: function (stable identity, so the jit cache persists across solves). The
-#: dynamic scalars are 0-d device arrays — every PHYSICAL parameter a sweep
-#: or optimizer would vary (dt, rates, thresholds) goes here, already cast
-#: on the host to its use dtype, so changing its value never recompiles. The
-#: static args tuple is hashable and holds only structural values (grid
-#: spacing, voxel volume — geometry that cannot change without a shape
-#: change). The step impl is called step_impl(state, consts, dyn, *static).
-StepSpec = tuple[Callable[..., State], tuple[jax.Array, ...], tuple[Any, ...]]
+#: dynamic scalars are a dict of named 0-d device arrays (a jit pytree with
+#: a stable treedef) — every PHYSICAL parameter a sweep or optimizer would
+#: vary (dt, rates, thresholds) goes here, already cast on the host to its
+#: use dtype, so changing its value never recompiles. The static args tuple
+#: is hashable and holds only structural values (grid spacing, voxel volume
+#: — geometry that cannot change without a shape change). The step impl is
+#: called step_impl(state, consts, dyn, *static).
+StepSpec = tuple[Callable[..., State], dict[str, jax.Array], tuple[Any, ...]]
 #: quantity_impl(state, consts, dyn, *static) -> f64 stopping quantity.
-QuantitySpec = tuple[Callable[..., jax.Array], tuple[jax.Array, ...], tuple[Any, ...]]
+QuantitySpec = tuple[Callable[..., jax.Array], dict[str, jax.Array], tuple[Any, ...]]
 #: guard_impl(new_state, prev_state, consts, dyn, *static) ->
 #: (code, shrinkage change, integrated density); code 0 = no guard fired,
 #: 1 = shrinkage, 2 = vanishing volume.
 GuardSpec = tuple[
     Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
-    tuple[jax.Array, ...],
+    dict[str, jax.Array],
     tuple[Any, ...],
 ]
 
@@ -59,7 +60,7 @@ def _no_guard(
     new_state: State,
     previous_state: State,
     consts: Consts,
-    dyn: tuple[jax.Array, ...],
+    dyn: dict[str, jax.Array],
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Default guard: never fires (pruned by XLA)."""
     del new_state, previous_state, consts, dyn

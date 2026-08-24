@@ -27,7 +27,7 @@ def _x64(fn, *args, **kwargs) -> np.ndarray:
 
 
 def _edge_shift(field: np.ndarray, shift: int, axis: int) -> np.ndarray:
-    """Independent spec of edge_roll: unit shift with edge replication."""
+    """Independent spec of edge_shift: unit shift with edge replication."""
     v = np.moveaxis(field, axis, 0)
     if shift == 1:
         shifted = np.concatenate([v[:1], v[:-1]])
@@ -51,18 +51,18 @@ def _diffusion_term_numpy(u: np.ndarray, faces: dict, spacing: tuple) -> np.ndar
 
 @pytest.mark.parametrize("axis", [0, 1, 2])
 @pytest.mark.parametrize("shift", [1, -1])
-def test_edge_roll(axis: int, shift: int) -> None:
+def test_edge_shift(axis: int, shift: int) -> None:
     field = np.random.default_rng(7).random(SHAPE)
     np.testing.assert_array_equal(
-        _x64(jax_ops.edge_roll, field, shift, axis),
+        _x64(jax_ops.edge_shift, field, shift, axis),
         _edge_shift(field, shift, axis),
     )
 
 
-def test_edge_roll_rejects_large_shift() -> None:
+def test_edge_shift_rejects_large_shift() -> None:
     with pytest.raises(ValueError):
         with jax.enable_x64():
-            jax_ops.edge_roll(np.zeros(SHAPE), 2, 0)
+            jax_ops.edge_shift(np.zeros(SHAPE), 2, 0)
 
 
 @pytest.mark.parametrize("axis", [0, 1, 2])

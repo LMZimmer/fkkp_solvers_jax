@@ -22,7 +22,7 @@ FaceFields = dict[str, jax.Array]
 """Keys: 'fwd_x', 'fwd_y', 'fwd_z', 'bwd_x', 'bwd_y', 'bwd_z'.
 
 'fwd' along an axis is the forward face value (between cells i and i+1);
-'bwd' is its edge-replicated shift by +1 (see ``edge_roll``), the backward
+'bwd' is its edge-replicated shift by +1 (see ``edge_shift``), the backward
 face (between cells i-1 and i).
 """
 
@@ -33,13 +33,13 @@ GAUSSIAN_SEED_MASS: float = 250.0  # "M", total mass of the kernel
 GAUSSIAN_SEED_FLOOR: float = 0.1  # values at or below this are zeroed
 
 
-def edge_roll(field: jax.Array, shift: int, axis: int) -> jax.Array:
-    """Roll with edge replication instead of periodic wrap.
+def edge_shift(field: jax.Array, shift: int, axis: int) -> jax.Array:
+    """Unit shift with edge replication.
 
-    ``jnp.roll(field, shift, axis)`` where the entries vacated by the shift
-    are filled with the array edge value (ghost cell equals boundary cell),
-    which realizes zero-flux boundaries in the stencils below. Only unit
-    shifts (+1 / -1) are supported; anything else raises ValueError.
+    Shifts ``field`` by one cell along ``axis``; the entries vacated by the
+    shift are filled with the array edge value (ghost cell equals boundary
+    cell), which realizes zero-flux boundaries in the stencils below. Only
+    unit shifts (+1 / -1) are supported; anything else raises ValueError.
     """
     pad_width = [(0, 0)] * field.ndim
     index: list[slice] = [slice(None)] * field.ndim
@@ -62,7 +62,7 @@ def face_average(field: jax.Array, axis: int) -> jax.Array:
     value on the face between cells i and i+1 (zero-flux edge replication at
     the boundary, see module docstring).
     """
-    return (edge_roll(field, -1, axis=axis) + field) / 2
+    return (edge_shift(field, -1, axis=axis) + field) / 2
 
 
 def masked_face_average(
@@ -72,8 +72,8 @@ def masked_face_average(
     satisfy ``valid_mask`` — blocks flux across faces touching invalid cells
     (e.g. CSF, background, fully necrotic tissue).
     """
-    condition = jnp.logical_and(edge_roll(valid_mask, -1, axis=axis), valid_mask)
-    return jnp.where(condition, (edge_roll(field, -1, axis=axis) + field) / 2, 0)
+    condition = jnp.logical_and(edge_shift(valid_mask, -1, axis=axis), valid_mask)
+    return jnp.where(condition, (edge_shift(field, -1, axis=axis) + field) / 2, 0)
 
 
 def diffusion_term(
@@ -91,16 +91,16 @@ def diffusion_term(
     dx, dy, dz = spacing
     d = diffusivity
     div_x = 1 / (dx * dx) * (
-        d["bwd_x"] * (edge_roll(u, 1, axis=0) - u)
-        - d["fwd_x"] * (u - edge_roll(u, -1, axis=0))
+        d["bwd_x"] * (edge_shift(u, 1, axis=0) - u)
+        - d["fwd_x"] * (u - edge_shift(u, -1, axis=0))
     )
     div_y = 1 / (dy * dy) * (
-        d["bwd_y"] * (edge_roll(u, 1, axis=1) - u)
-        - d["fwd_y"] * (u - edge_roll(u, -1, axis=1))
+        d["bwd_y"] * (edge_shift(u, 1, axis=1) - u)
+        - d["fwd_y"] * (u - edge_shift(u, -1, axis=1))
     )
     div_z = 1 / (dz * dz) * (
-        d["bwd_z"] * (edge_roll(u, 1, axis=2) - u)
-        - d["fwd_z"] * (u - edge_roll(u, -1, axis=2))
+        d["bwd_z"] * (edge_shift(u, 1, axis=2) - u)
+        - d["fwd_z"] * (u - edge_shift(u, -1, axis=2))
     )
     return div_x + div_y + div_z
 
