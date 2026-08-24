@@ -57,7 +57,7 @@ _COMMON_DEFAULTS: dict[str, Any] = {
     "stopping_time": 100,
     "stopping_threshold": np.inf,
     "stopping_mode": "mass",
-    "density_threshold": None,  # only valid with stopping_mode="volume"
+    "volume_threshold": None,  # only valid with stopping_mode="volume"
     "n_time_series_snapshots": None,
     "n_steps": None,  # explicit step count (dt = stopping_time / n_steps);
     #                   None -> the solver's own stability formula
@@ -259,11 +259,11 @@ def _volume_single(
     voxel_volume: float,
 ) -> jax.Array:
     """
-    Thresholded volume of the single-field solvers; the density threshold
+    Thresholded volume of the single-field solvers; the volume threshold
     is a dynamic 0-d scalar at the state dtype.
     """
     del constants
-    threshold = dynamic_scalars["density_threshold"]
+    threshold = dynamic_scalars["volume_threshold"]
     count = jnp.count_nonzero(state["cell_density"] > threshold)
     return voxel_volume * count.astype(jnp.float64)
 
@@ -276,7 +276,7 @@ def _volume_two_compartment(
 ) -> jax.Array:
     """Thresholded volume of P + N (the nutrient field is never included)."""
     del constants
-    threshold = dynamic_scalars["density_threshold"]
+    threshold = dynamic_scalars["volume_threshold"]
     density = state["proliferative"] + state["necrotic"]
     count = jnp.count_nonzero(density > threshold)
     return voxel_volume * count.astype(jnp.float64)

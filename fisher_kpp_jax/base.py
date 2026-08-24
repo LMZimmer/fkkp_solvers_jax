@@ -39,7 +39,7 @@ from .operators import (
 
 CROP_MARGIN: int = 2
 
-DEFAULT_DENSITY_THRESHOLD: float = 0.5
+DEFAULT_VOLUME_THRESHOLD: float = 0.5
 
 
 @dataclass(slots=True)
@@ -103,42 +103,41 @@ def _merge_parameters(
     return merged
 
 
-def _validate_parameters(merged: dict[str, Any], solver_name: str) -> None:
+def _validate_parameters(parameters: dict[str, Any], solver_name: str) -> None:
     """
-    Check the parameter values shared by all solvers, right after the schema
-    merge.
+    Check the parameter values shared by all solvers.
 
-    density_threshold is only meaningful for "volume" mode and is rejected
+    volume_threshold is only meaningful for "volume" mode and is rejected
     otherwise (no silent unused parameters); in "volume" mode it is the one
     default filled in here (logged), because it depends on stopping_mode.
 
     Args:
-        merged: Merged parameter dict, modified in place.
+        parameters: Merged parameter dict, modified in place.
         solver_name: Solver class name, used in error messages.
     """
-    mode = merged["stopping_mode"]
+    mode = parameters["stopping_mode"]
     if mode not in ("mass", "volume"):
         raise ValueError(
             f"{solver_name}: stopping_mode must be 'mass' or 'volume', got {mode!r}."
         )
     if mode == "mass":
-        if merged["density_threshold"] is not None:
+        if parameters["volume_threshold"] is not None:
             raise ValueError(
-                f"{solver_name}: density_threshold is only valid with "
+                f"{solver_name}: volume_threshold is only valid with "
                 "stopping_mode='volume'."
             )
-    elif merged["density_threshold"] is None:
-        merged["density_threshold"] = DEFAULT_DENSITY_THRESHOLD
+    elif parameters["volume_threshold"] is None:
+        parameters["volume_threshold"] = DEFAULT_VOLUME_THRESHOLD
         logger.info(
-            f"{solver_name}: density_threshold not set, defaulting to "
-            f"{DEFAULT_DENSITY_THRESHOLD}."
+            f"{solver_name}: volume_threshold not set, defaulting to "
+            f"{DEFAULT_VOLUME_THRESHOLD}."
         )
-    if merged["precision"] not in ("f32", "f64"):
+    if parameters["precision"] not in ("f32", "f64"):
         raise ValueError(
             f"{solver_name}: precision must be 'f32' or 'f64', "
-            f"got {merged['precision']!r}."
+            f"got {parameters['precision']!r}."
         )
-    n_steps = merged["n_steps"]
+    n_steps = parameters["n_steps"]
     if n_steps is not None and not (
         isinstance(n_steps, (int, np.integer))
         and not isinstance(n_steps, bool)
@@ -568,15 +567,15 @@ class BaseFKPPSolver(ABC):
 
         See ``Result.final_stopping_quantity``: total cell mass
         (``_mass_impl``, the default) or
-        voxel_volume * count(cell density > density_threshold)
+        voxel_volume * count(cell density > volume_threshold)
         (``_volume_impl``). The reduction runs in float64 regardless of the
         state dtype; which fields count as cell density is documented on the
         per-solver impls.
         """
         if self.params["stopping_mode"] == "volume":
             dynamic_scalars = {
-                "density_threshold": self._dynamic_scalar(
-                    self.params["density_threshold"]
+                "volume_threshold": self._dynamic_scalar(
+                    self.params["volume_threshold"]
                 )
             }
             return {
