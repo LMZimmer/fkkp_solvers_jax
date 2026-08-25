@@ -1,4 +1,4 @@
-"""The three JAX Fisher-KPP forward solvers: ``FKPPSolver``,
+"""The JAX Fisher-KPP forward solvers: ``FKPPSolver``,
 ``TwoCompartmentWithNutrientFKPPSolver`` and ``AnisotropicFKPPSolver``.
 
 The device code is purely functional: each solver's step is a module-level
@@ -54,10 +54,9 @@ _COMMON_DEFAULTS: dict[str, Any] = {
     "stopping_mode": "mass",
     "volume_threshold": None,  # only valid with stopping_mode="volume"
     "n_time_series_snapshots": None,
-    "n_steps": None,  # explicit step count (dt = stopping_time / n_steps);
-    #                   None -> the solver's own stability formula
+    "n_steps": None,
     "verbose": False,
-    "precision": "f32",  # device state dtype: "f32" (default) or "f64"
+    "precision": "f32",
 }
 
 
@@ -78,12 +77,12 @@ def _mixture_face_fields(
     gm: jax.Array,
     valid_mask: jax.Array,
     diffusivity: float | jax.Array,
-    ratio: float | jax.Array,
+    wm_to_gm_ratio: float | jax.Array,
 ) -> dict[str, jax.Array]:
     """
     Build white/gray-matter mixture face diffusivities (device).
 
-    D = diffusivity * (wm_face + gm_face / ratio), faces masked by
+    D = diffusivity * (wm_face + gm_face / wm_to_gm_ratio), faces masked by
     valid_mask. The 'bwd' fields are the edge-replicated shift of the 'fwd'
     fields (zero-flux boundary convention).
 
@@ -93,7 +92,7 @@ def _mixture_face_fields(
         valid_mask: Boolean mask of valid cells; faces touching invalid
             cells carry zero diffusivity.
         diffusivity: White matter diffusivity.
-        ratio: White-to-gray-matter diffusivity ratio.
+        wm_to_gm_ratio: White-to-gray-matter diffusivity ratio.
 
     Returns:
         The face diffusivities: keys 'fwd_x/y/z' and 'bwd_x/y/z', each the
@@ -103,14 +102,15 @@ def _mixture_face_fields(
     for axis, name in enumerate(_AXES):
         wm_face = masked_face_average(wm, valid_mask, axis)
         gm_face = masked_face_average(gm, valid_mask, axis)
-        fwd = diffusivity * (wm_face + gm_face / ratio)
+        fwd = diffusivity * (wm_face + gm_face / wm_to_gm_ratio)
         faces[f"fwd_{name}"] = fwd
         faces[f"bwd_{name}"] = shift_grid_by_one(fwd, 1, axis=axis)
     return faces
 
 
 # --- module-level device functions (stable identity so the jitted time
-# --- scan's cache persists across solves; see operators._run_time_scan) ---
+# --- loop's cache persists across solves; otherwise new parameters would
+# --- trigger recompilation. see operators._run_time_scan) ---
 
 
 def _single_field_step(
@@ -118,8 +118,8 @@ def _single_field_step(
     constants: dict[str, Any],
 ) -> dict[str, jax.Array]:
     """
-    Perform one Euler step of the single-field solvers (FKPPSolver and
-    AnisotropicFKPPSolver).
+    Perform one explicit Euler step of the single-field solvers
+    (FKPPSolver and AnisotropicFKPPSolver).
 
     The face diffusivities are constant in time and come from constants.
 
@@ -146,7 +146,8 @@ def _two_compartment_step(
     constants: dict[str, Any],
 ) -> dict[str, jax.Array]:
     """
-    Perform one Euler step of the proliferative/necrotic/nutrient system.
+    Perform one explicit Euler step of the proliferative/necrotic/nutrient
+    system.
 
     The update order is deliberately sequential: the necrotic and nutrient
     updates see the already-updated proliferative field.
@@ -155,7 +156,7 @@ def _two_compartment_step(
         state: State dict with keys 'proliferative', 'necrotic' and
             'nutrient'.
         constants: Device inputs; reads the arrays 'wm', 'gm',
-            'tissue_valid' and 'nutrient_faces', the 'grid_spacing' scalars
+            'tissue_mask' and 'nutrient_faces', the 'grid_spacing' scalars
             and the 0-d parameter scalars built by
             TwoCompartmentWithNutrientFKPPSolver._build_device_constants.
 
@@ -178,7 +179,7 @@ def _two_compartment_step(
     tumor_faces = _mixture_face_fields(
         constants["wm"],
         constants["gm"],
-        jnp.logical_and(constants["tissue_valid"], occupancy_valid),
+        jnp.logical_and(constants["tissue_mask"], occupancy_valid),
         constants["white_matter_diffusivity"],
         constants["diffusivity_ratio"],
     )
@@ -315,8 +316,11 @@ class FKPPSolver(BaseFKPPSolver):
     )
     _DEFAULTS: ClassVar[dict[str, Any]] = {
         **_COMMON_DEFAULTS,
+        # Cells with wm + gm below this carry no flux (CSF/background).
         "min_tissue_fraction": 0.1,
     }
+
+    # static methods allows passing of stable module level functions as attributes
     _step_func = staticmethod(_single_field_step)
     _mass_func = staticmethod(_mass_single)
     _volume_func = staticmethod(_volume_single)
@@ -347,18 +351,22 @@ class FKPPSolver(BaseFKPPSolver):
         return {"cell_density": self._gaussian_seed()}
 
     def _build_device_constants(self) -> dict[str, Any]:
-        assert self._crop_box is not None
+        if self._crop_box is None:
+            raise RuntimeError(
+                "_build_device_constants called before the crop box was set."
+            )
         gm_host = self._gm_lowres[self._crop_box]
         wm_host = self._wm_lowres[self._crop_box]
-        # Time-constant validity mask, computed host-side in float64 so it
-        # is identical for both precisions.
-        valid_host = (wm_host + gm_host) >= float(self.params["min_tissue_fraction"])
+        
+        tissue_mask_host = (wm_host + gm_host) >= float(
+            self.params["min_tissue_fraction"]
+        )
         gm = jnp.asarray(gm_host, dtype=self._dtype)
         wm = jnp.asarray(wm_host, dtype=self._dtype)
         faces = _mixture_face_fields(
             wm,
             gm,
-            jnp.asarray(valid_host),
+            jnp.asarray(tissue_mask_host),
             float(self.params["white_matter_diffusivity"]),
             float(self.params["diffusivity_ratio"]),
         )
@@ -418,6 +426,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         "max_tumor_occupancy": 0.9,
         "nt_multiplier": 8,
     }
+
     _step_func = staticmethod(_two_compartment_step)
     _mass_func = staticmethod(_mass_two_compartment)
     _volume_func = staticmethod(_volume_two_compartment)
@@ -456,23 +465,26 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         }
 
     def _build_device_constants(self) -> dict[str, Any]:
-        assert self._crop_box is not None
+        if self._crop_box is None:
+            raise RuntimeError(
+                "_build_device_constants called before the crop box was set."
+            )
         gm_host = self._gm_lowres[self._crop_box]
         wm_host = self._wm_lowres[self._crop_box]
         # Time-constant validity mask, computed host-side in float64 so it
         # is identical for both precisions.
-        tissue_valid_host = (wm_host + gm_host) >= float(
+        tissue_mask_host = (wm_host + gm_host) >= float(
             self.params["min_tissue_fraction"]
         )
         gm = jnp.asarray(gm_host, dtype=self._dtype)
         wm = jnp.asarray(wm_host, dtype=self._dtype)
-        tissue_valid = jnp.asarray(tissue_valid_host)
+        tissue_mask = jnp.asarray(tissue_mask_host)
 
         # Nutrient faces are built once (constant in time; ratio 1 means
         # gray matter conducts nutrient like white matter).
         # The tumor faces are rebuilt every step inside the step function.
         nutrient_faces = _mixture_face_fields(
-            wm, gm, tissue_valid, float(self.params["nutrient_diffusivity"]), 1
+            wm, gm, tissue_mask, float(self.params["nutrient_diffusivity"]), 1
         )
         param_keys = (
             "white_matter_diffusivity",
@@ -486,7 +498,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         return {
             "wm": wm,
             "gm": gm,
-            "tissue_valid": tissue_valid,
+            "tissue_mask": tissue_mask,
             "nutrient_faces": nutrient_faces,
             **{k: self._dynamic_scalar(self.params[k]) for k in param_keys},
         }
@@ -711,7 +723,10 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         return {"cell_density": cell_density}
 
     def _build_device_constants(self) -> dict[str, Any]:
-        assert self._crop_box is not None
+        if self._crop_box is None:
+            raise RuntimeError(
+                "_build_device_constants called before the crop box was set."
+            )
         axial = jnp.asarray(self._axial_lowres[self._crop_box], dtype=self._dtype)
         diffusivity = float(self.params["diffusivity"])
         faces: dict[str, jax.Array] = {}

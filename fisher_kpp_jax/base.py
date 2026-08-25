@@ -186,12 +186,10 @@ class BaseFKPPSolver(ABC):
 
     # Device functions of the time loop, set per solver class. They must be
     # module-level functions (see ``operators._run_time_loop`` for the
-    # required signatures and the jit-cache reasoning). _step_func performs
-    # one explicit-Euler step; a solver that rebuilds its diffusivity every
-    # step does so inside the step function, from the carried state.
+    # required signatures). _step_func performs one time step.
     # _mass_func/_volume_func are the stopping quantities dispatched on
     # stopping_mode; _guard_func is the post-step sanity check (the default
-    # never fires and is pruned by XLA; AnisotropicFKPPSolver overrides it).
+    # never fires).
     _step_func: ClassVar[Callable[..., dict[str, jax.Array]]]
     _mass_func: ClassVar[Callable[..., jax.Array]]
     _volume_func: ClassVar[Callable[..., jax.Array]]
@@ -275,8 +273,8 @@ class BaseFKPPSolver(ABC):
     def _run_pipeline(self) -> Result:
         original_shape, _ = self._setup_grid()
         n_steps, dt = self._resolve_time_stepping()
-        loop = self._run_device_loop(n_steps, dt)
-        return self._assemble_result(loop, dt, original_shape)
+        loop_results = self._run_device_loop(n_steps, dt)
+        return self._assemble_result(loop_results, dt, original_shape)
 
     def _setup_grid(
         self,
@@ -380,7 +378,7 @@ class BaseFKPPSolver(ABC):
                     params["volume_threshold"]
                 )
 
-            loop = _run_time_loop(
+            device_outputs = _run_time_loop(
                 state_cropped,
                 constants,
                 self._step_func,
@@ -390,13 +388,14 @@ class BaseFKPPSolver(ABC):
                 record_steps,
             )
             final_state_cropped = {
-                k: np.asarray(v, dtype=np.float64) for k, v in loop["state"].items()
+                k: np.asarray(v, dtype=np.float64)
+                for k, v in device_outputs["state"].items()
             }
-            n_recorded = int(loop["n_recorded"])
+            n_recorded = int(device_outputs["n_recorded"])
             buffers = (
                 {
                     k: np.asarray(v[:n_recorded], dtype=np.float64)
-                    for k, v in loop["buffers"].items()
+                    for k, v in device_outputs["buffers"].items()
                 }
                 if n_snapshots is not None
                 else None
@@ -405,11 +404,11 @@ class BaseFKPPSolver(ABC):
         return {
             "initial_state": initial_state,
             "final_state_cropped": final_state_cropped,
-            "stop_kind": int(loop["stop_kind"]),
-            "stop_step": int(loop["stop_step"]),
-            "stopping_quantity": float(loop["stopping_quantity"]),
-            "guard_mass_change": float(loop["guard_mass_change"]),
-            "guard_density": float(loop["guard_density"]),
+            "stop_kind": int(device_outputs["stop_kind"]),
+            "stop_step": int(device_outputs["stop_step"]),
+            "stopping_quantity": float(device_outputs["stopping_quantity"]),
+            "guard_mass_change": float(device_outputs["guard_mass_change"]),
+            "guard_density": float(device_outputs["guard_density"]),
             "buffers": buffers,
         }
 
@@ -438,7 +437,7 @@ class BaseFKPPSolver(ABC):
 
     def _assemble_result(
         self,
-        loop: dict[str, Any],
+        loop_results: dict[str, Any],
         dt: float,
         original_shape: tuple[int, int, int],
     ) -> Result:
@@ -447,15 +446,15 @@ class BaseFKPPSolver(ABC):
         upsample them to the original resolution and build the Result.
 
         Args:
-            loop: Host-side loop outputs of _run_device_loop.
+            loop_results: Host-side loop outputs of _run_device_loop.
             dt: Time step size.
             original_shape: Full-resolution 3D grid shape.
 
         Returns:
             The assembled Result.
         """
-        stop_kind = loop["stop_kind"]
-        stop_step = loop["stop_step"]
+        stop_kind = loop_results["stop_kind"]
+        stop_step = loop_results["stop_step"]
         lowres_shape = self.grid_shape
         box = self._crop_box
 
@@ -465,18 +464,22 @@ class BaseFKPPSolver(ABC):
             final_time = stop_step * dt
 
         guard_error = self._guard_error_message(
-            stop_kind, stop_step, dt, loop["guard_mass_change"], loop["guard_density"]
+            stop_kind,
+            stop_step,
+            dt,
+            loop_results["guard_mass_change"],
+            loop_results["guard_density"],
         )
         if guard_error is not None and self.params["verbose"]:
             logger.info(f"Early loop exit at t={stop_step * dt}: {guard_error}")
 
         final_state = {
             k: embed(v, box, lowres_shape)
-            for k, v in loop["final_state_cropped"].items()
+            for k, v in loop_results["final_state_cropped"].items()
         }
 
         time_series: dict[str, NDArray] | None = None
-        if loop["buffers"] is not None:
+        if loop_results["buffers"] is not None:
             time_series = {
                 key: np.array(
                     [
@@ -486,7 +489,7 @@ class BaseFKPPSolver(ABC):
                         for frame_cropped in frames
                     ]
                 )
-                for key, frames in loop["buffers"].items()
+                for key, frames in loop_results["buffers"].items()
             }
 
         if guard_error is not None:
@@ -500,14 +503,14 @@ class BaseFKPPSolver(ABC):
             success=guard_error is None,
             initial_state={
                 k: self._upsample_to(v, original_shape)
-                for k, v in loop["initial_state"].items()
+                for k, v in loop_results["initial_state"].items()
             },
             final_state={
                 k: self._upsample_to(v, original_shape)
                 for k, v in final_state.items()
             },
             final_time=final_time,
-            final_stopping_quantity=loop["stopping_quantity"],
+            final_stopping_quantity=loop_results["stopping_quantity"],
             stopping_criterion=stopping_criterion,
             time_series=time_series,
             error=guard_error,
@@ -518,9 +521,6 @@ class BaseFKPPSolver(ABC):
     ) -> NDArray:
         """
         Downsample a host field with ``scipy.ndimage.zoom``.
-
-        ``scipy.ndimage.zoom`` is deliberate -- ``jax.image.resize`` is not
-        numerically equivalent and must not replace it.
         """
         return zoom(field, factor, order=order)
 
