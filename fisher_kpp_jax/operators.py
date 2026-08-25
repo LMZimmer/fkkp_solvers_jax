@@ -1,13 +1,5 @@
 """Stateless numerical operators and the jitted time loop for the JAX
 Fisher-KPP solvers.
-
-Device operators use ``jax.numpy``; host operators (bounding box, embed) stay
-in NumPy because they only run once per solve, outside the jitted time loop.
-All stencils apply zero-flux (homogeneous Neumann) boundaries via edge
-replication: the ghost cell outside the array equals the boundary cell, so
-boundary faces carry zero net flux. The jitted time loop's inputs and the
-required step/quantity/guard function signatures are documented at
-``_run_time_loop``.
 """
 
 from __future__ import annotations
@@ -22,25 +14,21 @@ import numpy as np
 from numpy.typing import NDArray
 
 
-# Empirically chosen constants of the Gaussian seed profile.
 GAUSSIAN_SEED_DIFFUSION_TIME: float = 5.0  # width of the analytic heat kernel
 GAUSSIAN_SEED_MASS: float = 250.0  # total mass of the kernel
 GAUSSIAN_SEED_FLOOR: float = 0.1  # values at or below this are zeroed
 
-# DTI guard thresholds (see solvers._dti_guard): referenced by the device
-# guard and by base's error messages, so they can never disagree.
+# DTI guard thresholds (see solvers._dti_guard)
 SHRINKAGE_LIMIT: float = 10.0
 VANISHING_DENSITY_LIMIT: float = 1e-6
 
-# Stop-kind codes carried through the scan.
+# Stop-kind codes
 _RUNNING: int = 0
 _STOP_THRESHOLD: int = 1
 _STOP_SHRINKAGE: int = 2
 _STOP_VANISHING: int = 3
 
 SCAN_TRACE_COUNT: int = 0
-"""Number of times the time scan has been traced in this process
-(diagnostic: identical consecutive solves must not increase it)."""
 
 
 def shift_grid_by_one(field: jax.Array, shift: int, axis: int) -> jax.Array:
@@ -117,7 +105,7 @@ def masked_face_average(
 def diffusion_term(
     u: jax.Array,
     diffusivity: dict[str, jax.Array],
-    spacing: tuple[jax.Array, jax.Array, jax.Array],
+    grid_spacing: tuple[jax.Array, jax.Array, jax.Array],
 ) -> jax.Array:
     """
     Compute the conservative finite-volume discretization of div(D grad u).
@@ -130,14 +118,14 @@ def diffusion_term(
             i+1); 'bwd' is its edge-replicated shift by +1 (see
             ``shift_grid_by_one``), the backward face (between cells i-1
             and i).
-        spacing: Grid spacing (dx, dy, dz) in mm, 0-d device scalars.
+        grid_spacing: Grid spacing (dx, dy, dz) in mm, 0-d device scalars.
 
     Returns:
         The diffusion term, same shape as u. Boundary faces carry zero flux:
         the edge-replicated ghost cell equals the boundary cell, so the flux
         through a boundary face is exactly zero.
     """
-    dx, dy, dz = spacing
+    dx, dy, dz = grid_spacing
     d = diffusivity
     div_x = 1 / (dx * dx) * (
         d["bwd_x"] * (shift_grid_by_one(u, 1, axis=0) - u)
@@ -225,9 +213,6 @@ def tissue_bounding_box(
 ) -> tuple[slice, slice, slice]:
     """
     Compute the axis-aligned bounding box of the True region of mask.
-
-    Host-side (NumPy): runs once per solve and its output (static slices)
-    determines the jitted shapes.
 
     Args:
         mask: Boolean 3D array.
@@ -375,28 +360,25 @@ def _time_step(
     stop_threshold = is_active & threshold_hit
     stop_guard = is_active & jnp.logical_not(threshold_hit) & (guard_code > 0)
     stopped_now = stop_threshold | stop_guard
-    # Recording happens after both stop checks, so a break step is never
-    # snapshotted.
+    
     do_record = is_active & jnp.logical_not(stopped_now) & (snapshot_slot >= 0)
 
     buffers = carry["buffers"]
     if n_slots > 0:
-        clipped_slot = jnp.clip(snapshot_slot, 0, n_slots - 1)
+        # set buffers at the correct slot to new_state; non-recording steps
+        # target the out-of-bounds slot n_slots, which mode="drop" discards.
+        write_slot = jnp.where(do_record, snapshot_slot, n_slots)
         buffers = {
-            k: buf.at[clipped_slot].set(
-                jnp.where(do_record, new_state[k], buf[clipped_slot])
-            )
+            k: buf.at[write_slot].set(new_state[k], mode="drop")
             for k, buf in buffers.items()
         }
 
-    stop_kind = jnp.where(
-        stop_threshold,
-        _STOP_THRESHOLD,
-        jnp.where(
-            stop_guard,
-            jnp.where(guard_code == 1, _STOP_SHRINKAGE, _STOP_VANISHING),
-            carry["stop_kind"],
-        ),
+    # First true condition wins; once the loop is inactive all conditions
+    # are False and the default latches the recorded value.
+    stop_kind = jnp.select(
+        [stop_threshold, stop_guard & (guard_code == 1), stop_guard],
+        [_STOP_THRESHOLD, _STOP_SHRINKAGE, _STOP_VANISHING],
+        default=carry["stop_kind"],
     )
     next_carry = {
         "state": {
@@ -405,11 +387,10 @@ def _time_step(
         },
         "active": is_active & jnp.logical_not(stopped_now),
         "stop_kind": stop_kind,
+        # Update or use old values decided by jnp.where
         "stop_step": jnp.where(stopped_now, step_index, carry["stop_step"]),
-        # The loop's last computed stopping quantity: frozen at the value
-        # of the stopping step once the loop is done.
-        "quantity": jnp.where(
-            is_active, stopping_quantity, carry["quantity"]
+        "stopping_quantity": jnp.where(
+            is_active, stopping_quantity, carry["stopping_quantity"]
         ),
         "guard_mass_change": jnp.where(
             stop_guard, guard_mass_change, carry["guard_mass_change"]
@@ -475,7 +456,8 @@ def _run_time_scan(
         _STOP_VANISHING),
         'stop_step' (step index at which the loop stopped, 0 if it never
         did),
-        'quantity' (stopping quantity of the last active step, float64),
+        'stopping_quantity' (stopping quantity of the last active step,
+        float64),
         'guard_mass_change' and 'guard_density' (guard diagnostics of the
         stopping step, 0.0 unless a guard fired) and
         'buffers' / 'n_recorded' (per-field snapshot arrays of shape
@@ -501,7 +483,7 @@ def _run_time_scan(
         "active": jnp.asarray(True),
         "stop_kind": jnp.asarray(_RUNNING, dtype=jnp.int32),
         "stop_step": jnp.asarray(0, dtype=jnp.int32),
-        "quantity": jnp.asarray(0.0, dtype=jnp.float64),
+        "stopping_quantity": jnp.asarray(0.0, dtype=jnp.float64),
         "guard_mass_change": jnp.asarray(0.0, dtype=jnp.float64),
         "guard_density": jnp.asarray(0.0, dtype=jnp.float64),
         "n_recorded": jnp.asarray(0, dtype=jnp.int32),
@@ -558,9 +540,6 @@ def _run_time_loop(
             physical parameters, plus the shared keys built by the base
             solver ('dt', 'grid_spacing', 'voxel_volume',
             'stopping_threshold' and, in volume mode, 'volume_threshold').
-            All entries are traced jit arguments, so changing a value never
-            recompiles; only the dict's keys and the array shapes/dtypes are
-            part of the jit cache key.
         step_func: Step function, see above.
         quantity_func: Stopping-quantity function, see above.
         guard_func: Post-step guard function, see above.
@@ -575,7 +554,8 @@ def _run_time_loop(
         _STOP_VANISHING),
         'stop_step' (step index at which the loop stopped, 0 if it never
         did),
-        'quantity' (stopping quantity of the last active step, float64),
+        'stopping_quantity' (stopping quantity of the last active step,
+        float64),
         'guard_mass_change' and 'guard_density' (guard diagnostics of the
         stopping step, 0.0 unless a guard fired) and
         'buffers' / 'n_recorded' (per-field snapshot arrays of shape

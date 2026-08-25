@@ -407,7 +407,7 @@ class BaseFKPPSolver(ABC):
             "final_state_cropped": final_state_cropped,
             "stop_kind": int(loop["stop_kind"]),
             "stop_step": int(loop["stop_step"]),
-            "quantity": float(loop["quantity"]),
+            "stopping_quantity": float(loop["stopping_quantity"]),
             "guard_mass_change": float(loop["guard_mass_change"]),
             "guard_density": float(loop["guard_density"]),
             "buffers": buffers,
@@ -507,7 +507,7 @@ class BaseFKPPSolver(ABC):
                 for k, v in final_state.items()
             },
             final_time=final_time,
-            final_stopping_quantity=loop["quantity"],
+            final_stopping_quantity=loop["stopping_quantity"],
             stopping_criterion=stopping_criterion,
             time_series=time_series,
             error=guard_error,

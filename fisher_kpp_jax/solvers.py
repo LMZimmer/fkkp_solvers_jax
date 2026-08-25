@@ -164,7 +164,7 @@ def _two_compartment_step(
     """
     dt = constants["dt"]
     necrosis_rate = constants["necrosis_rate"]
-    spacing = constants["grid_spacing"]
+    grid_spacing = constants["grid_spacing"]
     proliferative = state["proliferative"]
     necrotic = state["necrotic"]
     nutrient = state["nutrient"]
@@ -188,7 +188,7 @@ def _two_compartment_step(
         -NECROSIS_SWITCH_STEEPNESS * (nutrient - constants["nutrient_threshold"])
     )
 
-    tumor_diffusion = diffusion_term(proliferative, tumor_faces, spacing)
+    tumor_diffusion = diffusion_term(proliferative, tumor_faces, grid_spacing)
     delta_proliferative = (
         tumor_diffusion
         + constants["rho"]
@@ -202,7 +202,7 @@ def _two_compartment_step(
     necrotic = necrotic + delta_necrotic
 
     nutrient_diffusion = diffusion_term(
-        nutrient, constants["nutrient_faces"], spacing
+        nutrient, constants["nutrient_faces"], grid_spacing
     )
     delta_nutrient = (
         nutrient_diffusion
