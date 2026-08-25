@@ -19,10 +19,7 @@ from numpy.typing import NDArray
 from scipy.ndimage import zoom
 
 from .operators import (
-    GuardSpec,
-    QuantitySpec,
     SHRINKAGE_LIMIT,
-    StepSpec,
     VANISHING_DENSITY_LIMIT,
     _RUNNING,
     _STOP_SHRINKAGE,
@@ -186,10 +183,21 @@ class BaseFKPPSolver(ABC):
     # Required and default parameters, implemented by each solver
     _REQUIRED: ClassVar[frozenset[str]]
     _DEFAULTS: ClassVar[dict[str, Any]]
-    
-    # Early stopping functions on device consumed by _quantity_spec, set per solver class.
+
+    # Device functions of the time loop, set per solver class. They must be
+    # module-level functions (see ``operators._run_time_loop`` for the
+    # required signatures and the jit-cache reasoning). _step_func performs
+    # one explicit-Euler step; a solver that rebuilds its diffusivity every
+    # step does so inside the step function, from the carried state.
+    # _mass_func/_volume_func are the stopping quantities dispatched on
+    # stopping_mode; _guard_func is the post-step sanity check (the default
+    # never fires and is pruned by XLA; AnisotropicFKPPSolver overrides it).
+    _step_func: ClassVar[Callable[..., dict[str, jax.Array]]]
     _mass_func: ClassVar[Callable[..., jax.Array]]
     _volume_func: ClassVar[Callable[..., jax.Array]]
+    _guard_func: ClassVar[
+        Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
+    ] = staticmethod(_no_guard)
 
     def __init__(self, params: Mapping[str, Any]) -> None:
         merged = _merge_parameters(
@@ -352,16 +360,33 @@ class BaseFKPPSolver(ABC):
             self._crop_box = box
             state_cropped = {k: v[box] for k, v in state_lowres.items()}
 
-            constants = self._build_device_constants(dt)
+            constants = self._build_device_constants()
+            # Shared entries next to the solver's own fields and scalars.
+            constants["dt"] = self._dynamic_scalar(dt)
+            constants["grid_spacing"] = tuple(
+                self._dynamic_scalar(s) for s in self.grid_spacing
+            )
+            # f64 factors and threshold to match the f64 stopping-quantity
+            # reduction they feed.
+            constants["voxel_volume"] = jnp.asarray(
+                self.voxel_volume, dtype=jnp.float64
+            )
+            constants["stopping_threshold"] = jnp.asarray(
+                float(params["stopping_threshold"]), dtype=jnp.float64
+            )
+            if params["stopping_mode"] == "volume":
+                # Compared against the state fields, so at the state dtype.
+                constants["volume_threshold"] = self._dynamic_scalar(
+                    params["volume_threshold"]
+                )
 
             loop = _run_time_loop(
                 state_cropped,
                 constants,
-                self._step_spec(dt),
-                self._quantity_spec(),
-                self._guard_spec(),
+                self._step_func,
+                self._quantity_func(),
+                self._guard_func,
                 n_steps,
-                float(params["stopping_threshold"]),
                 record_steps,
             )
             final_state_cropped = {
@@ -543,29 +568,23 @@ class BaseFKPPSolver(ABC):
         """
 
     @abstractmethod
-    def _build_device_constants(self, dt: float) -> dict[str, Any]:
+    def _build_device_constants(self) -> dict[str, Any]:
         """
-        Build the constant device arrays for the scan (face diffusivities,
-        tissue masks), once per solve on the cropped grid.
+        Build the solver's device inputs of the scan, once per solve on the
+        cropped grid: the field arrays (face diffusivities, tissue masks)
+        and the solver-specific physical parameters as 0-d device scalars
+        (via ``_dynamic_scalar``).
 
-        They are passed to the time scan as dynamic arguments, so
-        re-solves with the same shapes and dtype reuse the compiled driver.
-        """
-
-    @abstractmethod
-    def _step_spec(self, dt: float) -> StepSpec:
-        """
-        Return the step specification for one explicit-Euler step on the
-        cropped grid.
-
-        See ``StepSpec`` for the function signature and the dynamic/static
-        split. A solver that rebuilds its diffusivity every step does so
-        inside the step function, from the carried state.
+        The base solver adds the shared entries afterwards ('dt',
+        'grid_spacing', 'voxel_volume', 'stopping_threshold' and, in volume
+        mode, 'volume_threshold'). Every entry is a traced jit argument, so
+        re-solves with the same keys, shapes and dtypes reuse the compiled
+        scan whatever the values.
         """
 
-    def _quantity_spec(self) -> QuantitySpec:
+    def _quantity_func(self) -> Callable[..., jax.Array]:
         """
-        Return the stopping-quantity spec dispatched on stopping_mode.
+        Return the stopping-quantity function dispatched on stopping_mode.
 
         See ``Result.final_stopping_quantity``: total cell mass
         (``_mass_func``, the default) or
@@ -575,21 +594,8 @@ class BaseFKPPSolver(ABC):
         per-solver functions.
         """
         if self.params["stopping_mode"] == "volume":
-            dynamic_scalars = {
-                "volume_threshold": self._dynamic_scalar(
-                    self.params["volume_threshold"]
-                )
-            }
-            return {
-                "func": self._volume_func,
-                "dynamic_scalars": dynamic_scalars,
-                "static_args": (self.voxel_volume,),
-            }
-        return {
-            "func": self._mass_func,
-            "dynamic_scalars": {},
-            "static_args": (self.voxel_volume,),
-        }
+            return self._volume_func
+        return self._mass_func
 
     @abstractmethod
     def _time_step_count(self) -> tuple[int, float]:
@@ -600,17 +606,6 @@ class BaseFKPPSolver(ABC):
         Bypassed entirely when the ``n_steps`` param is set. The three
         formulas are deliberately not unified -- do not merge or "fix" them.
         """
-
-    def _guard_spec(self) -> GuardSpec:
-        """
-        Return the post-step guard spec, evaluated on the device inside the
-        scan.
-
-        See ``GuardSpec`` for the function signature. The
-        AnisotropicFKPPSolver
-        overrides; the default never fires (and is pruned by XLA).
-        """
-        return {"func": _no_guard, "dynamic_scalars": {}, "static_args": ()}
 
     def _check_seed(self) -> None:
         """

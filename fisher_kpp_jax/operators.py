@@ -5,15 +5,16 @@ Device operators use ``jax.numpy``; host operators (bounding box, embed) stay
 in NumPy because they only run once per solve, outside the jitted time loop.
 All stencils apply zero-flux (homogeneous Neumann) boundaries via edge
 replication: the ghost cell outside the array equals the boundary cell, so
-boundary faces carry zero net flux. Which arguments of the jitted time loop
-are dynamic and which are static is documented at ``StepSpec``.
+boundary faces carry zero net flux. The jitted time loop's inputs and the
+required step/quantity/guard function signatures are documented at
+``_run_time_loop``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from functools import partial
-from typing import Any, TypedDict
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -40,61 +41,6 @@ _STOP_VANISHING: int = 3
 SCAN_TRACE_COUNT: int = 0
 """Number of times the time scan has been traced in this process
 (diagnostic: identical consecutive solves must not increase it)."""
-
-
-class StepSpec(TypedDict):
-    """Step specification for the jitted time loop.
-
-    func must be defined at module level so that every solve passes the 
-    identical function object and the jit cache is reused.
-    Its required signature::
-
-        def step_func(
-            state: dict[str, jax.Array],
-            constants: dict[str, Any],
-            dynamic_scalars: dict[str, jax.Array],
-            *static_args: Any,
-        ) -> dict[str, jax.Array]: ...
-
-    dynamic_scalars holds 0-d device arrays of individual parameters
-    (changing a value never recompiles); static_args holds static
-    values (changing recompiles).
-    """
-
-    func: Callable[..., dict[str, jax.Array]]
-    dynamic_scalars: dict[str, jax.Array]
-    static_args: tuple[Any, ...]
-
-
-class QuantitySpec(TypedDict):
-    """Stopping-quantity specification, same slots as ``StepSpec``.
-
-    func is called as func(state, constants, dynamic_scalars, *static_args)
-    and returns the float64 stopping quantity.
-    """
-
-    func: Callable[..., jax.Array]
-    dynamic_scalars: dict[str, jax.Array]
-    static_args: tuple[Any, ...]
-
-
-class GuardSpec(TypedDict):
-    """Sanity check evaluated on the device after every step.
-
-    The guard compares the stepped state against the previous one to
-    detect a solve gone wrong (e.g. an explicit-Euler instability); if it
-    fires, the time loop stops and the run is reported as a failure. The
-    default guard (``_no_guard``) never fires. Same slots as ``StepSpec``.
-
-    func is called as
-    func(new_state, previous_state, constants, dynamic_scalars,
-    *static_args) and returns (code, mass change, integrated density);
-    code 0 = no guard fired, 1 = shrinkage, 2 = vanishing volume.
-    """
-
-    func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
-    dynamic_scalars: dict[str, jax.Array]
-    static_args: tuple[Any, ...]
 
 
 def shift_grid_by_one(field: jax.Array, shift: int, axis: int) -> jax.Array:
@@ -171,7 +117,7 @@ def masked_face_average(
 def diffusion_term(
     u: jax.Array,
     diffusivity: dict[str, jax.Array],
-    spacing: tuple[float, float, float],
+    spacing: tuple[jax.Array, jax.Array, jax.Array],
 ) -> jax.Array:
     """
     Compute the conservative finite-volume discretization of div(D grad u).
@@ -184,7 +130,7 @@ def diffusion_term(
             i+1); 'bwd' is its edge-replicated shift by +1 (see
             ``shift_grid_by_one``), the backward face (between cells i-1
             and i).
-        spacing: Grid spacing (dx, dy, dz) in mm.
+        spacing: Grid spacing (dx, dy, dz) in mm, 0-d device scalars.
 
     Returns:
         The diffusion term, same shape as u. Boundary faces carry zero flux:
@@ -385,10 +331,9 @@ def _no_guard(
     new_state: dict[str, jax.Array],
     previous_state: dict[str, jax.Array],
     constants: dict[str, Any],
-    dynamic_scalars: dict[str, jax.Array],
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Default guard: never fires (pruned by XLA)."""
-    del new_state, previous_state, constants, dynamic_scalars
+    del new_state, previous_state, constants
     zero_i = jnp.asarray(0, dtype=jnp.int32)
     zero_f = jnp.asarray(0.0, dtype=jnp.float64)
     return zero_i, zero_f, zero_f
@@ -396,62 +341,50 @@ def _no_guard(
 
 def _time_step(
     carry: dict[str, Any],
-    x: tuple[jax.Array, jax.Array],
+    step_input: tuple[jax.Array, jax.Array],
     *,
     step_func: Callable[..., dict[str, jax.Array]],
     quantity_func: Callable[..., jax.Array],
     guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
     constants: dict[str, Any],
-    dynamic_args: dict[str, Any],
-    step_static: tuple[Any, ...],
-    quantity_static: tuple[Any, ...],
-    guard_static: tuple[Any, ...],
     n_slots: int,
 ) -> tuple[dict[str, Any], None]:
     """
-    Perform one time step of the scan: the scan body of ``_run_time_scan``,
-    which binds every keyword argument with ``functools.partial`` so that
-    ``lax.scan`` calls this as f(carry, x).
-
-    The operation order is fixed -- results depend on it: step ->
-    stopping quantity -> threshold-stop check (priority) -> guard check ->
-    snapshot recording (skipped at a break step).
+    Perform one time step. Keyword arguments (after *) are bound via
+    functools.partial such that lax.scan runs with
+    _time_step(carry, step_input).
 
     Args:
         carry: The loop state, see ``_run_time_scan``'s Returns.
-        x: Per-step scan inputs (step index, snapshot slot).
+        step_input: Per-step scan inputs (step index, snapshot slot).
 
     Returns:
         (next carry, None): scan carries the loop state; nothing is
         emitted per step.
     """
-    t, slot = x
-    prev = carry["state"]
-    active = carry["active"]
-    new_state = step_func(
-        prev, constants, dynamic_args["step"], *step_static
-    )
-    quantity = quantity_func(
-        new_state, constants, dynamic_args["quantity"], *quantity_static
-    )
-    threshold_hit = quantity >= dynamic_args["stopping_threshold"]
+    step_index, snapshot_slot = step_input
+    previous_state = carry["state"]
+    is_active = carry["active"]
+    new_state = step_func(previous_state, constants)
+    stopping_quantity = quantity_func(new_state, constants)
+    threshold_hit = stopping_quantity >= constants["stopping_threshold"]
     guard_code, guard_mass_change, guard_density = guard_func(
-        new_state, prev, constants, dynamic_args["guard"], *guard_static
+        new_state, previous_state, constants
     )
 
-    stop_threshold = active & threshold_hit
-    stop_guard = active & jnp.logical_not(threshold_hit) & (guard_code > 0)
+    stop_threshold = is_active & threshold_hit
+    stop_guard = is_active & jnp.logical_not(threshold_hit) & (guard_code > 0)
     stopped_now = stop_threshold | stop_guard
     # Recording happens after both stop checks, so a break step is never
     # snapshotted.
-    do_record = active & jnp.logical_not(stopped_now) & (slot >= 0)
+    do_record = is_active & jnp.logical_not(stopped_now) & (snapshot_slot >= 0)
 
     buffers = carry["buffers"]
     if n_slots > 0:
-        slot_clipped = jnp.clip(slot, 0, n_slots - 1)
+        clipped_slot = jnp.clip(snapshot_slot, 0, n_slots - 1)
         buffers = {
-            k: buf.at[slot_clipped].set(
-                jnp.where(do_record, new_state[k], buf[slot_clipped])
+            k: buf.at[clipped_slot].set(
+                jnp.where(do_record, new_state[k], buf[clipped_slot])
             )
             for k, buf in buffers.items()
         }
@@ -466,13 +399,18 @@ def _time_step(
         ),
     )
     next_carry = {
-        "state": {k: jnp.where(active, new_state[k], prev[k]) for k in new_state},
-        "active": active & jnp.logical_not(stopped_now),
+        "state": {
+            k: jnp.where(is_active, new_state[k], previous_state[k])
+            for k in new_state
+        },
+        "active": is_active & jnp.logical_not(stopped_now),
         "stop_kind": stop_kind,
-        "stop_step": jnp.where(stopped_now, t, carry["stop_step"]),
+        "stop_step": jnp.where(stopped_now, step_index, carry["stop_step"]),
         # The loop's last computed stopping quantity: frozen at the value
         # of the stopping step once the loop is done.
-        "quantity": jnp.where(active, quantity, carry["quantity"]),
+        "quantity": jnp.where(
+            is_active, stopping_quantity, carry["quantity"]
+        ),
         "guard_mass_change": jnp.where(
             stop_guard, guard_mass_change, carry["guard_mass_change"]
         ),
@@ -489,11 +427,8 @@ def _time_step(
     jax.jit,
     static_argnames=(
         "step_func",
-        "step_static",
         "quantity_func",
-        "quantity_static",
         "guard_func",
-        "guard_static",
         "n_steps",
         "n_slots",
     ),
@@ -501,41 +436,34 @@ def _time_step(
 def _run_time_scan(
     state: dict[str, jax.Array],
     constants: dict[str, Any],
-    dynamic_args: dict[str, Any],
     slot_ids: jax.Array,
     *,
     step_func: Callable[..., dict[str, jax.Array]],
-    step_static: tuple[Any, ...],
     quantity_func: Callable[..., jax.Array],
-    quantity_static: tuple[Any, ...],
     guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
-    guard_static: tuple[Any, ...],
     n_steps: int,
     n_slots: int,
 ) -> dict[str, Any]:
     """
     Run the explicit-Euler time loop as one jitted ``lax.scan``.
+    Jitting is done via the decorator.
 
     The loop length is fixed. After a stop, every remaining scan
     iteration is a masked no-op.
 
-    The step, quantity and guard functions and their static argument tuples
-    are stable across solves, while device arrays and physical scalars are
-    dynamic arguments (see ``StepSpec``).
+    All keyword-only arguments (after *) are jit-static, passing a new value
+    triggers recompile. The positional arguments (state, constants,
+    slot_ids) are traced device values, so solves that differ only in them
+    reuse the compiled scan.
 
     Args:
         state: Initial device state on the cropped grid.
-        constants: Constant device arrays consumed by the functions.
-        dynamic_args: Each function's 0-d device scalars under the keys
-            "step", "quantity" and "guard", plus the float64
-            "stopping_threshold".
+        constants: Device arrays and 0-d scalars consumed by the functions
+            and the stop logic, see ``_run_time_loop``.
         slot_ids: Snapshot slot of each step (-1: no snapshot).
-        step_func: Step function, see ``StepSpec``.
-        step_static: Static arguments of the step function.
-        quantity_func: Stopping-quantity function, see ``QuantitySpec``.
-        quantity_static: Static arguments of the quantity function.
-        guard_func: Post-step guard function, see ``GuardSpec``.
-        guard_static: Static arguments of the guard function.
+        step_func: Step function, see ``_run_time_loop``.
+        quantity_func: Stopping-quantity function, see ``_run_time_loop``.
+        guard_func: Post-step guard function, see ``_run_time_loop``.
         n_steps: Number of scan iterations.
         n_slots: Number of snapshot slots.
 
@@ -556,7 +484,8 @@ def _run_time_scan(
     global SCAN_TRACE_COUNT  # diagnostic, incremented once per compile
     SCAN_TRACE_COUNT += 1
 
-    xs = (jnp.arange(n_steps, dtype=jnp.int32), slot_ids)
+    # first axis dimension sets the number of iterations in jax.lax.scan
+    step_inputs = (jnp.arange(n_steps, dtype=jnp.int32), slot_ids)
 
     time_step = partial(
         _time_step,
@@ -564,10 +493,6 @@ def _run_time_scan(
         quantity_func=quantity_func,
         guard_func=guard_func,
         constants=constants,
-        dynamic_args=dynamic_args,
-        step_static=step_static,
-        quantity_static=quantity_static,
-        guard_static=guard_static,
         n_slots=n_slots,
     )
 
@@ -585,31 +510,61 @@ def _run_time_scan(
             for k, v in state.items()
         },
     }
-    final_carry, _ = jax.lax.scan(time_step, initial_carry, xs)
+    final_carry, _ = jax.lax.scan(time_step, initial_carry, step_inputs)
     return final_carry
 
 
 def _run_time_loop(
     state: dict[str, jax.Array],
     constants: dict[str, Any],
-    step_spec: StepSpec,
-    quantity_spec: QuantitySpec,
-    guard_spec: GuardSpec,
+    step_func: Callable[..., dict[str, jax.Array]],
+    quantity_func: Callable[..., jax.Array],
+    guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
     n_steps: int,
-    stopping_threshold: float,
     record_steps: NDArray,
 ) -> dict[str, Any]:
     """
     Prepare the host-side inputs and call the time scan (jitted loop).
 
+    The three functions must be defined at module level so that every solve
+    passes the identical function object and the jit cache is reused. Their
+    required signatures::
+
+        def step_func(
+            state: dict[str, jax.Array], constants: dict[str, Any]
+        ) -> dict[str, jax.Array]: ...
+
+        def quantity_func(
+            state: dict[str, jax.Array], constants: dict[str, Any]
+        ) -> jax.Array: ...  # the float64 stopping quantity
+
+        def guard_func(
+            new_state: dict[str, jax.Array],
+            previous_state: dict[str, jax.Array],
+            constants: dict[str, Any],
+        ) -> tuple[jax.Array, jax.Array, jax.Array]: ...
+
+    The guard is a post-step sanity check: it compares the stepped state
+    against the previous one to detect a solve gone wrong (e.g. an
+    explicit-Euler instability) and returns (code, mass change, integrated
+    density); code 0 = no guard fired, 1 = shrinkage, 2 = vanishing volume.
+    If it fires, the time loop stops and the run is reported as a failure.
+    The default guard (``_no_guard``) never fires.
+
     Args:
         state: Initial device state on the cropped grid.
-        constants: Constant device arrays consumed by the functions.
-        step_spec: Step specification, see ``StepSpec``.
-        quantity_spec: Stopping-quantity specification, see ``QuantitySpec``.
-        guard_spec: Post-step guard specification, see ``GuardSpec``.
+        constants: Device arrays and 0-d device scalars consumed by the
+            functions and the stop logic: the solver's field arrays and
+            physical parameters, plus the shared keys built by the base
+            solver ('dt', 'grid_spacing', 'voxel_volume',
+            'stopping_threshold' and, in volume mode, 'volume_threshold').
+            All entries are traced jit arguments, so changing a value never
+            recompiles; only the dict's keys and the array shapes/dtypes are
+            part of the jit cache key.
+        step_func: Step function, see above.
+        quantity_func: Stopping-quantity function, see above.
+        guard_func: Post-step guard function, see above.
         n_steps: Number of time steps.
-        stopping_threshold: Threshold on the stopping quantity.
         record_steps: Step indices at which snapshots are recorded.
 
     Returns:
@@ -631,24 +586,13 @@ def _run_time_loop(
     slot_ids = np.full(n_steps, -1, dtype=np.int32)
     if n_slots:
         slot_ids[slot_steps] = np.arange(n_slots, dtype=np.int32)
-    dynamic_args = {
-        "step": step_spec["dynamic_scalars"],
-        "quantity": quantity_spec["dynamic_scalars"],
-        "guard": guard_spec["dynamic_scalars"],
-        # f64 to match the f64 stopping-quantity reduction it is compared to.
-        "stopping_threshold": jnp.asarray(stopping_threshold, dtype=jnp.float64),
-    }
     return _run_time_scan(
         state,
         constants,
-        dynamic_args,
         jnp.asarray(slot_ids),
-        step_func=step_spec["func"],
-        step_static=step_spec["static_args"],
-        quantity_func=quantity_spec["func"],
-        quantity_static=quantity_spec["static_args"],
-        guard_func=guard_spec["func"],
-        guard_static=guard_spec["static_args"],
+        step_func=step_func,
+        quantity_func=quantity_func,
+        guard_func=guard_func,
         n_steps=n_steps,
         n_slots=n_slots,
     )
