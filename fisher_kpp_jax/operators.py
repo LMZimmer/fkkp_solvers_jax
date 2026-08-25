@@ -128,16 +128,16 @@ def diffusion_term(
     dx, dy, dz = grid_spacing
     d = diffusivity
     div_x = 1 / (dx * dx) * (
-        d["bwd_x"] * (shift_grid_by_one(u, 1, axis=0) - u)
-        - d["fwd_x"] * (u - shift_grid_by_one(u, -1, axis=0))
+        d["fwd_x"] * (shift_grid_by_one(u, -1, axis=0) - u)
+        - d["bwd_x"] * (u - shift_grid_by_one(u, 1, axis=0))
     )
     div_y = 1 / (dy * dy) * (
-        d["bwd_y"] * (shift_grid_by_one(u, 1, axis=1) - u)
-        - d["fwd_y"] * (u - shift_grid_by_one(u, -1, axis=1))
+        d["fwd_y"] * (shift_grid_by_one(u, -1, axis=1) - u)
+        - d["bwd_y"] * (u - shift_grid_by_one(u, 1, axis=1))
     )
     div_z = 1 / (dz * dz) * (
-        d["bwd_z"] * (shift_grid_by_one(u, 1, axis=2) - u)
-        - d["fwd_z"] * (u - shift_grid_by_one(u, -1, axis=2))
+        d["fwd_z"] * (shift_grid_by_one(u, -1, axis=2) - u)
+        - d["bwd_z"] * (u - shift_grid_by_one(u, 1, axis=2))
     )
     return div_x + div_y + div_z
 
@@ -153,9 +153,9 @@ def logistic_sigmoid(x: jax.Array) -> jax.Array:
 
 
 def clipped_gaussian(
-    shape: tuple[int, int, int],
+    grid_shape: tuple[int, int, int],
     center_voxel: tuple[int, int, int],
-    spacing: tuple[float, float, float],
+    grid_spacing: tuple[float, float, float],
     scale: float = 1.0,
     dtype: jnp.dtype = jnp.float64,
     diffusion_time: float = GAUSSIAN_SEED_DIFFUSION_TIME,
@@ -164,17 +164,13 @@ def clipped_gaussian(
 ) -> jax.Array:
     """
     Create the initial tumor cell density: an isotropic Gaussian profile
-    centered at center_voxel.
-
-    The clipping order is deliberate and results depend on it: values at or
-    below floor are
-    zeroed first (strictly-greater keeps the value), then the profile is
-    capped at 1.
+    centered at center_voxel. Values below floor are set to 0, values above
+    1 are clipped to 1.
 
     Args:
-        shape: Grid shape of the output field.
+        grid_shape: Grid shape of the output field.
         center_voxel: Voxel index of the profile center.
-        spacing: Grid spacing (dx, dy, dz) in mm.
+        grid_spacing: Grid spacing (dx, dy, dz) in mm.
         scale: Widens the seed by scaling the voxel coordinates.
         dtype: Dtype at which the whole profile is evaluated.
         diffusion_time: Width of the analytic heat kernel.
@@ -185,17 +181,15 @@ def clipped_gaussian(
         The clipped Gaussian profile of the given shape and dtype.
     """
     xv, yv, zv = jnp.meshgrid(
-        jnp.arange(0, shape[0], dtype=dtype),
-        jnp.arange(0, shape[1], dtype=dtype),
-        jnp.arange(0, shape[2], dtype=dtype),
+        jnp.arange(0, grid_shape[0], dtype=dtype),
+        jnp.arange(0, grid_shape[1], dtype=dtype),
+        jnp.arange(0, grid_shape[2], dtype=dtype),
         indexing="ij",
     )
-    x_scaled = (xv - center_voxel[0]) * spacing[0] / scale
-    y_scaled = (yv - center_voxel[1]) * spacing[1] / scale
-    z_scaled = (zv - center_voxel[2]) * spacing[2] / scale
+    x_scaled = (xv - center_voxel[0]) * grid_spacing[0] / scale
+    y_scaled = (yv - center_voxel[1]) * grid_spacing[1] / scale
+    z_scaled = (zv - center_voxel[2]) * grid_spacing[2] / scale
 
-    # The scalar amplitude is computed in float64 on the host and cast, so a
-    # NumPy scalar never promotes the device array dtype.
     amplitude = jnp.asarray(
         mass / np.power(4 * np.pi * diffusion_time, 3 / 2),
         dtype=dtype,
