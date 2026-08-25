@@ -5,27 +5,27 @@ grid: (182, 218, 182), seed voxel (140, 116, 55), GliODIL seed (Dt=15, M=1500)
 
 == fkpp_jax_f64_cpu ==
   wall time: 1.1 min
-  CPU time:  11.6 min -> 10.53 cores busy on average
+  CPU time:  11.3 min -> 10.40 cores busy on average
   final_time=100, criterion=time, final mass=58181.566, max density=0.999241
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/result_fkpp_jax_f64_cpu.nii.gz
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/segmentation_fkpp_jax_f64_cpu.nii.gz
 
 == fkpp_jax_f64_gpu ==
   wall time: 0.1 min
-  CPU time:  0.1 min -> 0.80 cores busy on average
+  CPU time:  0.1 min -> 0.88 cores busy on average
   final_time=100, criterion=time, final mass=58181.566, max density=0.999241
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/result_fkpp_jax_f64_gpu.nii.gz
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/segmentation_fkpp_jax_f64_gpu.nii.gz
 
 == fkpp_jax_f32_gpu ==
   wall time: 0.1 min
-  CPU time:  0.1 min -> 0.84 cores busy on average
+  CPU time:  0.1 min -> 0.92 cores busy on average
   final_time=100, criterion=time, final mass=58181.56, max density=0.99924
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/result_fkpp_jax_f32_gpu.nii.gz
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/segmentation_fkpp_jax_f32_gpu.nii.gz
 
 == comparison vs result_reference.nii.gz ==
-  fkpp_jax_f64_cpu     max|d|=2.220e-16  relL2=3.898e-17
+  fkpp_jax_f64_cpu     max|d|=2.776e-16  relL2=3.869e-17
   fkpp_jax_f64_gpu     max|d|=2.220e-16  relL2=6.983e-18
   fkpp_jax_f32_gpu     max|d|=1.473e-06  relL2=2.166e-07
 
