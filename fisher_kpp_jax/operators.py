@@ -142,7 +142,7 @@ def diffusion_term(
     return div_x + div_y + div_z
 
 
-def logistic_growth(u: jax.Array, rho: float) -> jax.Array:
+def logistic_growth(u: jax.Array, rho: jax.Array | float) -> jax.Array:
     """Compute the logistic growth term rho * u * (1 - u)."""
     return rho * (u * (1 - u))
 
@@ -497,7 +497,7 @@ def _run_time_loop(
     quantity_func: Callable[..., jax.Array],
     guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
     n_steps: int,
-    record_steps: NDArray,
+    n_snapshots: int | None,
 ) -> dict[str, Any]:
     """
     Prepare the host-side inputs and call the time scan (jitted loop).
@@ -538,24 +538,18 @@ def _run_time_loop(
         quantity_func: Stopping-quantity function, see above.
         guard_func: Post-step guard function, see above.
         n_steps: Number of time steps.
-        record_steps: Step indices at which snapshots are recorded.
+        n_snapshots: Number of snapshots to record, evenly spaced over the
+            steps; None records nothing. Duplicate step indices (more
+            snapshots than steps) collapse into a single slot.
 
     Returns:
-        Dict of device values with keys after the time loop:
-        'state' (the fields after the last active step),
-        'active' (False if a stop fired),
-        'stop_kind' (_RUNNING, _STOP_THRESHOLD, _STOP_SHRINKAGE or
-        _STOP_VANISHING),
-        'stop_step' (step index at which the loop stopped, 0 if it never
-        did),
-        'stopping_quantity' (stopping quantity of the last active step,
-        float64),
-        'guard_mass_change' and 'guard_density' (guard diagnostics of the
-        stopping step, 0.0 unless a guard fired) and
-        'buffers' / 'n_recorded' (per-field snapshot arrays of shape
-        (n_slots, *field_shape) and the number of frames written).
+        The final scan carry, see ``_run_time_scan``.
     """
-    slot_steps = np.unique(np.asarray(record_steps, dtype=np.int64))
+    if n_snapshots is None:
+        record_steps = np.empty(0, dtype=np.int64)
+    else:
+        record_steps = np.linspace(0, n_steps - 1, n_snapshots, dtype=np.int64)
+    slot_steps = np.unique(record_steps)
     n_slots = int(slot_steps.size)
     slot_ids = np.full(n_steps, -1, dtype=np.int32)
     if n_slots:

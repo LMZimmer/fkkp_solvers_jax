@@ -349,10 +349,13 @@ def _dti_guard(
     prev_sum = jnp.sum(previous_state["cell_density"], dtype=jnp.float64)
     total_change = new_sum - prev_sum
     integrated_density = voxel_volume * new_sum
-    code = jnp.where(
-        total_change < -SHRINKAGE_LIMIT,
-        1,
-        jnp.where(integrated_density < VANISHING_DENSITY_LIMIT, 2, 0),
+    code = jnp.select(
+        [
+            total_change < -SHRINKAGE_LIMIT,
+            integrated_density < VANISHING_DENSITY_LIMIT,
+        ],
+        [1, 2],
+        default=0,
     ).astype(jnp.int32)
     return code, total_change, integrated_density
 
@@ -414,13 +417,11 @@ class FKPPSolver(BaseFKPPSolver):
     def _initialize_state(self) -> dict[str, jax.Array]:
         return {"cell_density": self._gaussian_seed()}
 
-    def _build_device_constants(self) -> _SingleFieldSpecificConstants:
-        if self._crop_box is None:
-            raise RuntimeError(
-                "_build_device_constants called before the crop box was set."
-            )
-        gm_host = self._gm_lowres[self._crop_box]
-        wm_host = self._wm_lowres[self._crop_box]
+    def _build_device_constants(
+        self, box: tuple[slice, slice, slice]
+    ) -> _SingleFieldSpecificConstants:
+        gm_host = self._gm_lowres[box]
+        wm_host = self._wm_lowres[box]
 
         tissue_mask_host = (wm_host + gm_host) >= float(
             self.params["min_tissue_fraction"]
@@ -528,13 +529,11 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             "nutrient": nutrient,
         }
 
-    def _build_device_constants(self) -> _TwoCompartmentSpecificConstants:
-        if self._crop_box is None:
-            raise RuntimeError(
-                "_build_device_constants called before the crop box was set."
-            )
-        gm_host = self._gm_lowres[self._crop_box]
-        wm_host = self._wm_lowres[self._crop_box]
+    def _build_device_constants(
+        self, box: tuple[slice, slice, slice]
+    ) -> _TwoCompartmentSpecificConstants:
+        gm_host = self._gm_lowres[box]
+        wm_host = self._wm_lowres[box]
         # Time-constant validity mask, computed host-side in float64 so it
         # is identical for both precisions.
         tissue_mask_host = (wm_host + gm_host) >= float(
@@ -785,17 +784,15 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             )
         return {"cell_density": cell_density}
 
-    def _build_device_constants(self) -> _SingleFieldSpecificConstants:
-        if self._crop_box is None:
-            raise RuntimeError(
-                "_build_device_constants called before the crop box was set."
-            )
-        axial = jnp.asarray(self._axial_lowres[self._crop_box], dtype=self._dtype)
+    def _build_device_constants(
+        self, box: tuple[slice, slice, slice]
+    ) -> _SingleFieldSpecificConstants:
+        axial = jnp.asarray(self._axial_lowres[box], dtype=self._dtype)
         diffusivity = float(self.params["diffusivity"])
         faces: dict[str, jax.Array] = {}
         for axis, name in enumerate(_AXES):
             face = face_average(axial[:, :, :, axis], axis)
-            faces[f"fwd_{name}"] = face * diffusivity
+            faces[f"fwd_{name}"] = diffusivity * face
             faces[f"bwd_{name}"] = diffusivity * shift_grid_by_one(face, 1, axis=axis)
         return {
             "face_diffusivities": faces,

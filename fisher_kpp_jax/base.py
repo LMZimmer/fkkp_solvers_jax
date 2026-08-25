@@ -96,6 +96,39 @@ class Result:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _TimeLoopOutputs:
+    """
+    Host-side outputs of ``BaseFKPPSolver._run_device_loop``, consumed by
+    ``_assemble_result``.
+
+    Attributes:
+        initial_state: Initial fields on the full low-resolution grid.
+        final_state_cropped: Final fields on the cropped grid.
+        crop_box: Slices of the tissue bounding box the loop ran on.
+        stop_kind: Stop-kind code (_RUNNING, _STOP_THRESHOLD,
+            _STOP_SHRINKAGE or _STOP_VANISHING).
+        stop_step: Step index at which the loop stopped, 0 if it never did.
+        stopping_quantity: Stopping quantity of the last active step.
+        guard_mass_change: Guard diagnostic of the stopping step, 0.0
+            unless a guard fired.
+        guard_density: Guard diagnostic of the stopping step, 0.0 unless a
+            guard fired.
+        buffers: Recorded snapshot frames per field on the cropped grid, or
+            None if none were requested.
+    """
+
+    initial_state: dict[str, NDArray]
+    final_state_cropped: dict[str, NDArray]
+    crop_box: tuple[slice, slice, slice]
+    stop_kind: int
+    stop_step: int
+    stopping_quantity: float
+    guard_mass_change: float
+    guard_density: float
+    buffers: dict[str, NDArray] | None
+
+
 def _merge_parameters(
     params: Mapping[str, Any],
     required: frozenset[str],
@@ -232,7 +265,6 @@ class BaseFKPPSolver(ABC):
         )
         self._validate_extra(merged)
         self.params = merged
-        self._crop_box: tuple[slice, slice, slice] | None = None
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
         """Solver-specific validation beyond the shared parameters."""
@@ -352,7 +384,7 @@ class BaseFKPPSolver(ABC):
             logger.info(f"Number of simulation timesteps: {n_steps}")
         return n_steps, dt
 
-    def _run_device_loop(self, n_steps: int, dt: float) -> dict[str, Any]:
+    def _run_device_loop(self, n_steps: int, dt: float) -> _TimeLoopOutputs:
         """
         Initialize the device state, crop it to the tissue bounding box and
         run the jitted time loop.
@@ -362,13 +394,10 @@ class BaseFKPPSolver(ABC):
             dt: Time step size.
 
         Returns:
-            Host-side loop outputs: the initial low-resolution state, the
-            final cropped state, the stop bookkeeping values and the
-            recorded snapshot buffers (None unless snapshots were requested).
+            The host-side loop outputs, see ``_TimeLoopOutputs``.
         """
         params = self.params
         n_snapshots: int | None = params["n_time_series_snapshots"]
-        record_steps = self._get_record_steps(n_steps, n_snapshots)
 
         # x64 is enabled locally (never globally on import): the state keeps
         # its explicit f32/f64 dtype either way, while the stopping-quantity
@@ -380,7 +409,6 @@ class BaseFKPPSolver(ABC):
             }
 
             box = tissue_bounding_box(self._crop_mask(), margin=CROP_MARGIN)
-            self._crop_box = box
             state_cropped = {k: v[box] for k, v in state_lowres.items()}
 
             dx, dy, dz = self.grid_spacing
@@ -406,7 +434,7 @@ class BaseFKPPSolver(ABC):
             # shared is spread last so a stray solver key can never
             # overwrite a shared entry.
             constants: dict[str, Any] = {
-                **self._build_device_constants(),
+                **self._build_device_constants(box),
                 **shared,
             }
 
@@ -417,7 +445,7 @@ class BaseFKPPSolver(ABC):
                 self._quantity_func(),
                 self._guard_func,
                 n_steps,
-                record_steps,
+                n_snapshots,
             )
             final_state_cropped = {
                 k: np.asarray(v, dtype=np.float64)
@@ -433,16 +461,17 @@ class BaseFKPPSolver(ABC):
                 else None
             )
 
-        return {
-            "initial_state": initial_state,
-            "final_state_cropped": final_state_cropped,
-            "stop_kind": int(device_outputs["stop_kind"]),
-            "stop_step": int(device_outputs["stop_step"]),
-            "stopping_quantity": float(device_outputs["stopping_quantity"]),
-            "guard_mass_change": float(device_outputs["guard_mass_change"]),
-            "guard_density": float(device_outputs["guard_density"]),
-            "buffers": buffers,
-        }
+        return _TimeLoopOutputs(
+            initial_state=initial_state,
+            final_state_cropped=final_state_cropped,
+            crop_box=box,
+            stop_kind=int(device_outputs["stop_kind"]),
+            stop_step=int(device_outputs["stop_step"]),
+            stopping_quantity=float(device_outputs["stopping_quantity"]),
+            guard_mass_change=float(device_outputs["guard_mass_change"]),
+            guard_density=float(device_outputs["guard_density"]),
+            buffers=buffers,
+        )
 
     def _guard_error_message(
         self,
@@ -469,7 +498,7 @@ class BaseFKPPSolver(ABC):
 
     def _assemble_result(
         self,
-        loop_results: dict[str, Any],
+        loop_results: _TimeLoopOutputs,
         dt: float,
         original_shape: tuple[int, int, int],
     ) -> Result:
@@ -485,10 +514,10 @@ class BaseFKPPSolver(ABC):
         Returns:
             The assembled Result.
         """
-        stop_kind = loop_results["stop_kind"]
-        stop_step = loop_results["stop_step"]
+        stop_kind = loop_results.stop_kind
+        stop_step = loop_results.stop_step
         lowres_shape = self.grid_shape
-        box = self._crop_box
+        box = loop_results.crop_box
 
         if stop_kind == _RUNNING:
             final_time = float(self.params["stopping_time"])
@@ -499,19 +528,19 @@ class BaseFKPPSolver(ABC):
             stop_kind,
             stop_step,
             dt,
-            loop_results["guard_mass_change"],
-            loop_results["guard_density"],
+            loop_results.guard_mass_change,
+            loop_results.guard_density,
         )
         if guard_error is not None and self.params["verbose"]:
             logger.info(f"Early loop exit at t={stop_step * dt}: {guard_error}")
 
         final_state = {
             k: embed(v, box, lowres_shape)
-            for k, v in loop_results["final_state_cropped"].items()
+            for k, v in loop_results.final_state_cropped.items()
         }
 
         time_series: dict[str, NDArray] | None = None
-        if loop_results["buffers"] is not None:
+        if loop_results.buffers is not None:
             time_series = {
                 key: np.array(
                     [
@@ -521,7 +550,7 @@ class BaseFKPPSolver(ABC):
                         for frame_cropped in frames
                     ]
                 )
-                for key, frames in loop_results["buffers"].items()
+                for key, frames in loop_results.buffers.items()
             }
 
         if guard_error is not None:
@@ -535,14 +564,14 @@ class BaseFKPPSolver(ABC):
             success=guard_error is None,
             initial_state={
                 k: self._upsample_to(v, original_shape)
-                for k, v in loop_results["initial_state"].items()
+                for k, v in loop_results.initial_state.items()
             },
             final_state={
                 k: self._upsample_to(v, original_shape)
                 for k, v in final_state.items()
             },
             final_time=final_time,
-            final_stopping_quantity=loop_results["stopping_quantity"],
+            final_stopping_quantity=loop_results.stopping_quantity,
             stopping_criterion=stopping_criterion,
             time_series=time_series,
             error=guard_error,
@@ -564,12 +593,6 @@ class BaseFKPPSolver(ABC):
         )
         return np.array(zoom(field, factor, order=1))
 
-    def _get_record_steps(self, n_steps: int, n_records: int | None) -> NDArray:
-        """Step indices at which snapshots are recorded (empty for None)."""
-        if n_records is None:
-            return np.empty(0, dtype=int)
-        return np.linspace(0, n_steps - 1, n_records, dtype=int)
-
     # --- hooks ---
 
     @abstractmethod
@@ -577,8 +600,8 @@ class BaseFKPPSolver(ABC):
         self,
     ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         """
-        Downsample the solver's tissue/diffusivity input fields preserving FOV
-        (host and store them on self.
+        Downsample the solver's tissue/diffusivity input fields on the host,
+        preserving the field of view, and store them on self.
 
         Returns:
             (low-resolution 3D grid shape, full-resolution 3D grid shape).
@@ -600,7 +623,9 @@ class BaseFKPPSolver(ABC):
         """
 
     @abstractmethod
-    def _build_device_constants(self) -> Mapping[str, Any]:
+    def _build_device_constants(
+        self, box: tuple[slice, slice, slice]
+    ) -> Mapping[str, Any]:
         """
         Build the solver-specific device inputs of the scan, once per
         solve on the cropped grid: the field arrays (face diffusivities,
@@ -612,6 +637,10 @@ class BaseFKPPSolver(ABC):
         merges it flat with the ``_SharedConstants`` it builds itself;
         solver keys must not collide with the shared ones (the flat
         per-solver TypedDicts enforce this statically).
+
+        Args:
+            box: Slices of the tissue bounding box; the solver's host
+                fields are cropped to it before moving to the device.
         """
 
     def _quantity_func(self) -> Callable[..., jax.Array]:
