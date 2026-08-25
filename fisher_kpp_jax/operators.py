@@ -4,7 +4,7 @@ Fisher-KPP solvers.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 from typing import Any
 
@@ -309,7 +309,7 @@ def elongate_tensor_along_principal_axis(
 def _no_guard(
     new_state: dict[str, jax.Array],
     previous_state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: Mapping[str, Any],
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Default guard: never fires (pruned by XLA)."""
     del new_state, previous_state, constants
@@ -325,7 +325,7 @@ def _time_step(
     step_func: Callable[..., dict[str, jax.Array]],
     quantity_func: Callable[..., jax.Array],
     guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
-    constants: dict[str, Any],
+    constants: Mapping[str, Any],
     n_slots: int,
 ) -> tuple[dict[str, Any], None]:
     """
@@ -410,7 +410,7 @@ def _time_step(
 )
 def _run_time_scan(
     state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: Mapping[str, Any],
     slot_ids: jax.Array,
     *,
     step_func: Callable[..., dict[str, jax.Array]],
@@ -492,7 +492,7 @@ def _run_time_scan(
 
 def _run_time_loop(
     state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: Mapping[str, Any],
     step_func: Callable[..., dict[str, jax.Array]],
     quantity_func: Callable[..., jax.Array],
     guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
@@ -507,17 +507,17 @@ def _run_time_loop(
     required signatures::
 
         def step_func(
-            state: dict[str, jax.Array], constants: dict[str, Any]
+            state: dict[str, jax.Array], constants: Mapping[str, Any]
         ) -> dict[str, jax.Array]: ...
 
         def quantity_func(
-            state: dict[str, jax.Array], constants: dict[str, Any]
+            state: dict[str, jax.Array], constants: Mapping[str, Any]
         ) -> jax.Array: ...  # the float64 stopping quantity
 
         def guard_func(
             new_state: dict[str, jax.Array],
             previous_state: dict[str, jax.Array],
-            constants: dict[str, Any],
+            constants: Mapping[str, Any],
         ) -> tuple[jax.Array, jax.Array, jax.Array]: ...
 
     The guard is a post-step sanity check: it compares the stepped state

@@ -9,7 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, NotRequired, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +39,31 @@ DEFAULT_VOLUME_THRESHOLD: float = 0.5
 GAUSSIAN_SEED_POSITION_FRACTION: tuple[str, ...] = tuple(
     f"gaussian_seed_{axis}_fraction" for axis in "xyz"
 )
+
+
+class _SharedConstants(TypedDict):
+    """
+    Device constants shared by all solvers, built by
+    ``BaseFKPPSolver._run_device_loop`` and merged flat with the
+    solver-specific keys returned by ``_build_device_constants``.
+
+    Attributes:
+        dt: Time step size, 0-d scalar at the state dtype.
+        grid_spacing: Grid spacing (dx, dy, dz) in mm, 0-d scalars at the
+            state dtype.
+        voxel_volume: Voxel volume in mm^3, 0-d float64 scalar (feeds the
+            f64 stopping-quantity reduction).
+        stopping_threshold: Stopping threshold, 0-d float64 scalar.
+        volume_threshold: Density threshold of the volume stopping
+            quantity, 0-d scalar at the state dtype; only present with
+            stopping_mode='volume'.
+    """
+
+    dt: jax.Array
+    grid_spacing: tuple[jax.Array, jax.Array, jax.Array]
+    voxel_volume: jax.Array
+    stopping_threshold: jax.Array
+    volume_threshold: NotRequired[jax.Array]
 
 
 @dataclass(slots=True)
@@ -358,25 +383,32 @@ class BaseFKPPSolver(ABC):
             self._crop_box = box
             state_cropped = {k: v[box] for k, v in state_lowres.items()}
 
-            constants = self._build_device_constants()
-            # Shared entries next to the solver's own fields and scalars.
-            constants["dt"] = self._dynamic_scalar(dt)
-            constants["grid_spacing"] = tuple(
-                self._dynamic_scalar(s) for s in self.grid_spacing
-            )
-            # f64 factors and threshold to match the f64 stopping-quantity
-            # reduction they feed.
-            constants["voxel_volume"] = jnp.asarray(
-                self.voxel_volume, dtype=jnp.float64
-            )
-            constants["stopping_threshold"] = jnp.asarray(
-                float(params["stopping_threshold"]), dtype=jnp.float64
-            )
+            dx, dy, dz = self.grid_spacing
+            shared: _SharedConstants = {
+                "dt": self._dynamic_scalar(dt),
+                "grid_spacing": (
+                    self._dynamic_scalar(dx),
+                    self._dynamic_scalar(dy),
+                    self._dynamic_scalar(dz),
+                ),
+                # f64 factors and threshold to match the f64
+                # stopping-quantity reduction they feed.
+                "voxel_volume": jnp.asarray(self.voxel_volume, dtype=jnp.float64),
+                "stopping_threshold": jnp.asarray(
+                    float(params["stopping_threshold"]), dtype=jnp.float64
+                ),
+            }
             if params["stopping_mode"] == "volume":
                 # Compared against the state fields, so at the state dtype.
-                constants["volume_threshold"] = self._dynamic_scalar(
+                shared["volume_threshold"] = self._dynamic_scalar(
                     params["volume_threshold"]
                 )
+            # shared is spread last so a stray solver key can never
+            # overwrite a shared entry.
+            constants: dict[str, Any] = {
+                **self._build_device_constants(),
+                **shared,
+            }
 
             device_outputs = _run_time_loop(
                 state_cropped,
@@ -568,18 +600,18 @@ class BaseFKPPSolver(ABC):
         """
 
     @abstractmethod
-    def _build_device_constants(self) -> dict[str, Any]:
+    def _build_device_constants(self) -> Mapping[str, Any]:
         """
-        Build the solver's device inputs of the scan, once per solve on the
-        cropped grid: the field arrays (face diffusivities, tissue masks)
-        and the solver-specific physical parameters as 0-d device scalars
-        (via ``_dynamic_scalar``).
+        Build the solver-specific device inputs of the scan, once per
+        solve on the cropped grid: the field arrays (face diffusivities,
+        tissue masks) and the solver's physical parameters as 0-d device
+        scalars.
 
-        The base solver adds the shared entries afterwards ('dt',
-        'grid_spacing', 'voxel_volume', 'stopping_threshold' and, in volume
-        mode, 'volume_threshold'). Every entry is a traced jit argument, so
-        re-solves with the same keys, shapes and dtypes reuse the compiled
-        scan whatever the values.
+        Each solver types the returned dict as its own TypedDict, so its
+        key set is visible and checkable in one place. The base solver
+        merges it flat with the ``_SharedConstants`` it builds itself;
+        solver keys must not collide with the shared ones (the flat
+        per-solver TypedDicts enforce this statically).
         """
 
     def _quantity_func(self) -> Callable[..., jax.Array]:

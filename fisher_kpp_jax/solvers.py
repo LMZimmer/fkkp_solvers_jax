@@ -9,7 +9,7 @@ across solves (see ``operators._run_time_loop``).
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +18,7 @@ from loguru import logger
 from numpy.typing import NDArray
 from scipy.ndimage import binary_dilation
 
-from .base import BaseFKPPSolver
+from .base import BaseFKPPSolver, _SharedConstants
 from .operators import (
     GAUSSIAN_SEED_DIFFUSION_TIME,
     GAUSSIAN_SEED_FLOOR,
@@ -58,6 +58,74 @@ _COMMON_DEFAULTS: dict[str, Any] = {
     "verbose": False,
     "precision": "f32",
 }
+
+
+class _SingleFieldSpecificConstants(TypedDict):
+    """
+    Solver-specific device constants of the single-field solvers
+    (FKPPSolver and AnisotropicFKPPSolver), returned by their
+    ``_build_device_constants``.
+
+    Attributes:
+        face_diffusivities: Face diffusivity arrays, keys 'fwd_x/y/z' and
+            'bwd_x/y/z' (see ``diffusion_term``); constant in time.
+        rho: Proliferation rate, 0-d scalar at the state dtype.
+    """
+
+    face_diffusivities: dict[str, jax.Array]
+    rho: jax.Array
+
+
+class _SingleFieldConstants(_SharedConstants, _SingleFieldSpecificConstants):
+    """
+    Flat device constants of the single-field solvers, merged by the base
+    solver: the ``_SharedConstants`` keys plus the
+    ``_SingleFieldSpecificConstants`` keys in one dict.
+    """
+
+
+class _TwoCompartmentSpecificConstants(TypedDict):
+    """
+    Solver-specific device constants of
+    TwoCompartmentWithNutrientFKPPSolver, returned by its
+    ``_build_device_constants``.
+
+    Attributes:
+        wm: White matter fraction field on the cropped grid.
+        gm: Gray matter fraction field on the cropped grid.
+        tissue_mask: Boolean mask of cells with enough tissue to carry
+            flux; the tumor faces are rebuilt from it every step.
+        nutrient_faces: Nutrient face diffusivities, keys 'fwd_x/y/z' and
+            'bwd_x/y/z'; constant in time.
+        white_matter_diffusivity: 0-d scalar at the state dtype, like all
+            scalars below.
+        diffusivity_ratio: White-to-gray-matter diffusivity ratio.
+        rho: Proliferation rate.
+        necrosis_rate: Proliferative-to-necrotic conversion rate.
+        nutrient_consumption_rate: Nutrient consumption rate.
+        nutrient_threshold: Nutrient level of the necrosis switch.
+        max_tumor_occupancy: Occupancy above which faces carry no flux.
+    """
+
+    wm: jax.Array
+    gm: jax.Array
+    tissue_mask: jax.Array
+    nutrient_faces: dict[str, jax.Array]
+    white_matter_diffusivity: jax.Array
+    diffusivity_ratio: jax.Array
+    rho: jax.Array
+    necrosis_rate: jax.Array
+    nutrient_consumption_rate: jax.Array
+    nutrient_threshold: jax.Array
+    max_tumor_occupancy: jax.Array
+
+
+class _TwoCompartmentConstants(_SharedConstants, _TwoCompartmentSpecificConstants):
+    """
+    Flat device constants of TwoCompartmentWithNutrientFKPPSolver, merged
+    by the base solver: the ``_SharedConstants`` keys plus the
+    ``_TwoCompartmentSpecificConstants`` keys in one dict.
+    """
 
 
 def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
@@ -115,7 +183,7 @@ def _mixture_face_fields(
 
 def _single_field_step(
     state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: _SingleFieldConstants,
 ) -> dict[str, jax.Array]:
     """
     Perform one explicit Euler step of the single-field solvers
@@ -125,8 +193,7 @@ def _single_field_step(
 
     Args:
         state: State dict with key 'cell_density'.
-        constants: Device inputs; reads the 'face_diffusivities' arrays,
-            the 0-d scalars 'dt' and 'rho' and the 'grid_spacing' scalars.
+        constants: Device inputs, see ``_SingleFieldConstants``.
 
     Returns:
         The stepped state.
@@ -143,7 +210,7 @@ def _single_field_step(
 
 def _two_compartment_step(
     state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: _TwoCompartmentConstants,
 ) -> dict[str, jax.Array]:
     """
     Perform one explicit Euler step of the proliferative/necrotic/nutrient
@@ -155,17 +222,14 @@ def _two_compartment_step(
     Args:
         state: State dict with keys 'proliferative', 'necrotic' and
             'nutrient'.
-        constants: Device inputs; reads the arrays 'wm', 'gm',
-            'tissue_mask' and 'nutrient_faces', the 'grid_spacing' scalars
-            and the 0-d parameter scalars built by
-            TwoCompartmentWithNutrientFKPPSolver._build_device_constants.
+        constants: Device inputs, see ``_TwoCompartmentConstants``.
 
     Returns:
         The stepped state.
     """
     dt = constants["dt"]
-    necrosis_rate = constants["necrosis_rate"]
     grid_spacing = constants["grid_spacing"]
+    necrosis_rate = constants["necrosis_rate"]
     proliferative = state["proliferative"]
     necrotic = state["necrotic"]
     nutrient = state["nutrient"]
@@ -220,7 +284,7 @@ def _two_compartment_step(
 
 def _mass_single(
     state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: _SharedConstants,
 ) -> jax.Array:
     """Integrated cell density of the single-field solvers, summed in f64."""
     return constants["voxel_volume"] * jnp.sum(
@@ -230,7 +294,7 @@ def _mass_single(
 
 def _mass_two_compartment(
     state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: _SharedConstants,
 ) -> jax.Array:
     """
     Two-compartment integrated cell density, f64:
@@ -245,7 +309,7 @@ def _mass_two_compartment(
 
 def _volume_single(
     state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: _SharedConstants,
 ) -> jax.Array:
     """
     Thresholded volume of the single-field solvers; the volume threshold
@@ -258,7 +322,7 @@ def _volume_single(
 
 def _volume_two_compartment(
     state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: _SharedConstants,
 ) -> jax.Array:
     """Thresholded volume of P + N (the nutrient field is never included)."""
     threshold = constants["volume_threshold"]
@@ -270,7 +334,7 @@ def _volume_two_compartment(
 def _dti_guard(
     new_state: dict[str, jax.Array],
     previous_state: dict[str, jax.Array],
-    constants: dict[str, Any],
+    constants: _SharedConstants,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Evaluate the shrinkage/vanishing guards of the anisotropic solver.
@@ -350,14 +414,14 @@ class FKPPSolver(BaseFKPPSolver):
     def _initialize_state(self) -> dict[str, jax.Array]:
         return {"cell_density": self._gaussian_seed()}
 
-    def _build_device_constants(self) -> dict[str, Any]:
+    def _build_device_constants(self) -> _SingleFieldSpecificConstants:
         if self._crop_box is None:
             raise RuntimeError(
                 "_build_device_constants called before the crop box was set."
             )
         gm_host = self._gm_lowres[self._crop_box]
         wm_host = self._wm_lowres[self._crop_box]
-        
+
         tissue_mask_host = (wm_host + gm_host) >= float(
             self.params["min_tissue_fraction"]
         )
@@ -464,7 +528,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             "nutrient": nutrient,
         }
 
-    def _build_device_constants(self) -> dict[str, Any]:
+    def _build_device_constants(self) -> _TwoCompartmentSpecificConstants:
         if self._crop_box is None:
             raise RuntimeError(
                 "_build_device_constants called before the crop box was set."
@@ -486,21 +550,20 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         nutrient_faces = _mixture_face_fields(
             wm, gm, tissue_mask, float(self.params["nutrient_diffusivity"]), 1
         )
-        param_keys = (
-            "white_matter_diffusivity",
-            "diffusivity_ratio",
-            "rho",
-            "necrosis_rate",
-            "nutrient_consumption_rate",
-            "nutrient_threshold",
-            "max_tumor_occupancy",
-        )
+        scalar = self._dynamic_scalar
+        params = self.params
         return {
             "wm": wm,
             "gm": gm,
             "tissue_mask": tissue_mask,
             "nutrient_faces": nutrient_faces,
-            **{k: self._dynamic_scalar(self.params[k]) for k in param_keys},
+            "white_matter_diffusivity": scalar(params["white_matter_diffusivity"]),
+            "diffusivity_ratio": scalar(params["diffusivity_ratio"]),
+            "rho": scalar(params["rho"]),
+            "necrosis_rate": scalar(params["necrosis_rate"]),
+            "nutrient_consumption_rate": scalar(params["nutrient_consumption_rate"]),
+            "nutrient_threshold": scalar(params["nutrient_threshold"]),
+            "max_tumor_occupancy": scalar(params["max_tumor_occupancy"]),
         }
 
     def _time_step_count(self) -> tuple[int, float]:
@@ -722,7 +785,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             )
         return {"cell_density": cell_density}
 
-    def _build_device_constants(self) -> dict[str, Any]:
+    def _build_device_constants(self) -> _SingleFieldSpecificConstants:
         if self._crop_box is None:
             raise RuntimeError(
                 "_build_device_constants called before the crop box was set."
