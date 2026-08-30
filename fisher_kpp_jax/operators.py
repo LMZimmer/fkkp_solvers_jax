@@ -303,6 +303,53 @@ def elongate_tensor_along_principal_axis(
     return np.asarray(elongated_tensors, dtype=np.float32)
 
 
+def chemo_concentration(
+    t: jax.Array, session_times: jax.Array, decay_rate: jax.Array
+) -> jax.Array:
+    """
+    Evaluate the chemotherapy drug concentration at time t.
+
+    Each session deposits a unit concentration that decays exponentially:
+    C(t) = sum_j [t >= session_times[j]] * exp(-decay_rate * (t -
+    session_times[j])). Sessions in the future of t contribute zero.
+
+    Args:
+        t: Evaluation time, 0-d scalar.
+        session_times: Chemotherapy session times, 1-D array.
+        decay_rate: Exponential decay rate of the concentration, 0-d
+            scalar.
+
+    Returns:
+        The concentration C(t), 0-d, at the dtype of the inputs.
+    """
+    elapsed = t - session_times
+    contributions = jnp.where(elapsed >= 0, jnp.exp(-decay_rate * elapsed), 0)
+    return jnp.sum(contributions)
+
+
+def lq_log_kill(
+    dose_per_fraction: jax.Array,
+    alpha: jax.Array | float,
+    beta: jax.Array | float,
+) -> jax.Array:
+    """
+    Evaluate the linear-quadratic log cell kill of one radiotherapy
+    fraction, E(x) = alpha * d(x) + beta * d(x)^2.
+
+    The surviving fraction of a single fraction is exp(-E(x)); n
+    fractions of the same dose survive with exp(-n * E(x)).
+
+    Args:
+        dose_per_fraction: Dose per fraction d(x) in Gy, any shape.
+        alpha: Linear radiosensitivity in 1/Gy.
+        beta: Quadratic radiosensitivity in 1/Gy^2.
+
+    Returns:
+        E(x), same shape as dose_per_fraction.
+    """
+    return alpha * dose_per_fraction + beta * dose_per_fraction**2
+
+
 # --- jitted time loop ---
 
 
@@ -344,7 +391,7 @@ def _time_step(
     step_index, snapshot_slot = step_input
     previous_state = carry["state"]
     is_active = carry["active"]
-    new_state = step_func(previous_state, constants)
+    new_state = step_func(previous_state, constants, step_index)
     stopping_quantity = quantity_func(new_state, constants)
     threshold_hit = stopping_quantity >= constants["stopping_threshold"]
     guard_code, guard_mass_change, guard_density = guard_func(
@@ -507,8 +554,10 @@ def _run_time_loop(
     required signatures::
 
         def step_func(
-            state: dict[str, jax.Array], constants: Mapping[str, Any]
-        ) -> dict[str, jax.Array]: ...
+            state: dict[str, jax.Array],
+            constants: Mapping[str, Any],
+            step_index: jax.Array,
+        ) -> dict[str, jax.Array]: ...  # step_index: 0-d int32 scan index
 
         def quantity_func(
             state: dict[str, jax.Array], constants: Mapping[str, Any]

@@ -2,6 +2,8 @@
 # imported for the comparison tests. NOT dependencies of fisher_kpp_jax.
 torch==2.13.0+cpu  # --index-url https://download.pytorch.org/whl/cpu
 
-# For scripts/run_reference_solves.py (reads/writes the GliODIL-style .nii
-# volumes in reference_solves/). Not a dependency of fisher_kpp_jax.
-nibabel==5.4.2
+# For scripts/run_stupp_forward.py (the overview.png montage). Scripts-only,
+# imported inside the script; NOT a dependency of fisher_kpp_jax. (nibabel,
+# which the scripts also use, is a runtime dependency of fisher_kpp_jax
+# since the treatment-manifest loader and is pinned in requirements.txt.)
+matplotlib==3.11.1

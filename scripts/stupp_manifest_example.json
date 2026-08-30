@@ -1,0 +1,21 @@
+{
+  "_note": "Example Stupp-protocol treatment manifest. All numeric values are PLACEHOLDERS - review before scientific use.",
+  "_schedule": "Resection at day 10 (seed = day 0); RT 30 fractions on consecutive weekdays over 6 weeks starting day 24 (2 weeks post-op); concomitant TMZ on the same 30 days (simplified: TMZ is given daily in the real protocol). NIfTI paths are absolute or relative to this file.",
+  "_units": "times in days on the solver clock (t=0 = seed), kill_rate and decay_rate in 1/day, dose NIfTI in Gy (TOTAL over all fractions; per-fraction dose = dose/len(times)), alpha in 1/Gy, beta in 1/Gy^2.",
+  "resection": {
+    "time": 10.0,
+    "tumor_segmentation": "/mnt/Drive4/lucas/SAILOR/processed/sub-01/ses-03/longitudinal/recurrence_preop.nii.gz",
+    "cavity_label": 4
+  },
+  "chemotherapy": {
+    "times": [24.0, 25.0, 26.0, 27.0, 28.0, 31.0, 32.0, 33.0, 34.0, 35.0, 38.0, 39.0, 40.0, 41.0, 42.0, 45.0, 46.0, 47.0, 48.0, 49.0, 52.0, 53.0, 54.0, 55.0, 56.0, 59.0, 60.0, 61.0, 62.0, 63.0],
+    "kill_rate": 0.05,
+    "decay_rate": 1.0
+  },
+  "radiotherapy": {
+    "times": [24.0, 25.0, 26.0, 27.0, 28.0, 31.0, 32.0, 33.0, 34.0, 35.0, 38.0, 39.0, 40.0, 41.0, 42.0, 45.0, 46.0, 47.0, 48.0, 49.0, 52.0, 53.0, 54.0, 55.0, 56.0, 59.0, 60.0, 61.0, 62.0, 63.0],
+    "dose": "/mnt/Drive4/lucas/SAILOR/processed/sub-01/ses-03/longitudinal/dose_warped_longitudinal.nii.gz",
+    "alpha": 0.1,
+    "beta": 0.01
+  }
+}

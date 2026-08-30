@@ -227,3 +227,36 @@ def test_elongate_tensor_along_principal_axis(tensor_phantom: np.ndarray) -> Non
     rotated = np.swapaxes(v_in, -2, -1) @ out @ v_in
     expected = e_expected[..., None, :] * np.eye(3, dtype=np.float32)
     np.testing.assert_allclose(rotated, expected, rtol=0, atol=1e-5)
+
+
+def test_chemo_concentration() -> None:
+    """Superposition of unit doses decaying exponentially from each session
+    time; zero before the first session."""
+    times = np.array([2.0, 5.0, 9.0])
+    decay = 0.3
+    assert _x64(jax_ops.chemo_concentration, 1.999, times, decay) == 0.0
+    # Exactly at a session time the dose counts in full.
+    np.testing.assert_allclose(_x64(jax_ops.chemo_concentration, 2.0, times, decay), 1.0)
+    # Single active dose: the decayed value.
+    np.testing.assert_allclose(
+        _x64(jax_ops.chemo_concentration, 4.0, times, decay), np.exp(-0.3 * 2.0), rtol=1e-14
+    )
+    # Superposition: the sum of the individual contributions.
+    t = 7.5
+    expected = sum(np.exp(-decay * (t - s)) for s in times if t >= s)
+    ours = _x64(jax_ops.chemo_concentration, t, times, decay)
+    assert ours.shape == ()
+    np.testing.assert_allclose(ours, expected, rtol=1e-14)
+    singles = [_x64(jax_ops.chemo_concentration, t, np.array([s]), decay) for s in times]
+    np.testing.assert_allclose(ours, np.sum(singles), rtol=1e-14)
+
+
+def test_lq_log_kill() -> None:
+    dose = np.random.default_rng(16).random(SHAPE) * 3.0
+    alpha, beta = 0.3, 0.03
+    np.testing.assert_allclose(
+        _x64(jax_ops.lq_log_kill, dose, alpha, beta),
+        alpha * dose + beta * dose**2,
+        rtol=1e-15,
+    )
+    assert _x64(jax_ops.lq_log_kill, np.zeros(()), alpha, beta) == 0.0

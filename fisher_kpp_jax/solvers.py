@@ -1,5 +1,7 @@
 """The JAX Fisher-KPP forward solvers: ``FKPPSolver``,
-``TwoCompartmentWithNutrientFKPPSolver`` and ``AnisotropicFKPPSolver``.
+``TwoCompartmentWithNutrientFKPPSolver``, ``AnisotropicFKPPSolver`` and the
+treatment-extended ``StuppFKPPSolver`` (with its manifest loader
+``treatment_params_from_manifest``).
 
 The device code is purely functional: each solver's step is a module-level
 function with a stable identity, so the jitted time scan's cache persists
@@ -8,11 +10,14 @@ across solves (see ``operators._run_time_loop``).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
-from typing import Any, ClassVar, TypedDict
+from pathlib import Path
+from typing import Any, ClassVar, NotRequired, TypedDict
 
 import jax
 import jax.numpy as jnp
+import nibabel as nib
 import numpy as np
 from loguru import logger
 from numpy.typing import NDArray
@@ -25,11 +30,13 @@ from .operators import (
     GAUSSIAN_SEED_MASS,
     SHRINKAGE_LIMIT,
     VANISHING_DENSITY_LIMIT,
+    chemo_concentration,
     diffusion_term,
     elongate_tensor_along_principal_axis,
     face_average,
     logistic_growth,
     logistic_sigmoid,
+    lq_log_kill,
     masked_face_average,
     shift_grid_by_one,
 )
@@ -128,6 +135,51 @@ class _TwoCompartmentConstants(_SharedConstants, _TwoCompartmentSpecificConstant
     """
 
 
+class _StuppSpecificConstants(_SingleFieldSpecificConstants):
+    """
+    Solver-specific device constants of StuppFKPPSolver, returned by its
+    ``_build_device_constants``: the single-field keys plus one optional
+    key group per treatment. A group is present as a whole or absent as a
+    whole; ``_stupp_step`` branches on key presence (static pytree
+    structure), never on the values.
+
+    Attributes:
+        resection_time: Resection time in days, 0-d scalar at the state
+            dtype.
+        cavity: Boolean resection-cavity mask on the cropped grid.
+        face_diffusivities_post: Post-resection face diffusivities, same
+            keys as face_diffusivities; every face touching a cavity voxel
+            is zero.
+        chemo_times: Chemotherapy session times in days, 1-D at the state
+            dtype.
+        chemo_kill_rate: Chemotherapy kill rate per unit concentration,
+            0-d scalar at the state dtype.
+        chemo_decay_rate: Exponential decay rate of the drug
+            concentration, 0-d scalar at the state dtype.
+        rt_times: Radiotherapy fraction times in days, 1-D at the state
+            dtype.
+        rt_log_kill: Per-fraction linear-quadratic log kill E(x) on the
+            cropped grid, at the state dtype.
+    """
+
+    resection_time: NotRequired[jax.Array]
+    cavity: NotRequired[jax.Array]
+    face_diffusivities_post: NotRequired[dict[str, jax.Array]]
+    chemo_times: NotRequired[jax.Array]
+    chemo_kill_rate: NotRequired[jax.Array]
+    chemo_decay_rate: NotRequired[jax.Array]
+    rt_times: NotRequired[jax.Array]
+    rt_log_kill: NotRequired[jax.Array]
+
+
+class _StuppConstants(_SharedConstants, _StuppSpecificConstants):
+    """
+    Flat device constants of StuppFKPPSolver, merged by the base solver:
+    the ``_SharedConstants`` keys plus the ``_StuppSpecificConstants`` keys
+    in one dict.
+    """
+
+
 def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
     if not (isinstance(gm, np.ndarray) and isinstance(wm, np.ndarray)):
         raise ValueError("gray_matter_pbmap and white_matter_pbmap must be numpy arrays.")
@@ -184,6 +236,7 @@ def _mixture_face_fields(
 def _single_field_step(
     state: dict[str, jax.Array],
     constants: _SingleFieldConstants,
+    step_index: jax.Array,
 ) -> dict[str, jax.Array]:
     """
     Perform one explicit Euler step of the single-field solvers
@@ -194,10 +247,12 @@ def _single_field_step(
     Args:
         state: State dict with key 'cell_density'.
         constants: Device inputs, see ``_SingleFieldConstants``.
+        step_index: Scan step index, unused (the step is autonomous).
 
     Returns:
         The stepped state.
     """
+    del step_index
     dt = constants["dt"]
     rho = constants["rho"]
     u = state["cell_density"]
@@ -211,6 +266,7 @@ def _single_field_step(
 def _two_compartment_step(
     state: dict[str, jax.Array],
     constants: _TwoCompartmentConstants,
+    step_index: jax.Array,
 ) -> dict[str, jax.Array]:
     """
     Perform one explicit Euler step of the proliferative/necrotic/nutrient
@@ -223,10 +279,12 @@ def _two_compartment_step(
         state: State dict with keys 'proliferative', 'necrotic' and
             'nutrient'.
         constants: Device inputs, see ``_TwoCompartmentConstants``.
+        step_index: Scan step index, unused (the step is autonomous).
 
     Returns:
         The stepped state.
     """
+    del step_index
     dt = constants["dt"]
     grid_spacing = constants["grid_spacing"]
     necrosis_rate = constants["necrosis_rate"]
@@ -280,6 +338,77 @@ def _two_compartment_step(
         "necrotic": necrotic,
         "nutrient": nutrient,
     }
+
+
+def _stupp_step(
+    state: dict[str, jax.Array],
+    constants: _StuppConstants,
+    step_index: jax.Array,
+) -> dict[str, jax.Array]:
+    """
+    Perform one explicit Euler step of the treatment-extended isotropic
+    model (StuppFKPPSolver), followed by the discrete treatment events
+    of the step.
+
+    The step advances t0 = step_index * dt to t1 = (step_index + 1) * dt.
+    Both are computed as products (never accumulated), so the step
+    intervals (t0, t1] partition the horizon exactly at the state dtype.
+    In-step operation order:
+
+      1. Euler update at the pre-step state,
+         du/dt = div(D grad u) + rho u (1 - u) - chemo_kill_rate C(t0) u,
+         with D = the post-resection faces once t1 >= resection_time,
+         else the pre-resection faces;
+      2. radiotherapy impulse u <- u exp(-E(x) n_hits), n_hits = number of
+         rt_times in (t0, t1] (exact impulse map, not part of the Euler
+         right-hand side);
+      3. resection projection u <- 0 inside the cavity, for every step
+         with t1 >= resection_time (idempotent).
+
+    Each treatment is applied only if its key group is present in
+    constants (Python-level branching on the pytree structure, see
+    ``_StuppSpecificConstants``); with no treatment present the step
+    reduces to ``_single_field_step``.
+
+    Args:
+        state: State dict with key 'cell_density'.
+        constants: Device inputs, see ``_StuppConstants``.
+        step_index: Scan step index, 0-d int32.
+
+    Returns:
+        The stepped state.
+    """
+    dt = constants["dt"]
+    rho = constants["rho"]
+    u = state["cell_density"]
+    t0 = step_index.astype(u.dtype) * dt
+    t1 = (step_index + 1).astype(u.dtype) * dt
+
+    faces = constants["face_diffusivities"]
+    if "resection_time" in constants:
+        post = t1 >= constants["resection_time"]
+        faces_post = constants["face_diffusivities_post"]
+        faces = {key: jnp.where(post, faces_post[key], faces[key]) for key in faces}
+
+    reaction = logistic_growth(u, rho)
+    if "chemo_times" in constants:
+        concentration = chemo_concentration(
+            t0, constants["chemo_times"], constants["chemo_decay_rate"]
+        )
+        reaction = reaction - constants["chemo_kill_rate"] * concentration * u
+    diffusion = diffusion_term(u, faces, constants["grid_spacing"])
+    delta_u = (diffusion + reaction) * dt
+    u = u + delta_u
+
+    if "rt_times" in constants:
+        rt_times = constants["rt_times"]
+        n_hits = jnp.sum(jnp.logical_and(rt_times > t0, rt_times <= t1)).astype(
+            u.dtype
+        )
+        u = u * jnp.exp(-constants["rt_log_kill"] * n_hits)
+    if "resection_time" in constants:
+        u = jnp.where(jnp.logical_and(post, constants["cavity"]), 0, u)
+    return {"cell_density": u}
 
 
 def _mass_single(
@@ -818,3 +947,444 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         )
         dt = stopping_time / n_timesteps
         return int(np.ceil(n_timesteps)), dt
+
+
+# Treatment parameter groups of StuppFKPPSolver: each group is enabled by
+# setting ALL of its keys (partial groups are rejected).
+_STUPP_TREATMENT_GROUPS: dict[str, tuple[str, ...]] = {
+    "resection": ("resection_time", "resection_cavity"),
+    "chemotherapy": ("chemo_times", "chemo_kill_rate", "chemo_decay_rate"),
+    "radiotherapy": ("rt_times", "rt_dose", "rt_alpha", "rt_beta"),
+}
+
+# Number of host-side sample points of the chemotherapy concentration used
+# by StuppFKPPSolver's time-step formula.
+_CHEMO_CONCENTRATION_SAMPLES: int = 10001
+
+
+class StuppFKPPSolver(BaseFKPPSolver):
+    """
+    Isotropic Fisher-KPP solver on WM/GM tissue maps, extended by the
+    treatment effects of a Stupp-type protocol: surgical resection,
+    chemotherapy (CT) and radiotherapy (RT).
+
+    State key: 'cell_density' (u in [0, 1]); grid in mm, time in days on
+    the ``stopping_time`` clock with the seed at t = 0. The untreated
+    dynamics deliberately mirror ``FKPPSolver``: the same WM/GM mixture
+    diffusivity D = white_matter_diffusivity * (wm_face + gm_face /
+    diffusivity_ratio) with faces masked by min_tissue_fraction, the same
+    logistic growth, seed, crop mask and stability formula (extended by the
+    chemotherapy kill rate), so that with all treatments disabled the
+    solver reproduces ``FKPPSolver``.
+
+    Continuous model (explicit Euler at the pre-step state, drug
+    concentration evaluated at the step start t0)::
+
+        du/dt = div(D grad u) + rho u (1 - u) - chemo_kill_rate C(t) u
+        C(t)  = sum_j [t >= chemo_times[j]] exp(-chemo_decay_rate (t - chemo_times[j]))
+
+    Discrete events, applied after the Euler update of the step whose
+    interval (t0, t1] contains them, in this order (see ``_stupp_step``):
+
+      1. RT impulse: u <- u exp(-E(x) n_hits) with the linear-quadratic
+         log kill E(x) = rt_alpha d(x) + rt_beta d(x)^2 and n_hits the
+         number of rt_times in (t0, t1]. Per-fraction dose convention:
+         rt_dose holds the TOTAL dose over all fractions, so
+         d(x) = rt_dose / len(rt_times) (computed once on the host).
+      2. Resection: u <- 0 inside resection_cavity for every step with
+         t1 >= resection_time, and from the same step on the face
+         diffusivities switch to a post-resection set in which every face
+         touching a cavity voxel is zero (zero-flux Neumann on the cavity
+         boundary).
+
+    The three treatments are individually optional (parameters default to
+    None); each group is all-or-nothing. Optionality is encoded in the
+    STRUCTURE of the device constants dict (a group's keys are present or
+    absent) and branched on with Python ``if`` in the step function: one
+    compile per treatment configuration (and per number of session
+    times), while the values (times, doses, rates) stay traced and never
+    trigger recompilation. Times that never fire within the horizon
+    (e.g. beyond stopping_time, or an rt_time of exactly 0, which lies in
+    no step interval) are warned about and otherwise ignored.
+    """
+
+    _REQUIRED: ClassVar[frozenset[str]] = frozenset(
+        {
+            "white_matter_diffusivity",
+            "rho",
+            "gray_matter_pbmap",
+            "white_matter_pbmap",
+            "gaussian_seed_x_fraction",
+            "gaussian_seed_y_fraction",
+            "gaussian_seed_z_fraction",
+            "resolution_factor",
+        }
+    )
+    _DEFAULTS: ClassVar[dict[str, Any]] = {
+        **_COMMON_DEFAULTS,
+        # Cells with wm + gm below this carry no flux (CSF/background).
+        "min_tissue_fraction": 0.1,
+        # Treatments, all optional (None = disabled); see class docstring.
+        "resection_time": None,
+        "resection_cavity": None,
+        "chemo_times": None,
+        "chemo_kill_rate": None,
+        "chemo_decay_rate": None,
+        "rt_times": None,
+        "rt_dose": None,  # TOTAL dose over all fractions, 3D array in Gy
+        "rt_alpha": None,
+        "rt_beta": None,
+    }
+
+    # static methods allows passing of stable module level functions as attributes
+    _step_func = staticmethod(_stupp_step)
+    _mass_func = staticmethod(_mass_single)
+    _volume_func = staticmethod(_volume_single)
+
+    _gm_lowres: NDArray
+    _wm_lowres: NDArray
+    _cavity_lowres: NDArray | None
+    _rt_dose_lowres: NDArray | None
+
+    @staticmethod
+    def _active_groups(params: Mapping[str, Any]) -> dict[str, bool]:
+        """Which treatment groups are enabled (all keys set) in params."""
+        return {
+            name: all(params[key] is not None for key in keys)
+            for name, keys in _STUPP_TREATMENT_GROUPS.items()
+        }
+
+    def _validate_extra(self, params: Mapping[str, Any]) -> None:
+        name = type(self).__name__
+        gm = params["gray_matter_pbmap"]
+        wm = params["white_matter_pbmap"]
+        _validate_tissue_arrays(gm, wm)
+
+        for group, keys in _STUPP_TREATMENT_GROUPS.items():
+            missing = [key for key in keys if params[key] is None]
+            if missing and len(missing) < len(keys):
+                raise ValueError(
+                    f"{name}: {group} is enabled by setting all of {list(keys)}; "
+                    f"missing {missing}."
+                )
+        active = self._active_groups(params)
+        stopping_time = float(params["stopping_time"])
+
+        def check_times(key: str) -> NDArray:
+            times = np.asarray(params[key], dtype=np.float64)
+            if times.ndim != 1:
+                raise ValueError(f"{name}: {key} must be a 1-D sequence of times.")
+            if not np.all(np.isfinite(times)) or np.any(times < 0):
+                raise ValueError(f"{name}: {key} must be finite and nonnegative.")
+            late = times[times > stopping_time]
+            if late.size:
+                logger.warning(
+                    f"{name}: {key} contains {late.size} time(s) beyond "
+                    f"stopping_time={stopping_time:g} that will never fire: "
+                    f"{late.tolist()}."
+                )
+            return times
+
+        def check_rate(key: str) -> None:
+            value = params[key]
+            if not (np.isscalar(value) and np.isfinite(value) and value >= 0):
+                raise ValueError(
+                    f"{name}: {key} must be a finite nonnegative scalar, got "
+                    f"{value!r}."
+                )
+
+        def check_volume(key: str) -> NDArray:
+            value = params[key]
+            if not isinstance(value, np.ndarray):
+                raise ValueError(f"{name}: {key} must be a numpy array.")
+            if value.ndim != 3:
+                raise ValueError(f"{name}: {key} must be a 3D array.")
+            if value.shape != gm.shape:
+                raise ValueError(
+                    f"{name}: {key} shape {value.shape} differs from the "
+                    f"tissue map shape {gm.shape}."
+                )
+            return value
+
+        if active["resection"]:
+            check_rate("resection_time")
+            if float(params["resection_time"]) > stopping_time:
+                logger.warning(
+                    f"{name}: resection_time={float(params['resection_time']):g} "
+                    f"lies beyond stopping_time={stopping_time:g} and will never "
+                    "fire."
+                )
+            cavity = check_volume("resection_cavity")
+            if cavity.dtype != bool and not np.isin(cavity, (0, 1)).all():
+                raise ValueError(
+                    f"{name}: resection_cavity must be a binary (bool or 0/1) array."
+                )
+        if active["chemotherapy"]:
+            check_times("chemo_times")
+            check_rate("chemo_kill_rate")
+            check_rate("chemo_decay_rate")
+        if active["radiotherapy"]:
+            rt_times = check_times("rt_times")
+            if rt_times.size < 1:
+                raise ValueError(f"{name}: rt_times must contain at least one time.")
+            if np.any(rt_times == 0):
+                logger.warning(
+                    f"{name}: rt_times contains 0, which lies in no step interval "
+                    "(t0, t1] and will never fire."
+                )
+            dose = check_volume("rt_dose")
+            if not np.all(np.isfinite(dose)) or np.any(dose < 0):
+                raise ValueError(f"{name}: rt_dose must be finite and nonnegative.")
+            check_rate("rt_alpha")
+            check_rate("rt_beta")
+
+    def _prepare_input_fields(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        params = self.params
+        factor = params["resolution_factor"]
+        self._gm_lowres = self._downsample(params["gray_matter_pbmap"], factor)
+        self._wm_lowres = self._downsample(params["white_matter_pbmap"], factor)
+        active = self._active_groups(params)
+        # Linear downsampling of the treatment volumes with the tissue
+        # maps' factor, so the low-resolution grids coincide.
+        self._cavity_lowres = None
+        if active["resection"]:
+            cavity = np.asarray(params["resection_cavity"], dtype=np.float64)
+            self._cavity_lowres = self._downsample(cavity, factor) >= 0.5
+        self._rt_dose_lowres = None
+        if active["radiotherapy"]:
+            dose = np.asarray(params["rt_dose"], dtype=np.float64)
+            self._rt_dose_lowres = np.clip(self._downsample(dose, factor), 0, None)
+        return self._gm_lowres.shape, params["gray_matter_pbmap"].shape
+
+    def _check_seed(self) -> None:
+        i, j, k = self.seed_voxel
+        if self._gm_lowres[i, j, k] == 0 and self._wm_lowres[i, j, k] == 0:
+            raise ValueError("Initial tumor position is outside the brain matter.")
+
+    def _crop_mask(self) -> NDArray:
+        return (self._gm_lowres + self._wm_lowres) >= CROP_TISSUE_THRESHOLD
+
+    def _initialize_state(self) -> dict[str, jax.Array]:
+        return {"cell_density": self._gaussian_seed()}
+
+    def _build_device_constants(
+        self, box: tuple[slice, slice, slice]
+    ) -> _StuppSpecificConstants:
+        params = self.params
+        gm_host = self._gm_lowres[box]
+        wm_host = self._wm_lowres[box]
+
+        # Host-side float64 tissue mask, identical for both precisions.
+        tissue_mask_host = (wm_host + gm_host) >= float(params["min_tissue_fraction"])
+        gm = jnp.asarray(gm_host, dtype=self._dtype)
+        wm = jnp.asarray(wm_host, dtype=self._dtype)
+        diffusivity = float(params["white_matter_diffusivity"])
+        ratio = float(params["diffusivity_ratio"])
+        faces = _mixture_face_fields(
+            wm, gm, jnp.asarray(tissue_mask_host), diffusivity, ratio
+        )
+        constants: _StuppSpecificConstants = {
+            "face_diffusivities": faces,
+            "rho": self._dynamic_scalar(params["rho"]),
+        }
+
+        active = self._active_groups(params)
+        if active["resection"]:
+            cavity_host = self._cavity_lowres[box]
+            # Post-resection faces: the cavity is removed from the valid
+            # mask, so every face touching a cavity voxel carries no flux.
+            constants["resection_time"] = self._dynamic_scalar(params["resection_time"])
+            constants["cavity"] = jnp.asarray(cavity_host)
+            constants["face_diffusivities_post"] = _mixture_face_fields(
+                wm,
+                gm,
+                jnp.asarray(np.logical_and(tissue_mask_host, ~cavity_host)),
+                diffusivity,
+                ratio,
+            )
+        if active["chemotherapy"]:
+            constants["chemo_times"] = jnp.asarray(
+                np.asarray(params["chemo_times"], dtype=np.float64), dtype=self._dtype
+            )
+            constants["chemo_kill_rate"] = self._dynamic_scalar(params["chemo_kill_rate"])
+            constants["chemo_decay_rate"] = self._dynamic_scalar(
+                params["chemo_decay_rate"]
+            )
+        if active["radiotherapy"]:
+            rt_times = np.asarray(params["rt_times"], dtype=np.float64)
+            # Per-fraction dose: rt_dose is the TOTAL dose over all fractions.
+            dose_per_fraction = jnp.asarray(
+                self._rt_dose_lowres[box] / rt_times.size, dtype=self._dtype
+            )
+            constants["rt_times"] = jnp.asarray(rt_times, dtype=self._dtype)
+            constants["rt_log_kill"] = lq_log_kill(
+                dose_per_fraction, float(params["rt_alpha"]), float(params["rt_beta"])
+            )
+        return constants
+
+    def _max_chemo_concentration(self) -> float:
+        """
+        Host-side upper bound of the drug concentration C(t) over
+        [0, stopping_time]: C is evaluated with numpy on a dense grid plus
+        the session times themselves (where its local maxima lie). Zero
+        when chemotherapy is disabled.
+        """
+        params = self.params
+        if not self._active_groups(params)["chemotherapy"]:
+            return 0.0
+        stopping_time = float(params["stopping_time"])
+        session_times = np.asarray(params["chemo_times"], dtype=np.float64)
+        decay_rate = float(params["chemo_decay_rate"])
+        grid = np.union1d(
+            np.linspace(0.0, stopping_time, _CHEMO_CONCENTRATION_SAMPLES),
+            session_times[session_times <= stopping_time],
+        )
+        elapsed = grid[:, None] - session_times[None, :]
+        concentration = np.where(elapsed >= 0, np.exp(-decay_rate * elapsed), 0.0)
+        return float(concentration.sum(axis=1).max(initial=0.0))
+
+    def _time_step_count(self) -> tuple[int, float]:
+        # NOTE: preliminary stability heuristic -- the isotropic formula of
+        # FKPPSolver with the reaction bound extended from rho to
+        # rho + chemo_kill_rate * max_t C(t); the RT and resection events
+        # are impulse maps and do not constrain dt.
+        stopping_time = self.params["stopping_time"]
+        diffusivity_wm = self.params["white_matter_diffusivity"]
+        rho = self.params["rho"]
+        reaction_rate = rho
+        if self._active_groups(self.params)["chemotherapy"]:
+            reaction_rate = rho + self.params["chemo_kill_rate"] * (
+                self._max_chemo_concentration()
+            )
+        dx, dy, dz = self.grid_spacing
+        # np.power kept deliberately: CPython's ** is not bit-identical to it.
+        n_timesteps = max(
+            stopping_time * diffusivity_wm / np.power(min(dx, dy, dz), 2) * 8 + 100,
+            stopping_time * reaction_rate * 1.1,
+        )
+        dt = stopping_time / n_timesteps
+        return int(np.ceil(n_timesteps)), dt
+
+
+# --- treatment manifest loader ---
+
+# Manifest schema of ``treatment_params_from_manifest``: section name ->
+# required keys. Keys starting with '_' (comments) are ignored everywhere.
+_MANIFEST_SECTIONS: dict[str, tuple[str, ...]] = {
+    "resection": ("time", "tumor_segmentation", "cavity_label"),
+    "chemotherapy": ("times", "kill_rate", "decay_rate"),
+    "radiotherapy": ("times", "dose", "alpha", "beta"),
+}
+
+
+def _manifest_section(manifest: Mapping[str, Any], name: str) -> dict[str, Any]:
+    """Return the checked manifest section name (all keys present, none unknown)."""
+    section = manifest[name]
+    if not isinstance(section, Mapping):
+        raise ValueError(
+            f"treatment_params_from_manifest: section {name!r} must be a JSON object."
+        )
+    keys = _MANIFEST_SECTIONS[name]
+    present = {key for key in section if not key.startswith("_")}
+    unknown = sorted(present - set(keys))
+    if unknown:
+        raise ValueError(
+            f"treatment_params_from_manifest: unknown key(s) {unknown} in section "
+            f"{name!r}; expected {list(keys)}."
+        )
+    missing = [key for key in keys if key not in present]
+    if missing:
+        raise ValueError(
+            f"treatment_params_from_manifest: section {name!r} is missing "
+            f"key(s) {missing}."
+        )
+    return {key: section[key] for key in keys}
+
+
+def _load_manifest_volume(path_value: Any, manifest_path: Path, what: str) -> NDArray:
+    """Load a NIfTI volume named in the manifest as a float64 array."""
+    path = Path(str(path_value))
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"treatment_params_from_manifest: {what} volume not found: {path}"
+        )
+    return np.asarray(nib.load(str(path)).get_fdata(), dtype=np.float64)
+
+
+def treatment_params_from_manifest(path: str | Path) -> dict[str, Any]:
+    """
+    Load the StuppFKPPSolver treatment parameters from a JSON manifest.
+
+    The manifest holds up to three sections, each optional and read
+    only if present::
+
+        "resection":     {"time": <day>, "tumor_segmentation": <NIfTI path>,
+                          "cavity_label": <int>}
+        "chemotherapy":  {"times": [<days>], "kill_rate": <1/day>,
+                          "decay_rate": <1/day>}
+        "radiotherapy":  {"times": [<days>], "dose": <NIfTI path, TOTAL Gy>,
+                          "alpha": <1/Gy>, "beta": <1/Gy^2>}
+
+    Top-level and per-section keys starting with '_' are comments and are
+    ignored. NIfTI paths are absolute or relative to the manifest's
+    directory; the volumes are loaded with nibabel. The resection cavity
+    is ``segmentation == cavity_label`` (values rounded to the nearest
+    integer first).
+
+    Args:
+        path: Path of the JSON manifest.
+
+    Returns:
+        The solver parameters of the present sections, ready to be merged
+        into the StuppFKPPSolver params dict: 'resection_time',
+        'resection_cavity' (bool array), 'chemo_times', 'chemo_kill_rate',
+        'chemo_decay_rate', 'rt_times', 'rt_dose' (float64 array, Gy),
+        'rt_alpha', 'rt_beta'.
+    """
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"treatment_params_from_manifest: manifest not found: {manifest_path}"
+        )
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, Mapping):
+        raise ValueError(
+            "treatment_params_from_manifest: the manifest must be a JSON object."
+        )
+    unknown = sorted(
+        key
+        for key in manifest
+        if not key.startswith("_") and key not in _MANIFEST_SECTIONS
+    )
+    if unknown:
+        raise ValueError(
+            f"treatment_params_from_manifest: unknown top-level key(s) {unknown}; "
+            f"expected a subset of {list(_MANIFEST_SECTIONS)}."
+        )
+
+    params: dict[str, Any] = {}
+    if "resection" in manifest:
+        section = _manifest_section(manifest, "resection")
+        segmentation = _load_manifest_volume(
+            section["tumor_segmentation"], manifest_path, "tumor_segmentation"
+        )
+        label = int(section["cavity_label"])
+        params["resection_time"] = float(section["time"])
+        params["resection_cavity"] = np.rint(segmentation).astype(np.int64) == label
+    if "chemotherapy" in manifest:
+        section = _manifest_section(manifest, "chemotherapy")
+        params["chemo_times"] = np.asarray(section["times"], dtype=np.float64)
+        params["chemo_kill_rate"] = float(section["kill_rate"])
+        params["chemo_decay_rate"] = float(section["decay_rate"])
+    if "radiotherapy" in manifest:
+        section = _manifest_section(manifest, "radiotherapy")
+        params["rt_times"] = np.asarray(section["times"], dtype=np.float64)
+        params["rt_dose"] = _load_manifest_volume(section["dose"], manifest_path, "dose")
+        params["rt_alpha"] = float(section["alpha"])
+        params["rt_beta"] = float(section["beta"])
+    return params

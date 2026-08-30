@@ -1,6 +1,9 @@
 """Fisher-KPP tumor growth forward solvers.
 
-Three solvers share one params-dict interface and return a ``Result``.
+Four solvers share one params-dict interface and return a ``Result``
+(``StuppFKPPSolver`` extends the isotropic model with resection,
+chemotherapy and radiotherapy; ``solvers.treatment_params_from_manifest``
+loads its treatment parameters from a JSON manifest).
 Common solver options: ``precision: "f32" | "f64"`` (default "f32") selects
 the device state dtype, and ``n_steps`` pins an explicit step count
 (dt = stopping_time / n_steps) in place of the stability formula. The
@@ -20,6 +23,7 @@ from .base import Result
 from .solvers import (
     AnisotropicFKPPSolver,
     FKPPSolver,
+    StuppFKPPSolver,
     TwoCompartmentWithNutrientFKPPSolver,
 )
 
@@ -40,5 +44,6 @@ __all__ = [
     "AnisotropicFKPPSolver",
     "FKPPSolver",
     "Result",
+    "StuppFKPPSolver",
     "TwoCompartmentWithNutrientFKPPSolver",
 ]
