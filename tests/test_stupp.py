@@ -2,7 +2,9 @@
 manifest loader, self-contained.
 
 Short f64 solves on the 24^3 tissue phantom checking (a) that the solver
-reduces to ``FKPPSolver`` without treatments, (b) closed forms of the three
+reduces to ``FKPPSolver`` with neutral treatment values (every treatment
+parameter is required; ``neutral_treatment_params`` switches the three
+treatments off through their values), (b) closed forms of the three
 treatment effects in limits where they decouple from growth/diffusion (RT
 impulse under mass-conserving diffusion, chemotherapy under pure reaction,
 resection projection and cavity isolation), (c) the jit-cache and precision
@@ -44,13 +46,34 @@ _COMMON = dict(
 F32_ATOL = 2e-3
 
 
+def neutral_treatment_params(shape: tuple[int, int, int], **overrides) -> dict:
+    """All three treatments present but switched off by their values: an
+    empty cavity, a zero chemotherapy kill rate, a zero dose. The event
+    times lie inside the 10-day horizon so that nothing warns."""
+    params = dict(
+        resection_time=2.0,
+        resection_cavity=np.zeros(shape, dtype=bool),
+        chemo_times=np.array([1.0, 3.0, 5.0]),
+        chemo_kill_rate=0.0,
+        chemo_decay_rate=0.5,
+        rt_times=np.array([3.3, 5.3, 7.3]),
+        rt_dose=np.zeros(shape),
+        rt_alpha=0.1,
+        rt_beta=0.01,
+    )
+    params.update(overrides)
+    return params
+
+
 def base_params(gm: np.ndarray, wm: np.ndarray, **overrides) -> dict:
+    """Untreated run: the shared solver parameters plus neutral treatments."""
     params = dict(
         white_matter_diffusivity=0.3,
         rho=0.15,
         gray_matter_pbmap=gm,
         white_matter_pbmap=wm,
         **_COMMON,
+        **neutral_treatment_params(gm.shape),
     )
     params.update(overrides)
     return params
@@ -98,21 +121,33 @@ def lowres_seed_mass(solver: StuppFKPPSolver) -> float:
     return solver.voxel_volume * float(seed.sum())
 
 
-def test_no_treatment_equals_fkpp(tissue_phantom):
-    """With every treatment disabled the treatment branches are absent from
-    the trace and the solver reproduces FKPPSolver bit-exactly."""
+def test_neutral_treatment_equals_fkpp(tissue_phantom):
+    """With every treatment switched off by its values the solver
+    reproduces FKPPSolver: the same step count and final time, and the same
+    fields up to rounding (the zero-valued treatment terms are still
+    evaluated, so the compiled arithmetic is not identical; the observed
+    difference is ~1e-16 relative)."""
     gm, wm = tissue_phantom
     params = base_params(gm, wm, n_time_series_snapshots=3)
-    reference = FKPPSolver(params).solve()
+    untreated = {k: v for k, v in params.items() if k not in neutral_treatment_params(gm.shape)}
+    reference = FKPPSolver(untreated).solve()
     result = StuppFKPPSolver(params).solve()
     assert reference.success and result.success, (reference.error, result.error)
     assert result.final_time == reference.final_time
-    assert result.final_stopping_quantity == reference.final_stopping_quantity
-    np.testing.assert_array_equal(
-        result.final_state["cell_density"], reference.final_state["cell_density"]
+    np.testing.assert_allclose(
+        result.final_stopping_quantity, reference.final_stopping_quantity, rtol=1e-13
     )
-    np.testing.assert_array_equal(
-        result.time_series["cell_density"], reference.time_series["cell_density"]
+    np.testing.assert_allclose(
+        result.final_state["cell_density"],
+        reference.final_state["cell_density"],
+        rtol=0,
+        atol=1e-14,
+    )
+    np.testing.assert_allclose(
+        result.time_series["cell_density"],
+        reference.time_series["cell_density"],
+        rtol=0,
+        atol=1e-14,
     )
 
 
@@ -390,13 +425,12 @@ def test_validation_errors(tissue_phantom):
         return StuppFKPPSolver(base_params(gm, wm, **treatment))
 
     build(**full)  # the complete set is accepted
-    # Partial treatment groups name the missing keys.
-    with pytest.raises(ValueError, match="resection_cavity"):
-        build(resection_time=2.0)
-    with pytest.raises(ValueError, match="chemo_decay_rate"):
-        build(chemo_times=full["chemo_times"], chemo_kill_rate=0.1)
-    with pytest.raises(ValueError, match="rt_beta"):
-        build(**{k: full[k] for k in ("rt_times", "rt_dose", "rt_alpha")})
+    # Every treatment parameter is required; None is not a way to disable one.
+    for key in ("resection_cavity", "chemo_decay_rate", "rt_beta"):
+        with pytest.raises(KeyError, match=key):
+            StuppFKPPSolver({k: v for k, v in base_params(gm, wm).items() if k != key})
+        with pytest.raises(ValueError, match=key):
+            build(**{**full, key: None})
     # Wrong shapes / kinds.
     with pytest.raises(ValueError, match="resection_cavity"):
         build(**{**full, "resection_cavity": np.zeros((4, 4, 4), dtype=bool)})
@@ -493,42 +527,45 @@ def test_manifest_loader_full(manifest_dir):
     assert params["rt_alpha"] == 0.1 and params["rt_beta"] == 0.01
 
 
-def test_manifest_loader_partial_sections(manifest_dir):
+def test_manifest_loader_requires_all_sections(manifest_dir):
     tmp_path, _, _ = manifest_dir
     manifest = {"chemotherapy": {"times": [1.0], "kill_rate": 0.1, "decay_rate": 0.5}}
-    params = treatment_params_from_manifest(_write_manifest(tmp_path, manifest))
-    assert set(params) == {"chemo_times", "chemo_kill_rate", "chemo_decay_rate"}
-    assert treatment_params_from_manifest(_write_manifest(tmp_path, {"_only": 1})) == {}
+    with pytest.raises(ValueError, match=r"missing treatment section.*resection.*radiotherapy"):
+        treatment_params_from_manifest(_write_manifest(tmp_path, manifest))
+    with pytest.raises(ValueError, match="missing treatment section"):
+        treatment_params_from_manifest(_write_manifest(tmp_path, {"_only": 1}))
 
 
 def test_manifest_loader_errors(manifest_dir):
     tmp_path, _, _ = manifest_dir
     with pytest.raises(FileNotFoundError, match="manifest not found"):
         treatment_params_from_manifest(tmp_path / "missing.json")
+    full = {
+        "resection": {"time": 1, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4},
+        "chemotherapy": {"times": [1], "kill_rate": 1, "decay_rate": 1},
+        "radiotherapy": {"times": [1], "dose": "dose.nii.gz", "alpha": 0.1, "beta": 0.01},
+    }
+    treatment_params_from_manifest(_write_manifest(tmp_path, full))  # accepted
     missing_volume = {
-        "resection": {
-            "time": 1,
-            "tumor_segmentation": str(tmp_path / "nope.nii.gz"),
-            "cavity_label": 4,
-        }
+        **full,
+        "resection": {**full["resection"], "tumor_segmentation": str(tmp_path / "nope.nii.gz")},
     }
     with pytest.raises(FileNotFoundError, match="nope.nii.gz"):
         treatment_params_from_manifest(_write_manifest(tmp_path, missing_volume))
     with pytest.raises(ValueError, match="unknown top-level"):
-        treatment_params_from_manifest(_write_manifest(tmp_path, {"surgery": {}}))
+        treatment_params_from_manifest(_write_manifest(tmp_path, {**full, "surgery": {}}))
     with pytest.raises(ValueError, match="unknown key"):
         treatment_params_from_manifest(
             _write_manifest(
-                tmp_path,
-                {"chemotherapy": {"times": [1], "kill_rate": 1, "decay_rate": 1, "dose": 2}},
+                tmp_path, {**full, "chemotherapy": {**full["chemotherapy"], "dose": 2}}
             )
         )
-    with pytest.raises(ValueError, match="missing"):
+    with pytest.raises(ValueError, match="missing key"):
         treatment_params_from_manifest(
-            _write_manifest(tmp_path, {"radiotherapy": {"times": [1], "alpha": 0.1}})
+            _write_manifest(tmp_path, {**full, "radiotherapy": {"times": [1], "alpha": 0.1}})
         )
     with pytest.raises(ValueError, match="JSON object"):
-        treatment_params_from_manifest(_write_manifest(tmp_path, {"resection": [1, 2]}))
+        treatment_params_from_manifest(_write_manifest(tmp_path, {**full, "resection": [1, 2]}))
 
 
 def test_manifest_params_drive_solver(manifest_dir, tissue_phantom):
@@ -541,6 +578,7 @@ def test_manifest_params_drive_solver(manifest_dir, tissue_phantom):
     _write_nifti(tmp_path / "dose24.nii.gz", np.full(gm.shape, 6.0, dtype=np.float32))
     manifest = {
         "resection": {"time": 2.0, "tumor_segmentation": "seg24.nii.gz", "cavity_label": 4},
+        "chemotherapy": {"times": [3.3, 5.3], "kill_rate": 0.1, "decay_rate": 0.5},
         "radiotherapy": {"times": [3.3, 5.3], "dose": "dose24.nii.gz", "alpha": 0.1, "beta": 0.01},
     }
     treatment = treatment_params_from_manifest(_write_manifest(tmp_path, manifest))
@@ -568,7 +606,9 @@ def test_manifest_solver_and_tissue_sections(manifest_dir):
             "stopping_threshold": "inf",
             "precision": "f64",
         },
+        "resection": {"time": 10.0, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4},
         "chemotherapy": {"times": [1.0], "kill_rate": 0.1, "decay_rate": 0.5},
+        "radiotherapy": {"times": [12.0], "dose": "dose.nii.gz", "alpha": 0.1, "beta": 0.01},
     }
     path = _write_manifest(tmp_path, manifest)
     solver = solver_params_from_manifest(path)
@@ -587,11 +627,17 @@ def test_manifest_solver_and_tissue_sections(manifest_dir):
         "gm": tmp_path / "dose.nii.gz",
     }
     assert set(treatment_params_from_manifest(path)) == {
+        "resection_time",
+        "resection_cavity",
         "chemo_times",
         "chemo_kill_rate",
         "chemo_decay_rate",
+        "rt_times",
+        "rt_dose",
+        "rt_alpha",
+        "rt_beta",
     }
-    # Absent sections give empty results.
+    # Absent 'solver' / 'tissue' sections give empty results.
     minimal = _write_manifest(tmp_path, {"_only": 1})
     assert solver_params_from_manifest(minimal) == {}
     assert tissue_paths_from_manifest(minimal) == {}

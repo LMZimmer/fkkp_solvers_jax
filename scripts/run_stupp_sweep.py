@@ -190,16 +190,14 @@ def config_manifest(
     )
     shift = config["resection_time"] - float(base["resection"]["time"])
     manifest["resection"]["time"] = config["resection_time"]
-    if "chemotherapy" in manifest:
-        section = manifest["chemotherapy"]
-        section["times"] = [float(t) + shift for t in section["times"]]
-        section["kill_rate"] = config["chemo_kill_rate"]
-        section["decay_rate"] = config["chemo_decay_rate"]
-    if "radiotherapy" in manifest:
-        section = manifest["radiotherapy"]
-        section["times"] = [float(t) + shift for t in section["times"]]
-        section["alpha"] = config["rt_alpha"]
-        section["beta"] = config["rt_beta"]
+    section = manifest["chemotherapy"]
+    section["times"] = [float(t) + shift for t in section["times"]]
+    section["kill_rate"] = config["chemo_kill_rate"]
+    section["decay_rate"] = config["chemo_decay_rate"]
+    section = manifest["radiotherapy"]
+    section["times"] = [float(t) + shift for t in section["times"]]
+    section["alpha"] = config["rt_alpha"]
+    section["beta"] = config["rt_beta"]
     manifest["_sweep"] = (
         f"{config['config']}: sampled values substituted by scripts/run_stupp_sweep.py; "
         f"sessions shifted by {shift:+g} days with the resection time; "

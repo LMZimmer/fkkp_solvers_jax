@@ -62,7 +62,7 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass, distance_transform_edt  # noqa: E402
 
-from fisher_kpp_jax import StuppFKPPSolver  # noqa: E402
+from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
 from fisher_kpp_jax.solvers import (  # noqa: E402
     resolve_horizon,
     resolve_time_step,
@@ -160,21 +160,20 @@ def scalar_params(params: dict[str, Any]) -> dict[str, Any]:
 def treatment_schedule_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     """
     The scalar treatment parameters of the manifest: resection time,
-    chemotherapy times/rates (if the section is present) and radiotherapy
-    times/alpha/beta. The volumes the sections point at (tumor
-    segmentation, planning dose) are not read - the cavity and dose map
-    are synthesized from the pre-resection solve instead.
+    chemotherapy times/rates and radiotherapy times/alpha/beta (all three
+    sections are required, as the solver requires every treatment). The
+    volumes the sections point at (tumor segmentation, planning dose) are
+    not read - the cavity and dose map are synthesized from the
+    pre-resection solve instead.
     """
-    if "resection" not in manifest:
-        raise ValueError("the manifest needs a 'resection' section (resection time).")
-    if "radiotherapy" not in manifest:
-        raise ValueError("the manifest needs a 'radiotherapy' section (times, alpha, beta).")
+    missing = [name for name in ("resection", "chemotherapy", "radiotherapy") if name not in manifest]
+    if missing:
+        raise ValueError(f"the manifest is missing the treatment section(s) {missing}.")
     params: dict[str, Any] = {"resection_time": float(manifest["resection"]["time"])}
-    if "chemotherapy" in manifest:
-        section = manifest["chemotherapy"]
-        params["chemo_times"] = np.asarray(section["times"], dtype=np.float64)
-        params["chemo_kill_rate"] = float(section["kill_rate"])
-        params["chemo_decay_rate"] = float(section["decay_rate"])
+    section = manifest["chemotherapy"]
+    params["chemo_times"] = np.asarray(section["times"], dtype=np.float64)
+    params["chemo_kill_rate"] = float(section["kill_rate"])
+    params["chemo_decay_rate"] = float(section["decay_rate"])
     section = manifest["radiotherapy"]
     params["rt_times"] = np.asarray(section["times"], dtype=np.float64)
     params["rt_alpha"] = float(section["alpha"])
@@ -326,8 +325,8 @@ def render(
     if pre_points:
         ax.plot(*zip(*pre_points), "s", color="gray", label="before resection")
     events = [("resection_time", "resection", CAVITY_COLOR, 1.5, 1.0)]
-    if "chemo_times" in treatment and np.array_equal(
-        np.atleast_1d(treatment.get("rt_times", [])), np.atleast_1d(treatment["chemo_times"])
+    if np.array_equal(
+        np.atleast_1d(treatment["rt_times"]), np.atleast_1d(treatment["chemo_times"])
     ):
         # One event class: the fractions and the sessions coincide.
         events.append(("rt_times", "radio-/chemotherapy", "blue", 0.6, 0.4))
@@ -335,8 +334,6 @@ def render(
         events.append(("rt_times", "radiotherapy", "blue", 0.6, 0.4))
         events.append(("chemo_times", "chemotherapy", "green", 0.6, 0.4))
     for key, label, color, width, alpha in events:
-        if key not in treatment:
-            continue
         for index, t in enumerate(np.atleast_1d(treatment[key])):
             ax.axvline(float(t), color=color, linewidth=width, alpha=alpha, label=label if index == 0 else None)
     ax.set_yscale("log")
@@ -403,12 +400,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"run directory: {run_dir}")
     print(f"seed voxel {seed_voxel}, {n_steps} steps (dt={dt:.4g} d)")
 
-    # Solve 1: up to the resection with no event firing.
+    # Solve 1: untreated up to the resection (FKPPSolver, whose dynamics
+    # StuppFKPPSolver reproduces up to that step).
     n_pre = int(round(resection_time / dt))
     wall = time.perf_counter()
-    pre = StuppFKPPSolver(
-        {**base, "stopping_time": n_pre * dt, "n_steps": n_pre}
-    ).solve()
+    pre = FKPPSolver({**base, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
     if not pre.success:
         raise RuntimeError(f"pre-resection solve failed: {pre.error}")
     wall_pre = time.perf_counter() - wall
@@ -459,12 +455,8 @@ def main(argv: list[str] | None = None) -> int:
     header = (
         f"D {base['white_matter_diffusivity']:g}, rho {base['rho']:g}, "
         f"ratio {base['diffusivity_ratio']:g}, "
-        f"alpha {treatment['rt_alpha']:g}, beta {treatment['rt_beta']:g}"
-        + (
-            f", kill {treatment['chemo_kill_rate']:g}, decay {treatment['chemo_decay_rate']:g}"
-            if "chemo_times" in treatment
-            else ""
-        )
+        f"alpha {treatment['rt_alpha']:g}, beta {treatment['rt_beta']:g}, "
+        f"kill {treatment['chemo_kill_rate']:g}, decay {treatment['chemo_decay_rate']:g}"
     )
     render(
         run_dir / "overview",

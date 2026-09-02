@@ -20,9 +20,8 @@ writes, into its own run directory
                                scripts/run_stupp_example.py (seed, before and
                                after resection, snapshots across the
                                radiotherapy block, end) on the axial slice
-                               through the dose map's center of mass (or the
-                               seed voxel without radiotherapy), over --t1c
-                               or the tissue maps, plus total mass vs time
+                               through the dose map's center of mass, over
+                               --t1c or the tissue maps, plus total mass vs time
                                with the treatment events marked
 
 The run directory is created with exist_ok=False and nothing is written
@@ -76,7 +75,7 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
 
-from fisher_kpp_jax import StuppFKPPSolver  # noqa: E402
+from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
 from fisher_kpp_jax.solvers import (  # noqa: E402
     resolve_horizon,
     resolve_time_step,
@@ -286,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
                 for key in group:
                     merged.pop(key, None)
         merged.update(layer)
-    merged = resolve_time_step(resolve_horizon(merged, treatment.get("resection_time")))
+    merged = resolve_time_step(resolve_horizon(merged, treatment["resection_time"]))
     n_snapshots = None if args.no_plot else int(args.n_snapshots)
     params: dict[str, Any] = {
         "voxel_size_mm": voxel_size,
@@ -301,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"run directory: {run_dir}")
     print(f"tissue: wm={wm_path} gm={gm_path}")
-    print(f"grid: {wm.shape}, voxel size {voxel_size} mm, treatments: {sorted(treatment)}")
+    print(f"grid: {wm.shape}, voxel size {voxel_size} mm")
     wall_start = time.perf_counter()
     result = solver.solve()
     wall = time.perf_counter() - wall_start
@@ -351,26 +350,26 @@ def main(argv: list[str] | None = None) -> int:
             for axis, n in zip("xyz", wm.shape)
         )
         # The state just before the resection: a second, shorter, untreated
-        # solve (identical dynamics up to that step).
+        # solve with FKPPSolver, whose dynamics StuppFKPPSolver reproduces
+        # up to that step.
         pre_resection = None
         pre_points = [(0.0, float(result.initial_state["cell_density"].sum()))]
-        if "resection_time" in treatment:
-            n_pre = int(round(float(treatment["resection_time"]) / dt))
-            if n_pre >= 1:
-                pre = StuppFKPPSolver(
-                    {
-                        **params,
-                        **{key: None for key in treatment},
-                        "stopping_time": n_pre * dt,
-                        "n_steps": n_pre,
-                        "n_time_series_snapshots": None,
-                    }
-                ).solve()
-                if not pre.success:
-                    raise RuntimeError(f"pre-resection solve failed: {pre.error}")
-                pre_state = pre.final_state["cell_density"]
-                pre_resection = (n_pre * dt, pre_state)
-                pre_points.append((n_pre * dt, float(pre_state.sum())))
+        n_pre = int(round(float(treatment["resection_time"]) / dt))
+        if n_pre >= 1:
+            untreated = {key: value for key, value in params.items() if key not in treatment}
+            pre = FKPPSolver(
+                {
+                    **untreated,
+                    "stopping_time": n_pre * dt,
+                    "n_steps": n_pre,
+                    "n_time_series_snapshots": None,
+                }
+            ).solve()
+            if not pre.success:
+                raise RuntimeError(f"pre-resection solve failed: {pre.error}")
+            pre_state = pre.final_state["cell_density"]
+            pre_resection = (n_pre * dt, pre_state)
+            pre_points.append((n_pre * dt, float(pre_state.sum())))
         if args.t1c is not None:
             background = np.asarray(nib.load(args.t1c).get_fdata(), dtype=np.float64)
             if background.shape != wm.shape:
@@ -379,45 +378,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
         else:
             background = wm + gm
-        z = (
-            int(round(center_of_mass(treatment["rt_dose"])[2]))
-            if "rt_dose" in treatment
-            else seed_voxel[2]
-        )
+        z = int(round(center_of_mass(treatment["rt_dose"])[2]))
         panels = select_panels(
             result.initial_state["cell_density"],
             frames,
             times,
             pre_resection,
-            treatment.get("resection_time"),
-            np.asarray(treatment["rt_times"], dtype=np.float64)
-            if "rt_times" in treatment
-            else None,
+            float(treatment["resection_time"]),
+            np.asarray(treatment["rt_times"], dtype=np.float64),
             args.n_treatment_panels,
         )
-        active = [
-            name
-            for name, key in (
-                ("resection", "resection_time"),
-                ("chemotherapy", "chemo_times"),
-                ("radiotherapy", "rt_times"),
-            )
-            if key in treatment
-        ]
         header = (
             f"{run_name}: {Path(args.manifest).name}, axial slice z={z}, "
             f"densities >= {args.threshold:g}\n"
             f"rho {solver.params['rho']:g}, D {solver.params['white_matter_diffusivity']:g}, "
             f"ratio {solver.params['diffusivity_ratio']:g}, resolution "
-            f"{solver.params['resolution_factor']:g}, {n_steps} steps; "
-            f"treatments: {', '.join(active) or 'none'}"
+            f"{solver.params['resolution_factor']:g}, {n_steps} steps"
         )
         render(
             run_dir / "overview",
             header,
             panels,
             background,
-            treatment.get("resection_cavity"),
+            treatment["resection_cavity"],
             seed_voxel,
             z,
             args.threshold,

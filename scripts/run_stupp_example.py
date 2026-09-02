@@ -51,7 +51,7 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
 
-from fisher_kpp_jax import StuppFKPPSolver  # noqa: E402
+from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
 from fisher_kpp_jax.solvers import (  # noqa: E402
     solver_params_from_manifest,
     tissue_paths_from_manifest,
@@ -244,8 +244,8 @@ def render(
     if pre_points:
         ax.plot(*zip(*pre_points), "s", color="gray", label="before resection")
     events = [("resection_time", "resection", CAVITY_COLOR, 1.5, 1.0)]
-    if "chemo_times" in treatment and np.array_equal(
-        np.atleast_1d(treatment.get("rt_times", [])), np.atleast_1d(treatment["chemo_times"])
+    if np.array_equal(
+        np.atleast_1d(treatment["rt_times"]), np.atleast_1d(treatment["chemo_times"])
     ):
         # One event class: the fractions and the sessions coincide.
         events.append(("rt_times", "radio-/chemotherapy", "blue", 0.6, 0.4))
@@ -253,8 +253,6 @@ def render(
         events.append(("rt_times", "radiotherapy", "blue", 0.6, 0.4))
         events.append(("chemo_times", "chemotherapy", "green", 0.6, 0.4))
     for key, label, color, width, alpha in events:
-        if key not in treatment:
-            continue
         for index, t in enumerate(np.atleast_1d(treatment[key])):
             ax.axvline(float(t), color=color, linewidth=width, alpha=alpha, label=label if index == 0 else None)
     ax.set_yscale("log")
@@ -295,10 +293,6 @@ def main(argv: list[str] | None = None) -> int:
 
     solver_params = solver_params_from_manifest(args.manifest)
     treatment = treatment_params_from_manifest(args.manifest)
-    if "resection_time" not in treatment:
-        raise ValueError("the manifest needs a 'resection' section (seed label + cavity).")
-    if "rt_times" not in treatment:
-        raise ValueError("the manifest needs a 'radiotherapy' section (treatment panels).")
     segmentation = np.rint(
         nib.load(str(Path(args.manifest).parent / manifest["resection"]["tumor_segmentation"]))
         .get_fdata()
@@ -328,12 +322,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"run directory: {run_dir}")
     print(f"seed voxel {seed_voxel} (label {args.seed_label} CoM), slice z={z}, {n_steps} steps (dt={dt:.4g} d)")
 
-    # Solve 1: up to the resection with no event firing.
+    # Solve 1: untreated up to the resection (FKPPSolver, whose dynamics
+    # StuppFKPPSolver reproduces up to that step).
     n_pre = int(round(resection_time / dt))
     wall = time.perf_counter()
-    pre = StuppFKPPSolver(
-        {**base, "stopping_time": n_pre * dt, "n_steps": n_pre}
-    ).solve()
+    pre = FKPPSolver({**base, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
     if not pre.success:
         raise RuntimeError(f"pre-resection solve failed: {pre.error}")
     wall_pre = time.perf_counter() - wall
@@ -365,12 +358,8 @@ def main(argv: list[str] | None = None) -> int:
     header = (
         f"D {base['white_matter_diffusivity']:g}, rho {base['rho']:g}, "
         f"ratio {base['diffusivity_ratio']:g}, "
-        f"alpha {treatment['rt_alpha']:g}, beta {treatment['rt_beta']:g}"
-        + (
-            f", kill {treatment['chemo_kill_rate']:g}, decay {treatment['chemo_decay_rate']:g}"
-            if "chemo_times" in treatment
-            else ""
-        )
+        f"alpha {treatment['rt_alpha']:g}, beta {treatment['rt_beta']:g}, "
+        f"kill {treatment['chemo_kill_rate']:g}, decay {treatment['chemo_decay_rate']:g}"
     )
     render(
         run_dir / "overview",
