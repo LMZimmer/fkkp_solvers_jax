@@ -205,16 +205,10 @@ def _validate_parameters(parameters: dict[str, Any], solver_name: str) -> None:
         )
 
 
-def _validate_unit_interval(
-    parameters: Mapping[str, Any], keys: Sequence[str], solver_name: str
-) -> None:
-    """Check that each named parameter lies in [0, 1]."""
-    for key in keys:
-        value = parameters[key]
-        if not 0 <= value <= 1:
-            raise ValueError(
-                f"{solver_name}: {key} must be between 0 and 1, got {value!r}."
-            )
+def _validate_unit_interval(value: Any, key: str, solver_name: str) -> None:
+    """Check that value (the parameter named key) lies in [0, 1]."""
+    if not 0 <= value <= 1:
+        raise ValueError(f"{solver_name}: {key} must be between 0 and 1, got {value!r}.")
 
 
 def _validate_tissue_arrays(parameters: Mapping[str, Any], solver_name: str) -> None:
@@ -237,11 +231,9 @@ def _validate_tissue_arrays(parameters: Mapping[str, Any], solver_name: str) -> 
         )
 
 
-def _validate_nonnegative_scalar(
-    parameters: Mapping[str, Any], key: str, solver_name: str
-) -> float:
-    """Check that the named parameter is a finite scalar >= 0; return it as a float."""
-    value = parameters[key]
+def _validate_nonnegative_scalar(value: Any, key: str, solver_name: str) -> float:
+    """Check that value (the parameter named key) is a finite scalar >= 0;
+    return it as a float."""
     if not (np.isscalar(value) and np.isfinite(value) and value >= 0):
         raise ValueError(
             f"{solver_name}: {key} must be a finite nonnegative scalar, got {value!r}."
@@ -250,19 +242,18 @@ def _validate_nonnegative_scalar(
 
 
 def _validate_event_times(
-    parameters: Mapping[str, Any], key: str, solver_name: str
+    value: Any, key: str, stopping_time: float, solver_name: str
 ) -> NDArray:
     """
-    Check that the named parameter is a 1-D sequence of finite nonnegative
-    times; return it as a float64 array. Times beyond stopping_time are
-    legal but never fire; a warning names them.
+    Check that value (the parameter named key) is a 1-D sequence of finite
+    nonnegative times; return it as a float64 array. Times beyond
+    stopping_time are legal but never fire; a warning names them.
     """
-    times = np.asarray(parameters[key], dtype=np.float64)
+    times = np.asarray(value, dtype=np.float64)
     if times.ndim != 1:
         raise ValueError(f"{solver_name}: {key} must be a 1-D sequence of times.")
     if not np.all(np.isfinite(times)) or np.any(times < 0):
         raise ValueError(f"{solver_name}: {key} must be finite and nonnegative.")
-    stopping_time = float(parameters["stopping_time"])
     late = times[times > stopping_time]
     if late.size:
         logger.warning(
@@ -273,11 +264,10 @@ def _validate_event_times(
 
 
 def _validate_volume(
-    parameters: Mapping[str, Any], key: str, shape: tuple[int, ...], solver_name: str
+    value: Any, key: str, shape: tuple[int, ...], solver_name: str
 ) -> NDArray:
-    """Check that the named parameter is a 3D numpy array of the given
-    (tissue map) shape; return it."""
-    value = parameters[key]
+    """Check that value (the parameter named key) is a 3D numpy array of the
+    given (tissue map) shape; return it."""
     if not isinstance(value, np.ndarray):
         raise ValueError(f"{solver_name}: {key} must be a numpy array.")
     if value.ndim != 3:
@@ -333,9 +323,8 @@ class BaseFKPPSolver(ABC):
             params, self._REQUIRED, self._DEFAULTS, type(self).__name__
         )
         _validate_parameters(merged, type(self).__name__)
-        _validate_unit_interval(
-            merged, GAUSSIAN_SEED_POSITION_FRACTION, type(self).__name__
-        )
+        for key in GAUSSIAN_SEED_POSITION_FRACTION:
+            _validate_unit_interval(merged[key], key, type(self).__name__)
         self._validate_extra(merged)
         self.params = merged
 
