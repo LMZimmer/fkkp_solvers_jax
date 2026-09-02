@@ -5,7 +5,7 @@ Loads the patient's WM/GM tissue probability maps, reads a JSON run manifest
 (see scripts/stupp_manifest_example.json and the loaders in
 fisher_kpp_jax.solvers: 'tissue' pbmap paths, 'solver' scalar parameters
 incl. dt, and the treatment sections -- resection cavity from a labelled
-segmentation, chemotherapy session times/rates, radiotherapy fraction times
+segmentation, chemotherapy session times/doses/rates, radiotherapy fraction times
 and TOTAL-dose map with the linear-quadratic alpha/beta), runs the solver and
 writes, into its own run directory
 

@@ -85,7 +85,7 @@ FACTOR_LABELS = {
     "white_matter_diffusivity": "D_wm [mm^2/day]",
     "diffusivity_ratio": "diffusivity ratio",
     "resection_time": "resection time [day]",
-    "chemo_kill_rate": "chemo kill rate [1/day]",
+    "chemo_kill_rate": "chemo kill rate [1/day per mg/m^2]",
     "chemo_decay_rate": "chemo decay rate [1/day]",
     "rt_alpha": "rt alpha [1/Gy]",
     SEED_WM: "WM prob. at seed voxel",

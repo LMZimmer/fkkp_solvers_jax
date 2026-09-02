@@ -21,15 +21,19 @@ Swept parameters and default ranges (uniform):
   white_matter_diffusivity 0.0071209 - 2.1329   mm^2/day   (parameter_range.txt)
   diffusivity_ratio        10.051    - 743.02              (parameter_range.txt, 10^log10 range)
   resection_time           30        - 200      days       (not in the file)
-  chemo_kill_rate          0.05      - 2.0      1/day      (not in the file)
+  chemo_kill_rate          6.67e-4   - 2.67e-2  1/day per mg/m^2 (not in the file;
+                           the former 0.05 - 2.0 per unit concentration / 75 mg/m^2)
   chemo_decay_rate         1.0       - 20.0     1/day      (not in the file)
   rt_alpha                 0.02      - 0.3      1/Gy       (not in the file); rt_beta = 0.1 * rt_alpha
   seed voxel               uniformly among the cavity voxels (cavity_label of the
                            base manifest's tumor segmentation) that carry tissue
 Ranges are overridable with --range NAME MIN MAX.
 
-Everything else comes from the base manifest (--manifest). The radiotherapy
-and chemotherapy sessions are shifted with the sampled resection time so the
+Everything else comes from the base manifest (--manifest): the tissue maps,
+the resection segmentation and dose map, the radiotherapy and chemotherapy
+session times, the chemotherapy session doses (mg/m^2, copied through
+unchanged) and the remaining solver parameters. The radiotherapy and
+chemotherapy sessions are shifted with the sampled resection time so the
 treatment block keeps its offset after surgery (the base manifest's
 time_after_resection keeps the horizon relative to the resection). The time
 step is raised per configuration when the sampled diffusivity needs it:
@@ -41,7 +45,9 @@ without --gpus a single worker inherits the environment (e.g.
 JAX_PLATFORMS=cpu). Each subprocess writes only into its own folder.
 
 Defaults: 10000 configurations, seed 1, GPUs 1,2,3,5, output under
-/mnt/Drive4/lucas/SAILOR/sweep (about 10 h and 60 GB). Run from the
+/mnt/Drive4/lucas/SAILOR/sweep (about 10 h and 60 GB, measured with the
+earlier base manifest's day-200 horizon; the current manifest runs to day
+360). Run from the
 project root, detached for the long default run, e.g.:
   nohup python scripts/run_stupp_sweep.py --sweep-name sweep_sub15 > sweep_sub15.log 2>&1 &
   python scripts/run_stupp_sweep.py --output-dir runs/ --n-configs 5 --gpus 1 --dry-run
@@ -81,7 +87,7 @@ DEFAULT_RANGES: dict[str, tuple[float, float]] = {
     "white_matter_diffusivity": (0.0071209, 2.1329),
     "diffusivity_ratio": (10 ** 1.0022, 10 ** 2.871),
     "resection_time": (30.0, 200.0),
-    "chemo_kill_rate": (0.05, 2.0),
+    "chemo_kill_rate": (0.05 / 75, 2.0 / 75),  # 1/day per mg/m^2
     "chemo_decay_rate": (1.0, 20.0),
     "rt_alpha": (0.02, 0.3),
 }
@@ -169,7 +175,7 @@ def config_manifest(
     """The per-configuration manifest: the base manifest with the sampled
     values substituted, sessions shifted with the resection time and the
     time step raised to the diffusion stability bound where needed."""
-    manifest = json.loads(json.dumps(base))  # deep copy
+    manifest = json.loads(json.dumps(base))  # deep copy (incl. the chemo doses)
     solver = manifest.setdefault("solver", {})
     for key in (
         "rho",
@@ -192,6 +198,7 @@ def config_manifest(
     manifest["resection"]["time"] = config["resection_time"]
     section = manifest["chemotherapy"]
     section["times"] = [float(t) + shift for t in section["times"]]
+    # section["doses"] stays as in the base manifest (one per shifted time).
     section["kill_rate"] = config["chemo_kill_rate"]
     section["decay_rate"] = config["chemo_decay_rate"]
     section = manifest["radiotherapy"]

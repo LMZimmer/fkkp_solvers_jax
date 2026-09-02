@@ -6,7 +6,7 @@ The counterpart of scripts/run_stupp_example.py without patient data: the
 tissue maps default to reference_solves/{wm,gm}_pbmap.nii.gz and the cavity
 and dose map are derived from the simulation itself instead of segmentations
 and a planning dose. Two solves of fisher_kpp_jax.StuppFKPPSolver with the
-manifest's solver parameters and treatment schedule
+manifest's solver parameters and treatment schedule (session times, TMZ doses, rates)
 (scripts/stupp_manifest_example.json by default; its 'tissue', resection
 'tumor_segmentation'/'cavity_label' and radiotherapy 'dose' entries are
 ignored and may be omitted):
@@ -159,8 +159,10 @@ def scalar_params(params: dict[str, Any]) -> dict[str, Any]:
 def treatment_schedule_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     """
     The scalar treatment parameters of the manifest: resection time,
-    chemotherapy times/rates and radiotherapy times/alpha/beta (all three
-    sections are required, as the solver requires every treatment). The
+    chemotherapy times/doses/rates and radiotherapy times/alpha/beta (all
+    three sections are required, as the solver requires every treatment;
+    the chemotherapy section needs 'doses', one per time, like the package
+    loader). The
     volumes the sections point at (tumor segmentation, planning dose) are
     not read - the cavity and dose map are synthesized from the
     pre-resection solve instead.
@@ -170,7 +172,11 @@ def treatment_schedule_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]
         raise ValueError(f"the manifest is missing the treatment section(s) {missing}.")
     params: dict[str, Any] = {"resection_time": float(manifest["resection"]["time"])}
     section = manifest["chemotherapy"]
+    missing = [key for key in ("times", "doses", "kill_rate", "decay_rate") if key not in section]
+    if missing:
+        raise ValueError(f"manifest section 'chemotherapy' is missing key(s) {missing}.")
     params["chemo_times"] = np.asarray(section["times"], dtype=np.float64)
+    params["chemo_doses"] = np.asarray(section["doses"], dtype=np.float64)
     params["chemo_kill_rate"] = float(section["kill_rate"])
     params["chemo_decay_rate"] = float(section["decay_rate"])
     section = manifest["radiotherapy"]
@@ -267,6 +273,18 @@ def select_panels(
     return panels
 
 
+def session_blocks(days: np.ndarray, max_gap: float = 1.0) -> list[tuple[float, float]]:
+    """(first, last) day of each run of sessions that are at most max_gap
+    days apart, for sorted session days."""
+    blocks: list[tuple[float, float]] = []
+    for day in days:
+        if blocks and day - blocks[-1][1] <= max_gap:
+            blocks[-1] = (blocks[-1][0], float(day))
+        else:
+            blocks.append((float(day), float(day)))
+    return blocks
+
+
 def render(
     outfile_stem: Path,
     header: str,
@@ -323,18 +341,29 @@ def render(
     ax.plot(times, masses, "ko-", markersize=3, label="mass")
     if pre_points:
         ax.plot(*zip(*pre_points), "s", color="gray", label="before resection")
-    events = [("resection_time", "resection", CAVITY_COLOR, 1.5, 1.0)]
-    if np.array_equal(
-        np.atleast_1d(treatment["rt_times"]), np.atleast_1d(treatment["chemo_times"])
+    ax.axvline(
+        float(treatment["resection_time"]), color=CAVITY_COLOR, linewidth=1.5, label="resection"
+    )
+    # Radiotherapy days as lines, split by whether chemotherapy is given the
+    # same day; chemotherapy-only days (daily sessions, many of them) as one
+    # shaded band per contiguous block of sessions.
+    rt_days = np.atleast_1d(np.asarray(treatment["rt_times"], dtype=np.float64))
+    ct_days = np.atleast_1d(np.asarray(treatment["chemo_times"], dtype=np.float64))
+    with_ct = np.isin(rt_days, ct_days)
+    for days, label, color in (
+        (rt_days[with_ct], "radio- + chemotherapy", "blue"),
+        (rt_days[~with_ct], "radiotherapy only", "purple"),
     ):
-        # One event class: the fractions and the sessions coincide.
-        events.append(("rt_times", "radio-/chemotherapy", "blue", 0.6, 0.4))
-    else:
-        events.append(("rt_times", "radiotherapy", "blue", 0.6, 0.4))
-        events.append(("chemo_times", "chemotherapy", "green", 0.6, 0.4))
-    for key, label, color, width, alpha in events:
-        for index, t in enumerate(np.atleast_1d(treatment[key])):
-            ax.axvline(float(t), color=color, linewidth=width, alpha=alpha, label=label if index == 0 else None)
+        for index, t in enumerate(days):
+            ax.axvline(
+                float(t), color=color, linewidth=0.6, alpha=0.4, label=label if index == 0 else None
+            )
+    ct_only = np.sort(ct_days[~np.isin(ct_days, rt_days)])
+    for index, (start, end) in enumerate(session_blocks(ct_only)):
+        ax.axvspan(
+            start - 0.5, end + 0.5, color="green", alpha=0.25, linewidth=0,
+            label="chemotherapy only" if index == 0 else None,
+        )
     ax.set_yscale("log")
     ax.set_xlabel("time [days]", fontsize=12)
     ax.set_ylabel("total mass", fontsize=12)
@@ -454,7 +483,8 @@ def main(argv: list[str] | None = None) -> int:
         f"D {base['white_matter_diffusivity']:g}, rho {base['rho']:g}, "
         f"ratio {base['diffusivity_ratio']:g}, "
         f"alpha {treatment['rt_alpha']:g}, beta {treatment['rt_beta']:g}, "
-        f"kill {treatment['chemo_kill_rate']:g}, decay {treatment['chemo_decay_rate']:g}"
+        f"kill {treatment['chemo_kill_rate']:g} /(mg/m^2), decay {treatment['chemo_decay_rate']:g}, "
+        f"TMZ {np.min(treatment['chemo_doses']):g}-{np.max(treatment['chemo_doses']):g} mg/m^2"
     )
     render(
         run_dir / "overview",

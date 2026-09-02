@@ -1,7 +1,7 @@
 {
   "_note": "Example Stupp-protocol run manifest.",
   "_clock": "Time specifications are in days: t=0 is the tumor seed, simulated growth time before surgery is resection.time, total iimulation time is resection.time + solver.time_after_resection.",
-  "_schedule": "seed (day 0) --> resection (day 100) --> recovery (days 100-114) --> 30 radiotherapy fractions on consecutive weekdays over 6 weeks (days 114-153, Monday = day 114), concomitant TMZ on the same 30 days --> growth (to day 200).",
+  "_schedule": "seed (day 0) --> resection (day 100) --> recovery (days 100-114) --> radiotherapy: 30 fractions on consecutive weekdays over 6 weeks (days 114-153, Monday = day 114); concomitant TMZ 75 mg/m^2 daily INCLUDING weekends over the same 6 weeks (days 114-155, 42 sessions) --> 4-week break --> adjuvant TMZ on days 1-5 of six 28-day cycles starting 4 weeks after the last fraction (day 181): days 181-185, 209-213, 237-241, 265-269, 293-297, 321-325; 150 mg/m^2 in cycle 1, 200 mg/m^2 in cycles 2-6 (72 sessions in total) --> growth to day 360 (35 days after the last dose).",
   "_paths": "NIfTI paths are absolute or relative to this file. The 'tissue' and 'solver' sections are optional; explicit CLI arguments of scripts/run_stupp_forward.py override them.",
   "tissue": {
     "wm": "/mnt/Drive4/lucas/SAILOR/processed/sub-15/ses-01/tissue_segmentation/wm_pbmap.nii.gz",
@@ -16,7 +16,7 @@
     "gaussian_seed_y_fraction": 0.5,
     "gaussian_seed_z_fraction": 0.5,
     "resolution_factor": 1.0,
-    "time_after_resection": 100.0,
+    "time_after_resection": 260.0,
     "steps_per_day": 12,
     "precision": "f32"
   },
@@ -26,9 +26,10 @@
     "cavity_label": 4
   },
   "chemotherapy": {
-    "_units": "kill_rate in 1/day per unit concentration, decay_rate in 1/day; each session deposits a unit concentration.",
-    "times": [114.0, 115.0, 116.0, 117.0, 118.0, 121.0, 122.0, 123.0, 124.0, 125.0, 128.0, 129.0, 130.0, 131.0, 132.0, 135.0, 136.0, 137.0, 138.0, 139.0, 142.0, 143.0, 144.0, 145.0, 146.0, 149.0, 150.0, 151.0, 152.0, 153.0],
-    "kill_rate": 0.47,
+    "_units": "times in days; doses in mg/m^2 (each session deposits a concentration equal to its dose); kill_rate in 1/day per mg/m^2 (PLACEHOLDER: the previous unit-concentration value 0.47 / 75 mg/m^2, so a 75 mg/m^2 session kills as before); decay_rate in 1/day (> 0).",
+    "times": [114.0, 115.0, 116.0, 117.0, 118.0, 119.0, 120.0, 121.0, 122.0, 123.0, 124.0, 125.0, 126.0, 127.0, 128.0, 129.0, 130.0, 131.0, 132.0, 133.0, 134.0, 135.0, 136.0, 137.0, 138.0, 139.0, 140.0, 141.0, 142.0, 143.0, 144.0, 145.0, 146.0, 147.0, 148.0, 149.0, 150.0, 151.0, 152.0, 153.0, 154.0, 155.0, 181.0, 182.0, 183.0, 184.0, 185.0, 209.0, 210.0, 211.0, 212.0, 213.0, 237.0, 238.0, 239.0, 240.0, 241.0, 265.0, 266.0, 267.0, 268.0, 269.0, 293.0, 294.0, 295.0, 296.0, 297.0, 321.0, 322.0, 323.0, 324.0, 325.0],
+    "doses": [75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 150.0, 150.0, 150.0, 150.0, 150.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0],
+    "kill_rate": 0.0062667,
     "decay_rate": 9.24
   },
   "radiotherapy": {
