@@ -1031,25 +1031,23 @@ class StuppFKPPSolver(BaseFKPPSolver):
         stopping_time = float(params["stopping_time"])
         shape = params["gray_matter_pbmap"].shape
 
-        resection_time = _validate_nonnegative_scalar(
-            params["resection_time"], "resection_time", name
-        )
+        resection_time = _validate_nonnegative_scalar(params, "resection_time", name)
         if resection_time > stopping_time:
             logger.warning(
                 f"{name}: resection_time={resection_time:g} lies beyond "
                 f"stopping_time={stopping_time:g} and will never fire."
             )
-        cavity = _validate_volume(params["resection_cavity"], "resection_cavity", shape, name)
+        cavity = _validate_volume(params, "resection_cavity", shape, name)
         if cavity.dtype != bool and not np.isin(cavity, (0, 1)).all():
             raise ValueError(
                 f"{name}: resection_cavity must be a binary (bool or 0/1) array."
             )
 
-        _validate_event_times(params["chemo_times"], "chemo_times", stopping_time, name)
-        _validate_nonnegative_scalar(params["chemo_kill_rate"], "chemo_kill_rate", name)
-        _validate_nonnegative_scalar(params["chemo_decay_rate"], "chemo_decay_rate", name)
+        _validate_event_times(params, "chemo_times", name)
+        _validate_nonnegative_scalar(params, "chemo_kill_rate", name)
+        _validate_nonnegative_scalar(params, "chemo_decay_rate", name)
 
-        rt_times = _validate_event_times(params["rt_times"], "rt_times", stopping_time, name)
+        rt_times = _validate_event_times(params, "rt_times", name)
         if rt_times.size < 1:
             raise ValueError(f"{name}: rt_times must contain at least one time.")
         if np.any(rt_times == 0):
@@ -1057,11 +1055,11 @@ class StuppFKPPSolver(BaseFKPPSolver):
                 f"{name}: rt_times contains 0, which lies in no step interval "
                 "(t0, t1] and will never fire."
             )
-        dose = _validate_volume(params["rt_dose"], "rt_dose", shape, name)
+        dose = _validate_volume(params, "rt_dose", shape, name)
         if not np.all(np.isfinite(dose)) or np.any(dose < 0):
             raise ValueError(f"{name}: rt_dose must be finite and nonnegative.")
-        _validate_nonnegative_scalar(params["rt_alpha"], "rt_alpha", name)
-        _validate_nonnegative_scalar(params["rt_beta"], "rt_beta", name)
+        _validate_nonnegative_scalar(params, "rt_alpha", name)
+        _validate_nonnegative_scalar(params, "rt_beta", name)
 
     def _prepare_input_fields(
         self,
