@@ -3,9 +3,8 @@
 treatment-extended ``StuppFKPPSolver`` (with its manifest loader
 ``treatment_params_from_manifest``).
 
-The device code is purely functional: each solver's step is a module-level
-function with a stable identity, so the jitted time scan's cache persists
-across solves (see ``operators._run_time_loop``).
+Each solver's time step is a module-level function with a stable identity,
+so the jitted time scan's cache persists across solves (see ``operators._run_time_loop``).
 """
 
 from __future__ import annotations
@@ -350,7 +349,6 @@ def _stupp_step(
     model (StuppFKPPSolver), followed by the discrete treatment events
     of the step.
 
-    The step advances t0 = step_index * dt to t1 = (step_index + 1) * dt.
     Both are computed as products (never accumulated), so the step
     intervals (t0, t1] partition the horizon exactly at the state dtype.
     In-step operation order:
@@ -965,17 +963,12 @@ _CHEMO_CONCENTRATION_SAMPLES: int = 10001
 class StuppFKPPSolver(BaseFKPPSolver):
     """
     Isotropic Fisher-KPP solver on WM/GM tissue maps, extended by the
-    treatment effects of a Stupp-type protocol: surgical resection,
+    treatment effects of a Stupp protocol: surgical resection,
     chemotherapy (CT) and radiotherapy (RT).
 
     State key: 'cell_density' (u in [0, 1]); grid in mm, time in days on
-    the ``stopping_time`` clock with the seed at t = 0. The untreated
-    dynamics deliberately mirror ``FKPPSolver``: the same WM/GM mixture
-    diffusivity D = white_matter_diffusivity * (wm_face + gm_face /
-    diffusivity_ratio) with faces masked by min_tissue_fraction, the same
-    logistic growth, seed, crop mask and stability formula (extended by the
-    chemotherapy kill rate), so that with all treatments disabled the
-    solver reproduces ``FKPPSolver``.
+    the ``stopping_time`` clock with the seed at t = 0. If all treatments
+    are disabled the solver reproduces ``FKPPSolver``.
 
     Continuous model (explicit Euler at the pre-step state, drug
     concentration evaluated at the step start t0)::
@@ -996,16 +989,6 @@ class StuppFKPPSolver(BaseFKPPSolver):
          diffusivities switch to a post-resection set in which every face
          touching a cavity voxel is zero (zero-flux Neumann on the cavity
          boundary).
-
-    The three treatments are individually optional (parameters default to
-    None); each group is all-or-nothing. Optionality is encoded in the
-    STRUCTURE of the device constants dict (a group's keys are present or
-    absent) and branched on with Python ``if`` in the step function: one
-    compile per treatment configuration (and per number of session
-    times), while the values (times, doses, rates) stay traced and never
-    trigger recompilation. Times that never fire within the horizon
-    (e.g. beyond stopping_time, or an rt_time of exactly 0, which lies in
-    no step interval) are warned about and otherwise ignored.
     """
 
     _REQUIRED: ClassVar[frozenset[str]] = frozenset(
