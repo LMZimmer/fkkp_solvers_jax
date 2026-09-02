@@ -64,7 +64,6 @@ from scipy.ndimage import center_of_mass, distance_transform_edt  # noqa: E402
 
 from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
 from fisher_kpp_jax.solvers import (  # noqa: E402
-    resolve_horizon,
     resolve_time_step,
     solver_params_from_manifest,
 )
@@ -371,10 +370,8 @@ def main(argv: list[str] | None = None) -> int:
     # the patient-data keys of the resection section (tumor_segmentation,
     # cavity_label) that resolve=True would demand.
     solver_params = resolve_time_step(
-        resolve_horizon(
-            solver_params_from_manifest(args.manifest, resolve=False),
-            float(treatment["resection_time"]),
-        )
+        solver_params_from_manifest(args.manifest, resolve=False),
+        float(treatment["resection_time"]),
     )
     seed_voxel = tuple(int(v) for v in args.seed_voxel)
     if not all(0 <= seed_voxel[i] < wm.shape[i] for i in range(3)):
@@ -393,10 +390,10 @@ def main(argv: list[str] | None = None) -> int:
         **solver_params,
         **seed_fractions,
     }
-    stopping_time = float(base["stopping_time"])
+    resection_time = float(treatment["resection_time"])
+    stopping_time = resection_time + float(base["time_after_resection"])
     n_steps = int(base["n_steps"])
     dt = stopping_time / n_steps
-    resection_time = float(treatment["resection_time"])
     print(f"run directory: {run_dir}")
     print(f"seed voxel {seed_voxel}, {n_steps} steps (dt={dt:.4g} d)")
 
@@ -404,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
     # StuppFKPPSolver reproduces up to that step).
     n_pre = int(round(resection_time / dt))
     wall = time.perf_counter()
-    pre = FKPPSolver({**base, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
+    untreated = {key: value for key, value in base.items() if key != "time_after_resection"}
+    pre = FKPPSolver({**untreated, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
     if not pre.success:
         raise RuntimeError(f"pre-resection solve failed: {pre.error}")
     wall_pre = time.perf_counter() - wall

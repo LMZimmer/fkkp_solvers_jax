@@ -34,12 +34,11 @@ skipped.
 
 Parameter precedence, lowest to highest: the script defaults below, the
 manifest's 'tissue' / 'solver' sections, explicit CLI arguments. The horizon
-and the time step are resolved after the merge, each from the
-highest-precedence layer that sets any key of its group: horizon =
---stopping-time / --time-after-resection (stopping_time = resection time +
-time after resection; default 100 days after the resection), time step =
---n-steps / --steps-per-day (default 12 steps per day), with the manifest's
-solver keys of the same names in between. The script defaults: rho, white
+is --time-after-resection (the run ends that many days after the resection;
+default 100). The time step is resolved after the merge from the
+highest-precedence layer that sets any key of its group: --n-steps /
+--steps-per-day (default 12 steps per day), with the manifest's solver keys
+of the same names in between. The script defaults: rho, white
 matter diffusivity and diffusivity ratio are the means of
 scripts/parameter_range.txt (previous inverse runs); seed position (image
 center) and pbmap paths are PLACEHOLDERS for the SAILOR subject.
@@ -77,7 +76,6 @@ from scipy.ndimage import center_of_mass  # noqa: E402
 
 from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
 from fisher_kpp_jax.solvers import (  # noqa: E402
-    resolve_horizon,
     resolve_time_step,
     solver_params_from_manifest,
     tissue_paths_from_manifest,
@@ -98,8 +96,8 @@ DEFAULT_SOLVER_PARAMS: dict[str, Any] = {
     "white_matter_diffusivity": 0.80021,  # mm^2/day, mean of parameter_range.txt
     "diffusivity_ratio": 227.35,  # 10^mean(log10 ratio) of parameter_range.txt
     "resolution_factor": 1.0,
-    "time_after_resection": 100.0,  # days; stopping_time = resection time + this
-    "steps_per_day": 12,  # dt = 1/12 day; n_steps = ceil(stopping_time * 12)
+    "time_after_resection": 100.0,  # days after the resection: the horizon
+    "steps_per_day": 12,  # dt = 1/12 day; n_steps = ceil(horizon * 12)
     "precision": "f32",
     "gaussian_seed_x_fraction": 0.5,  # of the grid extent, per axis
     "gaussian_seed_y_fraction": 0.5,
@@ -114,7 +112,6 @@ CLI_SOLVER_KNOBS: dict[str, str] = {
     "rho": "rho",
     "diffusivity": "white_matter_diffusivity",
     "resolution_factor": "resolution_factor",
-    "stopping_time": "stopping_time",
     "time_after_resection": "time_after_resection",
     "n_steps": "n_steps",
     "steps_per_day": "steps_per_day",
@@ -161,13 +158,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     knobs.add_argument("--resolution-factor", type=float, default=None)
     knobs.add_argument(
-        "--stopping-time", type=float, default=None, help="total horizon in days from the seed"
-    )
-    knobs.add_argument(
         "--time-after-resection",
         type=float,
         default=None,
-        help="horizon as days after the resection (overrides the manifest's horizon)",
+        help="horizon: the run ends this many days after the resection",
     )
     knobs.add_argument(
         "--n-steps",
@@ -267,25 +261,21 @@ def main(argv: list[str] | None = None) -> int:
     # The time step is kept unresolved (n_steps / dt / steps_per_day) until
     # the merge is complete: the highest-precedence layer that sets any of
     # the three wins as a whole, and only then is it translated to n_steps
-    # with the resolved stopping_time.
+    # with the horizon resection time + time_after_resection.
     manifest_solver = solver_params_from_manifest(args.manifest, resolve=False)
     cli_solver = {
         param: getattr(args, option)
         for option, param in CLI_SOLVER_KNOBS.items()
         if getattr(args, option) is not None
     }
-    key_groups = (
-        ("stopping_time", "time_after_resection"),
-        ("n_steps", "dt", "steps_per_day"),
-    )
+    time_step_keys = ("n_steps", "dt", "steps_per_day")
     merged: dict[str, Any] = {}
     for layer in (DEFAULT_SOLVER_PARAMS, manifest_solver, cli_solver):
-        for group in key_groups:
-            if any(key in layer for key in group):
-                for key in group:
-                    merged.pop(key, None)
+        if any(key in layer for key in time_step_keys):
+            for key in time_step_keys:
+                merged.pop(key, None)
         merged.update(layer)
-    merged = resolve_time_step(resolve_horizon(merged, treatment["resection_time"]))
+    merged = resolve_time_step(merged, treatment["resection_time"])
     n_snapshots = None if args.no_plot else int(args.n_snapshots)
     params: dict[str, Any] = {
         "voxel_size_mm": voxel_size,
@@ -356,7 +346,11 @@ def main(argv: list[str] | None = None) -> int:
         pre_points = [(0.0, float(result.initial_state["cell_density"].sum()))]
         n_pre = int(round(float(treatment["resection_time"]) / dt))
         if n_pre >= 1:
-            untreated = {key: value for key, value in params.items() if key not in treatment}
+            untreated = {
+                key: value
+                for key, value in params.items()
+                if key not in treatment and key != "time_after_resection"
+            }
             pre = FKPPSolver(
                 {
                     **untreated,

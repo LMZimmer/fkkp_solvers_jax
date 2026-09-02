@@ -315,10 +315,10 @@ def main(argv: list[str] | None = None) -> int:
         **solver_params,
         **seed_fractions,
     }
-    stopping_time = float(base["stopping_time"])
+    resection_time = float(treatment["resection_time"])
+    stopping_time = resection_time + float(base["time_after_resection"])
     n_steps = int(base["n_steps"])
     dt = stopping_time / n_steps
-    resection_time = float(treatment["resection_time"])
     print(f"run directory: {run_dir}")
     print(f"seed voxel {seed_voxel} (label {args.seed_label} CoM), slice z={z}, {n_steps} steps (dt={dt:.4g} d)")
 
@@ -326,7 +326,8 @@ def main(argv: list[str] | None = None) -> int:
     # StuppFKPPSolver reproduces up to that step).
     n_pre = int(round(resection_time / dt))
     wall = time.perf_counter()
-    pre = FKPPSolver({**base, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
+    untreated = {key: value for key, value in base.items() if key != "time_after_resection"}
+    pre = FKPPSolver({**untreated, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
     if not pre.success:
         raise RuntimeError(f"pre-resection solve failed: {pre.error}")
     wall_pre = time.perf_counter() - wall
