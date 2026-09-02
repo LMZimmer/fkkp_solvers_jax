@@ -217,6 +217,79 @@ def _validate_unit_interval(
             )
 
 
+def _validate_tissue_arrays(parameters: Mapping[str, Any], solver_name: str) -> None:
+    """Check that gray_matter_pbmap and white_matter_pbmap are 3D numpy
+    arrays of one shape."""
+    gm = parameters["gray_matter_pbmap"]
+    wm = parameters["white_matter_pbmap"]
+    if not (isinstance(gm, np.ndarray) and isinstance(wm, np.ndarray)):
+        raise ValueError(
+            f"{solver_name}: gray_matter_pbmap and white_matter_pbmap must be numpy arrays."
+        )
+    if not (gm.ndim == 3 and wm.ndim == 3):
+        raise ValueError(
+            f"{solver_name}: gray_matter_pbmap and white_matter_pbmap must be 3D arrays."
+        )
+    if gm.shape != wm.shape:
+        raise ValueError(
+            f"{solver_name}: gray_matter_pbmap and white_matter_pbmap shapes differ: "
+            f"{gm.shape} vs {wm.shape}."
+        )
+
+
+def _validate_nonnegative_scalar(
+    parameters: Mapping[str, Any], key: str, solver_name: str
+) -> float:
+    """Check that the named parameter is a finite scalar >= 0; return it as a float."""
+    value = parameters[key]
+    if not (np.isscalar(value) and np.isfinite(value) and value >= 0):
+        raise ValueError(
+            f"{solver_name}: {key} must be a finite nonnegative scalar, got {value!r}."
+        )
+    return float(value)
+
+
+def _validate_event_times(
+    parameters: Mapping[str, Any], key: str, solver_name: str
+) -> NDArray:
+    """
+    Check that the named parameter is a 1-D sequence of finite nonnegative
+    times; return it as a float64 array. Times beyond stopping_time are
+    legal but never fire; a warning names them.
+    """
+    times = np.asarray(parameters[key], dtype=np.float64)
+    if times.ndim != 1:
+        raise ValueError(f"{solver_name}: {key} must be a 1-D sequence of times.")
+    if not np.all(np.isfinite(times)) or np.any(times < 0):
+        raise ValueError(f"{solver_name}: {key} must be finite and nonnegative.")
+    stopping_time = float(parameters["stopping_time"])
+    late = times[times > stopping_time]
+    if late.size:
+        logger.warning(
+            f"{solver_name}: {key} contains {late.size} time(s) beyond "
+            f"stopping_time={stopping_time:g} that will never fire: {late.tolist()}."
+        )
+    return times
+
+
+def _validate_volume(
+    parameters: Mapping[str, Any], key: str, shape: tuple[int, ...], solver_name: str
+) -> NDArray:
+    """Check that the named parameter is a 3D numpy array of the given
+    (tissue map) shape; return it."""
+    value = parameters[key]
+    if not isinstance(value, np.ndarray):
+        raise ValueError(f"{solver_name}: {key} must be a numpy array.")
+    if value.ndim != 3:
+        raise ValueError(f"{solver_name}: {key} must be a 3D array.")
+    if value.shape != shape:
+        raise ValueError(
+            f"{solver_name}: {key} shape {value.shape} differs from the tissue map "
+            f"shape {shape}."
+        )
+    return value
+
+
 class BaseFKPPSolver(ABC):
     """
     Base class implementing the shared solve() pipeline as a template method.

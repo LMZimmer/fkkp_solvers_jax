@@ -22,7 +22,14 @@ from loguru import logger
 from numpy.typing import NDArray
 from scipy.ndimage import binary_dilation
 
-from .base import BaseFKPPSolver, _SharedConstants
+from .base import (
+    BaseFKPPSolver,
+    _SharedConstants,
+    _validate_event_times,
+    _validate_nonnegative_scalar,
+    _validate_tissue_arrays,
+    _validate_volume,
+)
 from .operators import (
     GAUSSIAN_SEED_DIFFUSION_TIME,
     GAUSSIAN_SEED_FLOOR,
@@ -177,18 +184,6 @@ class _StuppConstants(_SharedConstants, _StuppSpecificConstants):
     the ``_SharedConstants`` keys plus the ``_StuppSpecificConstants`` keys
     in one dict.
     """
-
-
-def _validate_tissue_arrays(gm: NDArray, wm: NDArray) -> None:
-    if not (isinstance(gm, np.ndarray) and isinstance(wm, np.ndarray)):
-        raise ValueError("gray_matter_pbmap and white_matter_pbmap must be numpy arrays.")
-    if not (gm.ndim == 3 and wm.ndim == 3):
-        raise ValueError("gray_matter_pbmap and white_matter_pbmap must be 3D arrays.")
-    if gm.shape != wm.shape:
-        raise ValueError(
-            "gray_matter_pbmap and white_matter_pbmap shapes differ: "
-            f"{gm.shape} vs {wm.shape}."
-        )
 
 
 def _mixture_face_fields(
@@ -516,7 +511,7 @@ class FKPPSolver(BaseFKPPSolver):
     _wm_lowres: NDArray
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
-        _validate_tissue_arrays(params["gray_matter_pbmap"], params["white_matter_pbmap"])
+        _validate_tissue_arrays(params, type(self).__name__)
 
     def _prepare_input_fields(
         self,
@@ -620,7 +615,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
     _wm_lowres: NDArray
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
-        _validate_tissue_arrays(params["gray_matter_pbmap"], params["white_matter_pbmap"])
+        _validate_tissue_arrays(params, type(self).__name__)
 
     def _prepare_input_fields(
         self,
@@ -1032,63 +1027,27 @@ class StuppFKPPSolver(BaseFKPPSolver):
 
     def _validate_extra(self, params: Mapping[str, Any]) -> None:
         name = type(self).__name__
-        gm = params["gray_matter_pbmap"]
-        wm = params["white_matter_pbmap"]
-        _validate_tissue_arrays(gm, wm)
+        _validate_tissue_arrays(params, name)
         stopping_time = float(params["stopping_time"])
+        shape = params["gray_matter_pbmap"].shape
 
-        def check_times(key: str) -> NDArray:
-            times = np.asarray(params[key], dtype=np.float64)
-            if times.ndim != 1:
-                raise ValueError(f"{name}: {key} must be a 1-D sequence of times.")
-            if not np.all(np.isfinite(times)) or np.any(times < 0):
-                raise ValueError(f"{name}: {key} must be finite and nonnegative.")
-            late = times[times > stopping_time]
-            if late.size:
-                logger.warning(
-                    f"{name}: {key} contains {late.size} time(s) beyond "
-                    f"stopping_time={stopping_time:g} that will never fire: "
-                    f"{late.tolist()}."
-                )
-            return times
-
-        def check_rate(key: str) -> None:
-            value = params[key]
-            if not (np.isscalar(value) and np.isfinite(value) and value >= 0):
-                raise ValueError(
-                    f"{name}: {key} must be a finite nonnegative scalar, got "
-                    f"{value!r}."
-                )
-
-        def check_volume(key: str) -> NDArray:
-            value = params[key]
-            if not isinstance(value, np.ndarray):
-                raise ValueError(f"{name}: {key} must be a numpy array.")
-            if value.ndim != 3:
-                raise ValueError(f"{name}: {key} must be a 3D array.")
-            if value.shape != gm.shape:
-                raise ValueError(
-                    f"{name}: {key} shape {value.shape} differs from the "
-                    f"tissue map shape {gm.shape}."
-                )
-            return value
-
-        check_rate("resection_time")
-        if float(params["resection_time"]) > stopping_time:
+        resection_time = _validate_nonnegative_scalar(params, "resection_time", name)
+        if resection_time > stopping_time:
             logger.warning(
-                f"{name}: resection_time={float(params['resection_time']):g} "
-                f"lies beyond stopping_time={stopping_time:g} and will never "
-                "fire."
+                f"{name}: resection_time={resection_time:g} lies beyond "
+                f"stopping_time={stopping_time:g} and will never fire."
             )
-        cavity = check_volume("resection_cavity")
+        cavity = _validate_volume(params, "resection_cavity", shape, name)
         if cavity.dtype != bool and not np.isin(cavity, (0, 1)).all():
             raise ValueError(
                 f"{name}: resection_cavity must be a binary (bool or 0/1) array."
             )
-        check_times("chemo_times")
-        check_rate("chemo_kill_rate")
-        check_rate("chemo_decay_rate")
-        rt_times = check_times("rt_times")
+
+        _validate_event_times(params, "chemo_times", name)
+        _validate_nonnegative_scalar(params, "chemo_kill_rate", name)
+        _validate_nonnegative_scalar(params, "chemo_decay_rate", name)
+
+        rt_times = _validate_event_times(params, "rt_times", name)
         if rt_times.size < 1:
             raise ValueError(f"{name}: rt_times must contain at least one time.")
         if np.any(rt_times == 0):
@@ -1096,11 +1055,11 @@ class StuppFKPPSolver(BaseFKPPSolver):
                 f"{name}: rt_times contains 0, which lies in no step interval "
                 "(t0, t1] and will never fire."
             )
-        dose = check_volume("rt_dose")
+        dose = _validate_volume(params, "rt_dose", shape, name)
         if not np.all(np.isfinite(dose)) or np.any(dose < 0):
             raise ValueError(f"{name}: rt_dose must be finite and nonnegative.")
-        check_rate("rt_alpha")
-        check_rate("rt_beta")
+        _validate_nonnegative_scalar(params, "rt_alpha", name)
+        _validate_nonnegative_scalar(params, "rt_beta", name)
 
     def _prepare_input_fields(
         self,
