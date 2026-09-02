@@ -29,3 +29,6 @@ htmlcov/
 # NIfTI volumes (solver outputs; tracked reference inputs are unaffected)
 *.nii
 *.nii.gz
+
+# Run outputs (sweeps, forward solves)
+runs/

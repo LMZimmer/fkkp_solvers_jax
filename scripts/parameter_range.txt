@@ -1,0 +1,15 @@
+# Parameter ranges of previous (GliODIL-style) inverse runs, translated to the
+# fisher_kpp_jax nomenclature. Column 'source' is the original parameter name.
+# The means are the defaults of scripts/stupp_manifest_example.json.
+#
+idx param                      source                 mean        std        min        max     n  note
+  0 white_matter_diffusivity   D                   0.80021    0.45375  0.0071209     2.1329   242  mm^2/day
+  1 rho                        f                  0.075777   0.030016  0.0089228     0.3449   242  1/day
+  2 gaussian_seed_x_fraction   x0                        -          -          -          -   239  patient-specific voxel coords in the source (mean 45.697, std 16.542, min 11.345, max 133); default 0.5 = image center
+  3 gaussian_seed_y_fraction   y0                        -          -          -          -   239  patient-specific voxel coords in the source (mean 60.753, std 22.396, min 11.551, max 144.31); default 0.5 = image center
+  4 gaussian_seed_z_fraction   z0                        -          -          -          -   239  patient-specific voxel coords in the source (mean 44.637, std 12.033, min 10.305, max 82.099); default 0.5 = image center
+  5 (ignored)                  s                         1          0          1          1   242  no counterpart in fisher_kpp_jax
+  6 (no solver parameter)      th_up               0.59795   0.087593    0.49657    0.85018   242  segmentation threshold (enhancing core), see scripts/run_reference_solves.py
+  7 (no solver parameter)      th_down             0.29291   0.086608    0.18579    0.50194   242  segmentation threshold (edema), see scripts/run_reference_solves.py
+  8 diffusivity_ratio          log10(Dw_ratio)      227.35          -     10.051     743.02   242  10^x of the source's log10 statistics (mean 2.3567, std 0.31968, min 1.0022, max 2.871); mean = geometric mean
+  9 (no solver parameter)      pet_bkg_lvl             0.3          0        0.3        0.3   242  PET background level of the source pipeline

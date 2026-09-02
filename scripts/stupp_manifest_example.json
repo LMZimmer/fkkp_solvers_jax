@@ -1,21 +1,42 @@
 {
-  "_note": "Example Stupp-protocol treatment manifest. All numeric values are PLACEHOLDERS - review before scientific use.",
-  "_schedule": "Resection at day 10 (seed = day 0); RT 30 fractions on consecutive weekdays over 6 weeks starting day 24 (2 weeks post-op); concomitant TMZ on the same 30 days (simplified: TMZ is given daily in the real protocol). NIfTI paths are absolute or relative to this file.",
-  "_units": "times in days on the solver clock (t=0 = seed), kill_rate and decay_rate in 1/day, dose NIfTI in Gy (TOTAL over all fractions; per-fraction dose = dose/len(times)), alpha in 1/Gy, beta in 1/Gy^2.",
+  "_note": "Example Stupp-protocol run manifest. All numeric values are PLACEHOLDERS - review before scientific use.",
+  "_clock": "All times are days on the solver clock: t=0 is the tumor seed, so the simulated growth time before surgery is resection.time itself; the run ends at resection.time + solver.time_after_resection (alternatively give solver.stopping_time, the total horizon from the seed).",
+  "_schedule": "seed (day 0) --100 days growth--> resection (day 100) --recovery--> RT 30 fractions on consecutive weekdays over 6 weeks, days 114-153 (Mon = day 114, 2 weeks post-op), concomitant TMZ on the same 30 days (simplified: TMZ is given daily in the real protocol) --> follow-up growth to day 200.",
+  "_paths": "NIfTI paths are absolute or relative to this file. The 'tissue' and 'solver' sections are optional; explicit CLI arguments of scripts/run_stupp_forward.py override them.",
+  "_parameter_ranges": "rho, white_matter_diffusivity and diffusivity_ratio are the means of scripts/parameter_range.txt (previous inverse runs; diffusivity_ratio = 10^mean(log10 ratio)). Not solver parameters, recorded for reference only: th_up 0.59795, th_down 0.29291 (segmentation thresholds), pet_bkg_lvl 0.3.",
+  "tissue": {
+    "wm": "/mnt/Drive4/lucas/SAILOR/processed/sub-15/ses-01/tissue_segmentation/wm_pbmap.nii.gz",
+    "gm": "/mnt/Drive4/lucas/SAILOR/processed/sub-15/ses-01/tissue_segmentation/gm_pbmap.nii.gz"
+  },
+  "solver": {
+    "_units": "rho in 1/day, white_matter_diffusivity in mm^2/day, times in days; the horizon is set by exactly one of time_after_resection or stopping_time; the time step by exactly one of steps_per_day, dt (days) or n_steps (steps_per_day / dt are translated to n_steps = ceil(stopping_time / dt)); none of them selects the stability formula. Any other scalar StuppFKPPSolver parameter may be set here under its solver name (e.g. gaussian_seed_mass, min_tissue_fraction, stopping_threshold).",
+    "rho": 0.075777,
+    "white_matter_diffusivity": 0.80021,
+    "diffusivity_ratio": 227.35,
+    "gaussian_seed_x_fraction": 0.5,
+    "gaussian_seed_y_fraction": 0.5,
+    "gaussian_seed_z_fraction": 0.5,
+    "resolution_factor": 1.0,
+    "time_after_resection": 100.0,
+    "steps_per_day": 12,
+    "precision": "f32"
+  },
   "resection": {
-    "time": 10.0,
-    "tumor_segmentation": "/mnt/Drive4/lucas/SAILOR/processed/sub-01/ses-03/longitudinal/recurrence_preop.nii.gz",
+    "time": 100.0,
+    "tumor_segmentation": "/mnt/Drive4/lucas/SAILOR/processed/sub-15/ses-03/longitudinal/recurrence_preop.nii.gz",
     "cavity_label": 4
   },
   "chemotherapy": {
-    "times": [24.0, 25.0, 26.0, 27.0, 28.0, 31.0, 32.0, 33.0, 34.0, 35.0, 38.0, 39.0, 40.0, 41.0, 42.0, 45.0, 46.0, 47.0, 48.0, 49.0, 52.0, 53.0, 54.0, 55.0, 56.0, 59.0, 60.0, 61.0, 62.0, 63.0],
-    "kill_rate": 0.05,
-    "decay_rate": 1.0
+    "_units": "kill_rate in 1/day per unit concentration, decay_rate in 1/day; each session deposits a unit concentration.",
+    "times": [114.0, 115.0, 116.0, 117.0, 118.0, 121.0, 122.0, 123.0, 124.0, 125.0, 128.0, 129.0, 130.0, 131.0, 132.0, 135.0, 136.0, 137.0, 138.0, 139.0, 142.0, 143.0, 144.0, 145.0, 146.0, 149.0, 150.0, 151.0, 152.0, 153.0],
+    "kill_rate": 0.47,
+    "decay_rate": 9.24
   },
   "radiotherapy": {
-    "times": [24.0, 25.0, 26.0, 27.0, 28.0, 31.0, 32.0, 33.0, 34.0, 35.0, 38.0, 39.0, 40.0, 41.0, 42.0, 45.0, 46.0, 47.0, 48.0, 49.0, 52.0, 53.0, 54.0, 55.0, 56.0, 59.0, 60.0, 61.0, 62.0, 63.0],
-    "dose": "/mnt/Drive4/lucas/SAILOR/processed/sub-01/ses-03/longitudinal/dose_warped_longitudinal.nii.gz",
-    "alpha": 0.1,
-    "beta": 0.01
+    "_units": "dose NIfTI in Gy, TOTAL over all fractions (per-fraction dose = dose / len(times)); alpha in 1/Gy, beta in 1/Gy^2.",
+    "times": [114.0, 115.0, 116.0, 117.0, 118.0, 121.0, 122.0, 123.0, 124.0, 125.0, 128.0, 129.0, 130.0, 131.0, 132.0, 135.0, 136.0, 137.0, 138.0, 139.0, 142.0, 143.0, 144.0, 145.0, 146.0, 149.0, 150.0, 151.0, 152.0, 153.0],
+    "dose": "/mnt/Drive4/lucas/SAILOR/processed/sub-15/ses-03/longitudinal/dose_warped_longitudinal.nii.gz",
+    "alpha": 0.06,
+    "beta": 0.006
   }
 }

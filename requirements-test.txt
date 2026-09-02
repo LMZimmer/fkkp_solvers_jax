@@ -2,7 +2,8 @@
 # imported for the comparison tests. NOT dependencies of fisher_kpp_jax.
 torch==2.13.0+cpu  # --index-url https://download.pytorch.org/whl/cpu
 
-# For scripts/run_stupp_forward.py (the overview.png montage). Scripts-only,
+# For scripts/run_stupp_forward.py (the overview.png montage) and
+# scripts/analyze_sweep_sensitivity.py (the sensitivity figures). Scripts-only,
 # imported inside the script; NOT a dependency of fisher_kpp_jax. (nibabel,
 # which the scripts also use, is a runtime dependency of fisher_kpp_jax
 # since the treatment-manifest loader and is pinned in requirements.txt.)
