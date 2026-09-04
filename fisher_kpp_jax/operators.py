@@ -597,7 +597,7 @@ def _run_time_loop(
     quantity_func: Callable[..., jax.Array],
     guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
     n_steps: int,
-    n_snapshots: int | None,
+    record_steps: NDArray,
 ) -> dict[str, Any]:
     """
     Prepare the host-side inputs and call the time scan (jitted loop).
@@ -640,18 +640,14 @@ def _run_time_loop(
         quantity_func: Stopping-quantity function, see above.
         guard_func: Post-step guard function, see above.
         n_steps: Number of time steps.
-        n_snapshots: Number of snapshots to record, evenly spaced over the
-            steps; None records nothing. Duplicate step indices (more
-            snapshots than steps) collapse into a single slot.
+        record_steps: Step indices in [0, n_steps) after which a snapshot
+            of the state is recorded, in ascending order; empty records
+            nothing. The frame of step s holds the state after that step.
 
     Returns:
         The final scan carry, see ``_run_time_scan``.
     """
-    if n_snapshots is None:
-        record_steps = np.empty(0, dtype=np.int64)
-    else:
-        record_steps = np.linspace(0, n_steps - 1, n_snapshots, dtype=np.int64)
-    slot_steps = np.unique(record_steps)
+    slot_steps = np.unique(np.asarray(record_steps, dtype=np.int64))
     n_slots = int(slot_steps.size)
     slot_ids = np.full(n_steps, -1, dtype=np.int32)
     if n_slots:

@@ -104,14 +104,6 @@ def treatment_params(shape: tuple[int, int, int], **overrides) -> dict:
     return params
 
 
-def snapshot_times(solver: StuppFKPPSolver, n_snapshots: int) -> np.ndarray:
-    """Simulation times of the recorded frames: a frame scheduled at step s
-    holds the state after that step, i.e. at (s + 1) * dt."""
-    n_steps, dt = solver._resolve_time_stepping()
-    steps = np.unique(np.linspace(0, n_steps - 1, n_snapshots, dtype=np.int64))
-    return (steps + 1) * dt
-
-
 def lowres_seed_mass(solver: StuppFKPPSolver) -> float:
     """voxel_volume * sum of the seed on the low-resolution grid (the mass
     the stopping quantity starts from), available after a solve."""
@@ -127,7 +119,7 @@ def test_neutral_treatment_equals_fkpp(tissue_phantom):
     evaluated, so the compiled arithmetic is not identical; the observed
     difference is ~1e-16 relative)."""
     gm, wm = tissue_phantom
-    params = base_params(gm, wm, n_time_series_snapshots=3)
+    params = base_params(gm, wm, snapshot_times=[3.0, 6.0, 10.0])
     untreated = {k: v for k, v in params.items() if k not in neutral_treatment_params(gm.shape)}
     reference = FKPPSolver({**untreated, "stopping_time": HORIZON}).solve()
     result = StuppFKPPSolver(params).solve()
@@ -258,7 +250,6 @@ def test_resection_projection_and_isolation(tissue_phantom):
     (but is below the seed mass, which the projection reduced)."""
     gm, wm = tissue_phantom
     cavity = off_center_cavity(gm.shape)
-    n_snapshots = 6
     params = base_params(
         gm,
         wm,
@@ -267,13 +258,13 @@ def test_resection_projection_and_isolation(tissue_phantom):
         resection_time=0.0,
         time_after_resection=HORIZON,
         resection_cavity=cavity,
-        n_time_series_snapshots=n_snapshots,
+        snapshot_times=np.linspace(0, HORIZON, 6),
     )
     solver = StuppFKPPSolver(params)
     result = solver.solve()
     assert result.success, result.error
     frames = result.time_series["cell_density"]
-    times = snapshot_times(solver, n_snapshots)
+    times = result.snapshot_times
     assert frames.shape[0] == times.size
     for frame, t in zip(frames, times):
         assert t >= params["resection_time"]
@@ -293,7 +284,6 @@ def test_resection_mid_run(tissue_phantom):
     at or after it are zero there."""
     gm, wm = tissue_phantom
     cavity = off_center_cavity(gm.shape)
-    n_snapshots = 8
     params = base_params(
         gm,
         wm,
@@ -301,13 +291,13 @@ def test_resection_mid_run(tissue_phantom):
         resection_time=5.0,
         time_after_resection=HORIZON - 5.0,
         resection_cavity=cavity,
-        n_time_series_snapshots=n_snapshots,
+        snapshot_times=np.linspace(0, HORIZON, 8),
     )
     solver = StuppFKPPSolver(params)
     result = solver.solve()
     assert result.success, result.error
     frames = result.time_series["cell_density"]
-    times = snapshot_times(solver, n_snapshots)
+    times = result.snapshot_times
     before = times < params["resection_time"]
     assert before.any() and (~before).any()
     assert np.any(frames[before][:, cavity] > 0)
@@ -329,7 +319,7 @@ def test_events_beyond_horizon_are_inert(tissue_phantom):
         "rt_times": np.array([25.0, 26.0]),
         "rt_dose": full["rt_dose"],
     }
-    params = base_params(gm, wm, n_time_series_snapshots=3)
+    params = base_params(gm, wm, snapshot_times=[3.0, 6.0, 10.0])
     reference = StuppFKPPSolver(params).solve()
     result = StuppFKPPSolver({**params, **late}).solve()
     assert reference.success and result.success

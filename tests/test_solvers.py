@@ -19,6 +19,7 @@ from fisher_kpp_jax import (
     TwoCompartmentWithNutrientFKPPSolver,
 )
 from fisher_kpp_jax import operators
+from loguru import logger
 
 # f64 keeps the invariant checks tight; the f32 path is covered by
 # test_f32_vs_f64_agreement and the (default-precision) retrace test.
@@ -103,7 +104,7 @@ def assert_successful_time_solve(result, state_keys: set[str], full_shape: tuple
 
 def test_fkpp_short_solve(tissue_phantom):
     gm, wm = tissue_phantom
-    params = fk_params(gm, wm, n_time_series_snapshots=4)
+    params = fk_params(gm, wm, snapshot_times=[2.5, 5.0, 7.5, 10.0])
     result = FKPPSolver(params).solve()
     assert_successful_time_solve(result, {"cell_density"}, gm.shape)
     assert result.final_time == params["stopping_time"]
@@ -120,7 +121,7 @@ def test_fkpp_short_solve(tissue_phantom):
 
 def test_two_compartment_short_solve(tissue_phantom):
     gm, wm = tissue_phantom
-    params = two_compartment_params(gm, wm, n_time_series_snapshots=3)
+    params = two_compartment_params(gm, wm, snapshot_times=[3.0, 6.0, 10.0])
     result = TwoCompartmentWithNutrientFKPPSolver(params).solve()
     keys = {"proliferative", "necrotic", "nutrient"}
     assert_successful_time_solve(result, keys, gm.shape)
@@ -139,7 +140,7 @@ def test_two_compartment_short_solve(tissue_phantom):
 
 
 def test_dti_short_solve(tensor_phantom):
-    params = dti_params(tensor_phantom, n_time_series_snapshots=3)
+    params = dti_params(tensor_phantom, snapshot_times=[3.0, 6.0, 10.0])
     result = AnisotropicFKPPSolver(params).solve()
     full_shape = tensor_phantom.shape[:3]
     assert_successful_time_solve(result, {"cell_density"}, full_shape)
@@ -171,7 +172,7 @@ def test_stopping_threshold_early_exit(tissue_phantom):
     snapshots scheduled after the crossing are dropped."""
     gm, wm = tissue_phantom
     params = fk_params(
-        gm, wm, stopping_time=40, n_time_series_snapshots=6, stopping_threshold=300.0
+        gm, wm, stopping_time=40, snapshot_times=np.linspace(0, 40, 6), stopping_threshold=300.0
     )
     solver = FKPPSolver(params)
     result = solver.solve()
@@ -185,6 +186,8 @@ def test_stopping_threshold_early_exit(tissue_phantom):
     assert abs(n_taken - round(n_taken)) < 1e-6
     for frames in result.time_series.values():
         assert 0 < frames.shape[0] < 6  # truncated by the early exit
+    assert result.snapshot_times.size == result.time_series["cell_density"].shape[0]
+    assert np.all(result.snapshot_times <= result.final_time)
 
 
 def test_n_steps_override(tissue_phantom):
@@ -216,20 +219,64 @@ def test_dti_guard_exit(tensor_phantom):
 
 
 def test_time_series_recording(tissue_phantom):
-    """All requested snapshots are recorded on a full run, and the last one
-    (scheduled at the final step) equals the final state exactly."""
+    """All requested snapshot days are recorded on a full run, each at the
+    nearest step end (within half a step), and the one at the horizon equals
+    the final state exactly."""
     gm, wm = tissue_phantom
-    params = fk_params(gm, wm, n_time_series_snapshots=5)
-    result = FKPPSolver(params).solve()
+    days = [2.0, 4.0, 6.0, 8.0, 10.0]
+    solver = FKPPSolver(fk_params(gm, wm, snapshot_times=days))
+    result = solver.solve()
     frames = result.time_series["cell_density"]
     assert frames.shape[0] == 5
+    _, dt = solver._resolve_time_stepping()
+    np.testing.assert_allclose(result.snapshot_times, days, atol=dt / 2)
     np.testing.assert_array_equal(frames[-1], result.final_state["cell_density"])
+
+
+def test_snapshot_times_mapping(tissue_phantom):
+    """A day maps to the step whose end time is nearest (a day below one
+    step to the first step); days sharing a step give one frame; days
+    beyond the horizon are dropped with a warning."""
+    gm, wm = tissue_phantom
+    days = [0.0, 0.02, 0.13, 0.15, 0.17, 10.0, 12.0]  # dt = 0.05
+    messages: list[str] = []
+    handler_id = logger.add(messages.append, level="WARNING", format="{message}")
+    try:
+        solver = FKPPSolver(fk_params(gm, wm, n_steps=200, snapshot_times=days))
+        result = solver.solve()
+    finally:
+        logger.remove(handler_id)
+    assert result.success
+    np.testing.assert_allclose(result.snapshot_times, [0.05, 0.15, 10.0])
+    assert result.time_series["cell_density"].shape == (3, *gm.shape)
+    np.testing.assert_array_equal(
+        result.time_series["cell_density"][-1], result.final_state["cell_density"]
+    )
+    assert len(messages) == 1 and "beyond the horizon" in messages[0] and "12.0" in messages[0]
+    # Unsorted input is recorded in time order; every day dropped gives
+    # empty frames rather than None.
+    result = FKPPSolver(fk_params(gm, wm, snapshot_times=[8.0, 4.0])).solve()
+    assert result.snapshot_times[0] < result.snapshot_times[1]
+    result = FKPPSolver(fk_params(gm, wm, snapshot_times=[11.0])).solve()
+    assert result.time_series["cell_density"].shape == (0, *gm.shape)
+    assert result.snapshot_times.size == 0
+
+
+def test_snapshot_times_validation(tissue_phantom):
+    gm, wm = tissue_phantom
+    with pytest.raises(ValueError, match="1-D"):
+        FKPPSolver(fk_params(gm, wm, snapshot_times=[[1.0, 2.0]]))
+    with pytest.raises(ValueError, match="nonnegative"):
+        FKPPSolver(fk_params(gm, wm, snapshot_times=[-1.0]))
+    with pytest.raises(ValueError, match="finite"):
+        FKPPSolver(fk_params(gm, wm, snapshot_times=[np.inf]))
 
 
 def test_no_time_series_by_default(tissue_phantom):
     gm, wm = tissue_phantom
     result = FKPPSolver(fk_params(gm, wm)).solve()
     assert result.time_series is None
+    assert result.snapshot_times is None
 
 
 def test_seed_outside_tissue_errors(tissue_phantom):

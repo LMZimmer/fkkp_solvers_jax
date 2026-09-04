@@ -2,13 +2,11 @@
 """Run the example Stupp-protocol manifest on the SAILOR subject and render
 the treatment course as a figure.
 
-Two solves of fisher_kpp_jax.StuppFKPPSolver with the manifest's parameters
+One solve of fisher_kpp_jax.StuppFKPPSolver with the manifest's parameters
 (scripts/stupp_manifest_example.json by default; it must name the tissue
-maps, the cavity segmentation and the dose map):
-
-  1. seed -> resection time with no event firing (the state just BEFORE
-     the resection),
-  2. the full treated horizon with evenly spaced snapshots (--n-snapshots).
+maps, the cavity segmentation, the dose map and the time step), recording
+the state at the eight montage days below plus --n-snapshots evenly spaced
+days that sample the mass curve.
 
 The seed is placed at the center of mass of one label of the manifest's
 cavity segmentation (--seed-label, default 3 = enhancing core), replacing the
@@ -16,11 +14,11 @@ manifest's seed fractions. The figure shows, on the axial slice through the
 dose map's center of mass (or --slice-z), the T1c image with the cell
 density overlaid in the style of PredictGBM's multislice plots
 (np.rot90 orientation, inferno overlay, densities below --threshold
-transparent), three by three: the seed, the state before and one day after
-the resection; three evenly spaced times inside the radiotherapy block;
-three evenly spaced times from its end to the end of the run. Each is the
-recorded snapshot nearest to its time. The cavity outline and the seed
-voxel are marked. A total-mass-vs-time panel with the treatment events marked sits
+transparent), three by three: the seed, one step before and one day after
+the resection; three evenly spaced days inside the radiotherapy block;
+three evenly spaced days from its end to the end of the run (each recorded
+at the nearest time step). The cavity outline and the seed voxel are
+marked. A total-mass-vs-time panel with the treatment events marked sits
 below. Written into <output-dir>/<run-name>/ (exist_ok=False, nothing
 outside it): overview.png, overview.pdf and run_summary.json (parameters,
 seed voxel, slice, snapshot times and masses, wall times).
@@ -53,7 +51,7 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
 
-from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
+from fisher_kpp_jax import StuppFKPPSolver  # noqa: E402
 from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: E402
 
 DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
@@ -90,7 +88,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--slice-z", type=int, default=None, help="axial slice (default: dose-map center of mass)"
     )
     parser.add_argument(
-        "--n-snapshots", type=int, default=25, help="evenly spaced snapshots of the treated run"
+        "--n-snapshots",
+        type=int,
+        default=25,
+        help="evenly spaced snapshot days sampling the mass curve (default 25)",
     )
     parser.add_argument(
         "--threshold", type=float, default=0.01, help="cell density below which the overlay is transparent"
@@ -122,55 +123,47 @@ def scalar_params(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def snapshot_steps(n_steps: int, n_snapshots: int) -> np.ndarray:
-    """Recording schedule of operators._run_time_loop."""
-    return np.unique(np.linspace(0, n_steps - 1, n_snapshots, dtype=np.int64))
+def montage_days(
+    resection_time: float, dt: float, rt_times: np.ndarray, stopping_time: float
+) -> list[float]:
+    """
+    Days of the eight recorded montage panels (the seed is the initial
+    state): one step before and one day after the resection; three evenly
+    spaced days inside the radiotherapy block (first to last fraction,
+    endpoints excluded); three evenly spaced days from the last fraction to
+    the end of the run, the end included. Passed as the solver's
+    snapshot_times, so each frame is recorded at the nearest time step.
+    """
+    rt_start, rt_end = float(np.min(rt_times)), float(np.max(rt_times))
+    return [
+        resection_time - dt,
+        resection_time + 1.0,
+        *np.linspace(rt_start, rt_end, 5)[1:-1],
+        *np.linspace(rt_end, stopping_time, 4)[1:],
+    ]
 
 
 def select_panels(
-    initial: np.ndarray,
-    frames: np.ndarray,
-    times: np.ndarray,
-    pre_resection: tuple[float, np.ndarray],
-    resection_time: float,
-    rt_times: np.ndarray,
+    initial: np.ndarray, frames: np.ndarray, times: np.ndarray, days: list[float]
 ) -> list[tuple[str, np.ndarray]]:
     """
-    The nine montage panels, three per row. Apart from the first two, each
-    is the recorded frame nearest to its target time (frames repeat when
-    the snapshots are coarser than the targets):
-
-      row 1: the seed (t = 0), the state just before the resection, one day
-             after the resection;
-      row 2: three evenly spaced times inside the radiotherapy block (first
-             to last fraction, endpoints excluded);
-      row 3: three evenly spaced times from the last fraction to the end of
-             the run, the end included.
+    The nine montage panels, three per row: the seed, then for each of
+    the ``montage_days`` the recorded frame nearest to it.
 
     Args:
         initial: Initial state (t = 0).
         frames: Recorded frames of the treated run, (n_frames, ...).
-        times: Simulation time of each frame.
-        pre_resection: (time, state) just before the resection.
-        resection_time: Resection time.
-        rt_times: Radiotherapy fraction times.
+        times: Simulation day of each frame (Result.snapshot_times).
+        days: The eight montage days the frames were recorded for.
 
     Returns:
         (title, volume) pairs.
     """
-
-    def nearest(label: str, t: float) -> tuple[str, np.ndarray]:
-        k = int(np.argmin(np.abs(times - t)))
-        return f"t = {times[k]:.0f} d{label}", frames[k]
-
-    rt_start, rt_end = float(np.min(rt_times)), float(np.max(rt_times))
-    panels = [
-        ("t = 0 d (seed)", initial),
-        (f"t = {pre_resection[0]:.0f} d (before resection)", pre_resection[1]),
-        nearest(" (after resection)", resection_time + 1.0),
-    ]
-    panels += [nearest(" (RT/TMZ)", t) for t in np.linspace(rt_start, rt_end, 5)[1:-1]]
-    panels += [nearest("", t) for t in np.linspace(rt_end, float(times[-1]), 4)[1:]]
+    labels = [" (before resection)", " (after resection)", *[" (RT/TMZ)"] * 3, *[""] * 3]
+    panels = [("t = 0 d (seed)", initial)]
+    for day, label in zip(days, labels, strict=True):
+        k = int(np.argmin(np.abs(times - day)))
+        panels.append((f"t = {times[k]:.0f} d{label}", frames[k]))
     return panels
 
 
@@ -197,7 +190,6 @@ def render(
     threshold: float,
     times: np.ndarray,
     masses: np.ndarray,
-    pre_points: list[tuple[float, float]],
     params: dict[str, Any],
 ) -> None:
     import matplotlib
@@ -240,8 +232,6 @@ def render(
 
     ax = fig.add_subplot(grid[n_row, :n_col])
     ax.plot(times, masses, "ko-", markersize=3, label="mass")
-    if pre_points:
-        ax.plot(*zip(*pre_points), "s", color="gray", label="before resection")
     ax.axvline(
         float(params["resection_time"]), color=CAVITY_COLOR, linewidth=1.5, label="resection"
     )
@@ -325,43 +315,25 @@ def main(argv: list[str] | None = None) -> int:
     stopping_time = resection_time + float(params["time_after_resection"])
     n_steps = int(params["n_steps"])
     dt = stopping_time / n_steps
+    panel_days = montage_days(resection_time, dt, params["rt_times"], stopping_time)
+    # The montage frames plus evenly spaced days sampling the mass curve.
+    params["snapshot_times"] = [*panel_days, *np.linspace(0.0, stopping_time, args.n_snapshots)]
     print(f"run directory: {run_dir}")
     print(f"seed voxel {seed_voxel} (label {args.seed_label} CoM), slice z={z}, {n_steps} steps (dt={dt:.4g} d)")
 
-    # Solve 1: untreated up to the resection (FKPPSolver, whose dynamics
-    # StuppFKPPSolver reproduces up to that step).
-    n_pre = int(round(resection_time / dt))
     wall = time.perf_counter()
-    untreated = {
-        key: value
-        for key, value in params.items()
-        if key not in StuppFKPPSolver.TREATMENT_KEYS and key != "time_after_resection"
-    }
-    pre = FKPPSolver({**untreated, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
-    if not pre.success:
-        raise RuntimeError(f"pre-resection solve failed: {pre.error}")
-    wall_pre = time.perf_counter() - wall
-    print(f"pre-resection solve ({n_pre} steps): {wall_pre:.1f} s, mass {pre.final_stopping_quantity:.1f}")
-
-    # Solve 2: the treated horizon with snapshots.
-    wall = time.perf_counter()
-    treated = StuppFKPPSolver({**params, "n_time_series_snapshots": args.n_snapshots}).solve()
-    if not treated.success:
-        raise RuntimeError(f"treated solve failed: {treated.error}")
-    wall_treated = time.perf_counter() - wall
-    print(f"treated solve ({n_steps} steps): {wall_treated:.1f} s, final mass {treated.final_stopping_quantity:.1f}")
-
-    frames = treated.time_series["cell_density"]
-    times = ((snapshot_steps(n_steps, args.n_snapshots) + 1) * dt)[: frames.shape[0]]
+    result = StuppFKPPSolver(params).solve()
+    if not result.success:
+        raise RuntimeError(f"solve failed: {result.error}")
+    wall = time.perf_counter() - wall
+    frames = result.time_series["cell_density"]
+    times = result.snapshot_times
     masses = frames.sum(axis=(1, 2, 3))
-    panels = select_panels(
-        pre.initial_state["cell_density"],
-        frames,
-        times,
-        (n_pre * dt, pre.final_state["cell_density"]),
-        resection_time,
-        np.asarray(params["rt_times"], dtype=np.float64),
+    print(
+        f"solve ({n_steps} steps, {times.size} snapshots): {wall:.1f} s, "
+        f"final mass {result.final_stopping_quantity:.1f}"
     )
+    panels = select_panels(result.initial_state["cell_density"], frames, times, panel_days)
 
     header = (
         f"D {params['white_matter_diffusivity']:g}, rho {params['rho']:g}, "
@@ -381,7 +353,6 @@ def main(argv: list[str] | None = None) -> int:
         args.threshold,
         times,
         masses,
-        [(n_pre * dt, float(pre.final_state["cell_density"].sum()))],
         params,
     )
     summary = {
@@ -395,19 +366,12 @@ def main(argv: list[str] | None = None) -> int:
         "slice_z": z,
         "n_steps": n_steps,
         "dt": dt,
-        "pre_resection": {
-            "final_time": pre.final_time,
-            "final_mass": pre.final_stopping_quantity,
-            "wall_time_s": wall_pre,
-        },
-        "treated": {
-            "final_time": treated.final_time,
-            "stopping_criterion": treated.stopping_criterion,
-            "final_mass": treated.final_stopping_quantity,
-            "wall_time_s": wall_treated,
-            "snapshot_times": jsonable(times),
-            "snapshot_masses": jsonable(masses),
-        },
+        "final_time": result.final_time,
+        "stopping_criterion": result.stopping_criterion,
+        "final_mass": result.final_stopping_quantity,
+        "wall_time_s": wall,
+        "snapshot_times": jsonable(times),
+        "snapshot_masses": jsonable(masses),
     }
     (run_dir / "run_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(f"saved {run_dir / 'overview.png'} (+ .pdf, run_summary.json)")

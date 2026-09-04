@@ -27,10 +27,8 @@ solver and writes, into its own run directory
 The run directory is created with exist_ok=False and nothing is written
 outside it, so many evaluations can run in parallel against the same
 output-dir (the default run name carries a UTC timestamp and the pid).
-Snapshot volumes are only kept in memory for the plot; with --no-plot no
-time series is requested at all (memory-light for parallel sweeps) and the
-extra short solve up to the resection (the "before resection" panel) is
-skipped.
+The eight montage frames are the only snapshots recorded, and only for the
+plot; with --no-plot nothing is recorded (memory-light for parallel sweeps).
 
 The manifest carries every parameter; explicit CLI arguments (--wm, --gm
 and the solver knobs) override the manifest entries of the same name.
@@ -69,12 +67,11 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
 
-from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
+from fisher_kpp_jax import StuppFKPPSolver  # noqa: E402
 from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: E402
-from run_stupp_example import render, select_panels, snapshot_steps  # noqa: E402
+from run_stupp_example import montage_days, render, select_panels  # noqa: E402
 
 DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
-DEFAULT_N_SNAPSHOTS = 25
 DEFAULT_THRESHOLD = 0.01  # overlay transparency threshold (cell density)
 
 # CLI option -> manifest entry (solver parameter name) it overrides.
@@ -142,12 +139,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     knobs.add_argument("--seed-x", type=float, default=None, help="seed x fraction")
     knobs.add_argument("--seed-y", type=float, default=None, help="seed y fraction")
     knobs.add_argument("--seed-z", type=float, default=None, help="seed z fraction")
-    parser.add_argument(
-        "--n-snapshots",
-        type=int,
-        default=DEFAULT_N_SNAPSHOTS,
-        help="evenly spaced time-series snapshots recorded for overview.png",
-    )
     parser.add_argument(
         "--threshold",
         type=float,
@@ -221,16 +212,19 @@ def main(argv: list[str] | None = None) -> int:
     wm_img = nib.load(wm_path)  # affine and header of the output volume
     voxel_size = tuple(float(v) for v in wm_img.header.get_zooms()[:3])
 
-    n_snapshots = None if args.no_plot else int(args.n_snapshots)
-    params = params_from_manifest(
-        {
-            "voxel_size_mm": voxel_size,
-            "verbose": True,
-            **entries,
-            "n_time_series_snapshots": n_snapshots,
-        }
-    )
+    params = params_from_manifest({"voxel_size_mm": voxel_size, "verbose": True, **entries})
     wm, gm = params["white_matter_pbmap"], params["gray_matter_pbmap"]
+    n_steps, dt = StuppFKPPSolver(params)._resolve_time_stepping()
+    if not args.no_plot:
+        # The montage frames are the only snapshots.
+        resection_time = float(params["resection_time"])
+        panel_days = montage_days(
+            resection_time,
+            dt,
+            params["rt_times"],
+            resection_time + float(params["time_after_resection"]),
+        )
+        params["snapshot_times"] = panel_days
     solver = StuppFKPPSolver(params)
 
     print(f"run directory: {run_dir}")
@@ -266,7 +260,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAILED after {wall:.1f} s: {result.error}", file=sys.stderr)
         return 1
 
-    n_steps, dt = solver._resolve_time_stepping()
     config["n_steps"] = n_steps
     config["dt"] = dt
     (run_dir / "run_config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -278,37 +271,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_plot:
         frames = result.time_series["cell_density"]
-        times = ((snapshot_steps(n_steps, n_snapshots) + 1) * dt)[: frames.shape[0]]
+        times = result.snapshot_times
         masses = frames.sum(axis=(1, 2, 3))
         seed_voxel = tuple(
             int(solver.params[f"gaussian_seed_{axis}_fraction"] * n)
             for axis, n in zip("xyz", wm.shape)
         )
-        # The state just before the resection: a second, shorter, untreated
-        # solve with FKPPSolver, whose dynamics StuppFKPPSolver reproduces
-        # up to that step (the seed itself if the resection is at t = 0).
-        pre_resection = (0.0, result.initial_state["cell_density"])
-        pre_points = [(0.0, float(result.initial_state["cell_density"].sum()))]
-        n_pre = int(round(float(params["resection_time"]) / dt))
-        if n_pre >= 1:
-            untreated = {
-                key: value
-                for key, value in params.items()
-                if key not in StuppFKPPSolver.TREATMENT_KEYS and key != "time_after_resection"
-            }
-            pre = FKPPSolver(
-                {
-                    **untreated,
-                    "stopping_time": n_pre * dt,
-                    "n_steps": n_pre,
-                    "n_time_series_snapshots": None,
-                }
-            ).solve()
-            if not pre.success:
-                raise RuntimeError(f"pre-resection solve failed: {pre.error}")
-            pre_state = pre.final_state["cell_density"]
-            pre_resection = (n_pre * dt, pre_state)
-            pre_points.append((n_pre * dt, float(pre_state.sum())))
         if args.background_image is not None:
             background = np.asarray(nib.load(args.background_image).get_fdata(), dtype=np.float64)
             if background.shape != wm.shape:
@@ -318,14 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             background = wm + gm
         z = int(round(center_of_mass(params["rt_dose"])[2]))
-        panels = select_panels(
-            result.initial_state["cell_density"],
-            frames,
-            times,
-            pre_resection,
-            float(params["resection_time"]),
-            np.asarray(params["rt_times"], dtype=np.float64),
-        )
+        panels = select_panels(result.initial_state["cell_density"], frames, times, panel_days)
         header = (
             f"{run_name}: {Path(args.manifest).name}, axial slice z={z}, "
             f"densities >= {args.threshold:g}\n"
@@ -344,7 +305,6 @@ def main(argv: list[str] | None = None) -> int:
             args.threshold,
             times,
             masses,
-            pre_points,
             params,
         )
 

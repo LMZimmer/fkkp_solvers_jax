@@ -81,8 +81,15 @@ class Result:
             volume for stopping_mode="volume".
         stopping_criterion: What ended the run: "time", "threshold" or
             "error".
-        time_series: Recorded snapshots per field, or None if none were
-            requested.
+        time_series: Recorded snapshots per field, (n_frames, *grid), or
+            None if none were requested (``snapshot_times`` param None).
+        snapshot_times: Simulation day of each recorded frame, or None if
+            none were requested. Frames are recorded after the step whose
+            end time is nearest to each requested day (a day below one
+            step: after the first step); days sharing a step give one
+            frame, days beyond the horizon are dropped with a warning, and
+            frames after an early stop are not recorded, so this holds the
+            days actually recorded, ascending.
         error: Description of the failure, else None.
     """
 
@@ -93,6 +100,7 @@ class Result:
     final_stopping_quantity: float
     stopping_criterion: Literal["time", "threshold", "error"]
     time_series: dict[str, NDArray] | None = None
+    snapshot_times: NDArray | None = None
     error: str | None = None
 
 
@@ -116,6 +124,8 @@ class _TimeLoopOutputs:
             guard fired.
         buffers: Recorded snapshot frames per field on the cropped grid, or
             None if none were requested.
+        snapshot_times: Simulation day of each recorded frame, or None if
+            none were requested.
     """
 
     initial_state: dict[str, NDArray]
@@ -127,6 +137,7 @@ class _TimeLoopOutputs:
     guard_mass_change: float
     guard_density: float
     buffers: dict[str, NDArray] | None
+    snapshot_times: NDArray | None
 
 
 def _merge_parameters(
@@ -203,6 +214,48 @@ def _validate_parameters(parameters: dict[str, Any], solver_name: str) -> None:
             f"{solver_name}: n_steps must be a positive integer or None, "
             f"got {n_steps!r}."
         )
+    snapshot_times = parameters["snapshot_times"]
+    if snapshot_times is not None:
+        days = np.asarray(snapshot_times, dtype=np.float64)
+        if days.ndim != 1:
+            raise ValueError(
+                f"{solver_name}: snapshot_times must be a 1-D sequence of days or None."
+            )
+        if not np.all(np.isfinite(days)) or np.any(days < 0):
+            raise ValueError(f"{solver_name}: snapshot_times must be finite and nonnegative.")
+        parameters["snapshot_times"] = np.sort(days)
+
+
+def _snapshot_steps(
+    days: NDArray, n_steps: int, dt: float, solver_name: str
+) -> tuple[NDArray, NDArray]:
+    """
+    Map requested snapshot days to the steps to record.
+
+    A frame recorded at step s holds the state after that step, at
+    (s + 1) dt, so each day is mapped to the step whose end time is nearest
+    (a day below one step to the first step). Days beyond the horizon are
+    dropped with a warning; days sharing a step collapse into one frame.
+
+    Args:
+        days: Requested days, finite and nonnegative.
+        n_steps: Number of time steps.
+        dt: Time step size in days.
+        solver_name: Solver class name, used in the warning.
+
+    Returns:
+        (steps, times): the sorted unique steps to record and the
+        simulation day of each.
+    """
+    steps = np.clip(np.rint(days / dt).astype(np.int64) - 1, 0, None)
+    late = days[steps >= n_steps]
+    if late.size:
+        logger.warning(
+            f"{solver_name}: {late.size} snapshot day(s) beyond the horizon "
+            f"{n_steps * dt:g} are dropped: {late.tolist()}."
+        )
+    steps = np.unique(steps[steps < n_steps])
+    return steps, (steps + 1) * dt
 
 
 def _validate_unit_interval(
@@ -492,7 +545,12 @@ class BaseFKPPSolver(ABC):
             The host-side loop outputs, see ``_TimeLoopOutputs``.
         """
         params = self.params
-        n_snapshots: int | None = params["n_time_series_snapshots"]
+        record_steps = np.empty(0, dtype=np.int64)
+        snapshot_times: NDArray | None = None
+        if params["snapshot_times"] is not None:
+            record_steps, snapshot_times = _snapshot_steps(
+                params["snapshot_times"], n_steps, dt, type(self).__name__
+            )
 
         # x64 is enabled locally (never globally on import): the state keeps
         # its explicit f32/f64 dtype either way, while the stopping-quantity
@@ -540,21 +598,21 @@ class BaseFKPPSolver(ABC):
                 self._quantity_func(),
                 self._guard_func,
                 n_steps,
-                n_snapshots,
+                record_steps,
             )
             final_state_cropped = {
                 k: np.asarray(v, dtype=np.float64)
                 for k, v in device_outputs["state"].items()
             }
+            # An early stop leaves the frames scheduled after it unrecorded.
             n_recorded = int(device_outputs["n_recorded"])
-            buffers = (
-                {
+            buffers = None
+            if snapshot_times is not None:
+                buffers = {
                     k: np.asarray(v[:n_recorded], dtype=np.float64)
                     for k, v in device_outputs["buffers"].items()
                 }
-                if n_snapshots is not None
-                else None
-            )
+                snapshot_times = snapshot_times[:n_recorded]
 
         return _TimeLoopOutputs(
             initial_state=initial_state,
@@ -566,6 +624,7 @@ class BaseFKPPSolver(ABC):
             guard_mass_change=float(device_outputs["guard_mass_change"]),
             guard_density=float(device_outputs["guard_density"]),
             buffers=buffers,
+            snapshot_times=snapshot_times,
         )
 
     def _guard_error_message(
@@ -636,17 +695,15 @@ class BaseFKPPSolver(ABC):
 
         time_series: dict[str, NDArray] | None = None
         if loop_results.buffers is not None:
-            time_series = {
-                key: np.array(
-                    [
-                        self._upsample_to(
-                            embed(frame_cropped, box, lowres_shape), original_shape
-                        )
-                        for frame_cropped in frames
-                    ]
+            time_series = {}
+            for key, frames in loop_results.buffers.items():
+                upsampled = [
+                    self._upsample_to(embed(frame, box, lowres_shape), original_shape)
+                    for frame in frames
+                ]
+                time_series[key] = (
+                    np.stack(upsampled) if upsampled else np.zeros((0, *original_shape))
                 )
-                for key, frames in loop_results.buffers.items()
-            }
 
         if guard_error is not None:
             stopping_criterion: Literal["time", "threshold", "error"] = "error"
@@ -669,6 +726,7 @@ class BaseFKPPSolver(ABC):
             final_stopping_quantity=loop_results.stopping_quantity,
             stopping_criterion=stopping_criterion,
             time_series=time_series,
+            snapshot_times=loop_results.snapshot_times,
             error=guard_error,
         )
 

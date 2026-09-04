@@ -68,7 +68,7 @@ _COMMON_DEFAULTS: dict[str, Any] = {
     "stopping_threshold": np.inf,
     "stopping_mode": "mass",
     "volume_threshold": None,  # only valid with stopping_mode="volume"
-    "n_time_series_snapshots": None,
+    "snapshot_times": None,  # days at which to record the state, see Result
     "n_steps": None,
     "verbose": False,
     "precision": "f32",

@@ -6,8 +6,11 @@ chemotherapy and radiotherapy; ``solvers.read_manifest`` and
 ``solvers.params_from_manifest`` load its parameters from a JSON run
 manifest keyed by parameter name).
 Common solver options: ``precision: "f32" | "f64"`` (default "f32") selects
-the device state dtype, and ``n_steps`` pins an explicit step count
-(dt = stopping_time / n_steps) in place of the stability formula. The
+the device state dtype, ``n_steps`` pins an explicit step count
+(dt = stopping_time / n_steps) in place of the stability formula, and
+``snapshot_times`` (a list of days) records the state at the nearest steps
+into ``Result.time_series`` with the recorded days in
+``Result.snapshot_times``. The
 explicit-Euler time loop runs as a jitted ``jax.lax.scan`` on GPU when one
 is available, with automatic CPU fallback.
 ``scripts/run_reference_solves.py`` checks that the reference results are
