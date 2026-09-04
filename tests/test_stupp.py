@@ -1,5 +1,5 @@
 """Behavior tests of the treatment-extended ``StuppFKPPSolver`` and its
-manifest loader, self-contained.
+config entries, self-contained.
 
 Short f64 solves on the 24^3 tissue phantom checking (a) that the solver
 reduces to ``FKPPSolver`` with neutral treatment values (every treatment
@@ -9,7 +9,8 @@ treatment effects in limits where they decouple from growth/diffusion (RT
 impulse under mass-conserving diffusion, the exact chemotherapy exposure
 without growth and diffusion, resection projection and cavity isolation),
 (c) the jit-cache and precision
-behavior, (d) parameter validation and (e) the JSON manifest loader.
+behavior, (d) parameter validation and (e) the JSON config with the
+treatment volumes as NIfTI paths (the cavity as a labelled segmentation).
 """
 
 from __future__ import annotations
@@ -23,8 +24,15 @@ import numpy as np
 import pytest
 from loguru import logger
 
-from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, operators
-from fisher_kpp_jax.solvers import n_steps_from_dt, params_from_manifest, read_manifest
+from fisher_kpp_jax import (
+    SOLVER_KEY,
+    FKPPSolver,
+    StuppFKPPSolver,
+    operators,
+    read_config,
+    solver_from_config,
+    write_config,
+)
 
 _COMMON = dict(
     gaussian_seed_x_fraction=0.5,
@@ -467,21 +475,22 @@ def test_validation_errors(tissue_phantom):
     assert solver.params["stopping_time"] == full["resection_time"] + full["time_after_resection"]
 
 
-# --- manifest loader ---
+# --- configs ---
 
 
-def _write_nifti(path: Path, data: np.ndarray) -> None:
+def _write_nifti(path: Path, data: np.ndarray) -> str:
     nib.save(nib.Nifti1Image(data, np.eye(4)), str(path))
+    return str(path)
 
 
-def _write_manifest(tmp_path: Path, manifest: dict) -> Path:
-    path = tmp_path / "manifest.json"
-    path.write_text(json.dumps(manifest))
+def _write_config(tmp_path: Path, config: dict, name: str = "config.json") -> Path:
+    path = tmp_path / name
+    path.write_text(json.dumps(config))
     return path
 
 
 @pytest.fixture
-def manifest_dir(tmp_path: Path) -> tuple[Path, np.ndarray, np.ndarray]:
+def config_dir(tmp_path: Path) -> tuple[Path, np.ndarray, np.ndarray]:
     """tmp dir with a label map (labels 0..4) and a dose volume."""
     rng = np.random.default_rng(3)
     segmentation = rng.integers(0, 5, size=(6, 7, 8)).astype(np.int16)
@@ -502,11 +511,13 @@ def test_treatment_keys():
     }
 
 
-def test_read_manifest(manifest_dir):
-    """Comments are dropped, keys checked, NIfTI paths made absolute
-    (relative to the manifest's directory) but not loaded."""
-    tmp_path, _, _ = manifest_dir
-    manifest = {
+def test_read_config_cavity_entry(config_dir):
+    """read_config keeps the treatment volumes as paths: the cavity entry
+    is checked to be {"segmentation": path, "label": int} and its path
+    made absolute (relative to the config's directory) but not loaded."""
+    tmp_path, _, _ = config_dir
+    config = {
+        SOLVER_KEY: "StuppFKPPSolver",
         "_note": "ignored",
         "white_matter_pbmap": "seg.nii.gz",
         "rho": 0.12,
@@ -514,116 +525,75 @@ def test_read_manifest(manifest_dir):
         "resection_cavity": {"segmentation": str(tmp_path / "seg.nii.gz"), "label": 4.0},
         "rt_dose": "dose.nii.gz",
         "dt": 0.1,
+        "stopping_threshold": "inf",
     }
-    entries = read_manifest(_write_manifest(tmp_path, manifest))
+    entries = read_config(_write_config(tmp_path, config))
     assert entries == {
+        SOLVER_KEY: "StuppFKPPSolver",
         "white_matter_pbmap": str(tmp_path / "seg.nii.gz"),
         "rho": 0.12,
         "chemo_times": [24, 25, 26],
         "resection_cavity": {"segmentation": str(tmp_path / "seg.nii.gz"), "label": 4},
         "rt_dose": str(tmp_path / "dose.nii.gz"),
         "dt": 0.1,
+        "stopping_threshold": np.inf,
     }
-    # A missing volume file is only reported on loading.
-    read_manifest(_write_manifest(tmp_path, {"rt_dose": "nope.nii.gz"}))
-    assert read_manifest(_write_manifest(tmp_path, {"_only": 1})) == {}
-
-
-def test_read_manifest_errors(manifest_dir):
-    tmp_path, _, _ = manifest_dir
-    with pytest.raises(FileNotFoundError, match="manifest not found"):
-        read_manifest(tmp_path / "missing.json")
-    with pytest.raises(ValueError, match="JSON object"):
-        read_manifest(_write_manifest(tmp_path, [1, 2]))
-    with pytest.raises(ValueError, match=r"unknown key\(s\) \['D', 'chemotherapy'\]"):
-        read_manifest(_write_manifest(tmp_path, {"rho": 1, "D": 2, "chemotherapy": {}}))
+    # A missing volume file is only reported on loading; a null volume stays.
+    stupp = {SOLVER_KEY: "StuppFKPPSolver"}
+    assert read_config(_write_config(tmp_path, {**stupp, "rt_dose": "nope.nii.gz"}))["rt_dose"].endswith(
+        "nope.nii.gz"
+    )
+    assert read_config(_write_config(tmp_path, {**stupp, "resection_cavity": None}))["resection_cavity"] is None
     with pytest.raises(ValueError, match="unknown key.*stopping_time"):
-        read_manifest(_write_manifest(tmp_path, {"stopping_time": 5}))
+        read_config(_write_config(tmp_path, {**stupp, "stopping_time": 5}))
     with pytest.raises(ValueError, match="rt_dose must be a NIfTI path"):
-        read_manifest(_write_manifest(tmp_path, {"rt_dose": 60.0}))
+        read_config(_write_config(tmp_path, {**stupp, "rt_dose": 60.0}))
     for cavity in ("seg.nii.gz", {"segmentation": "seg.nii.gz"}, {"path": "x", "label": 4}):
         with pytest.raises(ValueError, match="resection_cavity must be an object"):
-            read_manifest(_write_manifest(tmp_path, {"resection_cavity": cavity}))
+            read_config(_write_config(tmp_path, {**stupp, "resection_cavity": cavity}))
 
 
-def test_params_from_manifest(manifest_dir):
-    """Volumes are loaded (the cavity as segmentation == label), dt becomes
-    n_steps with the horizon resection_time + time_after_resection,
-    voxel_size_mm a tuple, "inf" a float; everything else passes through."""
-    tmp_path, segmentation, dose = manifest_dir
-    entries = read_manifest(
-        _write_manifest(
-            tmp_path,
-            {
-                "white_matter_pbmap": "dose.nii.gz",
-                "resection_time": 10,
-                "time_after_resection": 10.0,
-                "resection_cavity": {"segmentation": "seg.nii.gz", "label": 4},
-                "chemo_times": [24, 25, 26],
-                "chemo_doses": [75, 150, 200],
-                "rt_dose": "dose.nii.gz",
-                "dt": 0.1,
-                "voxel_size_mm": [1.0, 1.5, 2.0],
-                "stopping_threshold": "inf",
-                "precision": "f64",
-            },
-        )
+def test_cavity_from_segmentation(config_dir, tissue_phantom):
+    """The solver loads a cavity entry as segmentation == label (a bool
+    array), whether it comes from a config file or is passed directly;
+    the dose map is loaded like the tissue maps."""
+    tmp_path, _, _ = config_dir
+    gm, wm = tissue_phantom
+    segmentation = np.zeros(gm.shape, dtype=np.int16)
+    segmentation[off_center_cavity(gm.shape)] = 4
+    segmentation[0, 0, 0] = 3
+    seg_path = _write_nifti(tmp_path / "seg24.nii.gz", segmentation)
+    dose_path = _write_nifti(tmp_path / "dose24.nii.gz", np.full(gm.shape, 6.0, dtype=np.float32))
+    params = base_params(
+        gm,
+        wm,
+        **treatment_params(
+            gm.shape,
+            resection_cavity={"segmentation": seg_path, "label": 4},
+            rt_dose=dose_path,
+        ),
     )
-    params = params_from_manifest(entries)
-    assert set(params) == {
-        "white_matter_pbmap",
-        "resection_time",
-        "time_after_resection",
-        "resection_cavity",
-        "chemo_times",
-        "chemo_doses",
-        "rt_dose",
-        "n_steps",
-        "voxel_size_mm",
-        "stopping_threshold",
-        "precision",
-    }
-    np.testing.assert_array_equal(params["white_matter_pbmap"], dose)
-    assert params["white_matter_pbmap"].dtype == np.float64
-    assert params["resection_cavity"].dtype == bool
-    np.testing.assert_array_equal(params["resection_cavity"], segmentation == 4)
-    assert params["resection_cavity"].any() and not params["resection_cavity"].all()
-    np.testing.assert_array_equal(params["rt_dose"], dose)
-    assert params["chemo_times"] == [24, 25, 26] and params["chemo_doses"] == [75, 150, 200]
-    assert params["n_steps"] == 200 and params["resection_time"] == 10
-    assert params["voxel_size_mm"] == (1.0, 1.5, 2.0)
-    assert params["stopping_threshold"] == np.inf and params["precision"] == "f64"
-    # Arrays already in place are used as is (callers may replace volumes).
-    cavity = np.zeros((6, 7, 8), dtype=bool)
-    replaced = params_from_manifest({**entries, "resection_cavity": cavity, "rt_dose": dose})
-    assert replaced["resection_cavity"] is cavity and replaced["rt_dose"] is dose
-    # steps_per_day is the other time-step form.
-    assert params_from_manifest({**entries, "dt": None, "steps_per_day": 4})["n_steps"] == 80
-    assert "dt" not in params_from_manifest({"rho": 1.0})
-
-
-def test_params_from_manifest_errors(manifest_dir):
-    tmp_path, _, _ = manifest_dir
-    horizon = {"resection_time": 10.0, "time_after_resection": 1.0}
-    with pytest.raises(ValueError, match="at most one"):
-        params_from_manifest({**horizon, "dt": 0.1, "n_steps": 5})
-    with pytest.raises(ValueError, match="at most one"):
-        params_from_manifest({**horizon, "dt": 0.1, "steps_per_day": 3})
-    with pytest.raises(ValueError, match=r"'dt' needs \['resection_time'\]"):
-        params_from_manifest({"time_after_resection": 1.0, "dt": 0.1})
-    with pytest.raises(ValueError, match=r"'steps_per_day' needs .*time_after_resection"):
-        params_from_manifest({"resection_time": 1.0, "steps_per_day": 3})
-    with pytest.raises(ValueError, match="steps_per_day"):
-        params_from_manifest({**horizon, "steps_per_day": 0})
+    solver = StuppFKPPSolver(params)
+    cavity = solver.params["resection_cavity"]
+    assert cavity.dtype == bool
+    np.testing.assert_array_equal(cavity, off_center_cavity(gm.shape))
+    np.testing.assert_array_equal(solver.params["rt_dose"], 6.0)
+    assert solver.config["resection_cavity"] == {"segmentation": seg_path, "label": 4}
+    assert solver.config["rt_dose"] == dose_path
+    assert solver.config["white_matter_pbmap"] == "<in-memory>"
     with pytest.raises(FileNotFoundError, match="nope.nii.gz"):
-        params_from_manifest(read_manifest(_write_manifest(tmp_path, {"rt_dose": "nope.nii.gz"})))
-    with pytest.raises(FileNotFoundError, match="nope.nii.gz"):
-        params_from_manifest({"resection_cavity": {"segmentation": "nope.nii.gz", "label": 1}})
+        StuppFKPPSolver({**params, "resection_cavity": {"segmentation": "nope.nii.gz", "label": 1}})
+    with pytest.raises(ValueError, match="resection_cavity must be an array or"):
+        StuppFKPPSolver({**params, "resection_cavity": {"segmentation": seg_path}})
 
 
-def test_manifest_drives_solver(manifest_dir, tissue_phantom):
-    """A complete manifest is a complete StuppFKPPSolver params dict."""
-    tmp_path, _, _ = manifest_dir
+def test_config_drives_solver(config_dir, tissue_phantom):
+    """A complete config file is a complete StuppFKPPSolver run: dt becomes
+    n_steps with the horizon resection_time + time_after_resection, the
+    derived stopping_time stays out of the config, and the written config
+    reads back equal. The solver's own validation reports config
+    mistakes."""
+    tmp_path, _, _ = config_dir
     gm, wm = tissue_phantom
     segmentation = np.zeros(gm.shape, dtype=np.int16)
     segmentation[off_center_cavity(gm.shape)] = 4
@@ -631,7 +601,8 @@ def test_manifest_drives_solver(manifest_dir, tissue_phantom):
     _write_nifti(tmp_path / "gm24.nii.gz", gm)
     _write_nifti(tmp_path / "seg24.nii.gz", segmentation)
     _write_nifti(tmp_path / "dose24.nii.gz", np.full(gm.shape, 6.0, dtype=np.float32))
-    manifest = {
+    config = {
+        SOLVER_KEY: "StuppFKPPSolver",
         "_note": "the phantom run of base_params / treatment_params",
         "white_matter_pbmap": "wm24.nii.gz",
         "gray_matter_pbmap": "gm24.nii.gz",
@@ -649,31 +620,27 @@ def test_manifest_drives_solver(manifest_dir, tissue_phantom):
         "rt_dose": "dose24.nii.gz",
         "rt_alpha": 0.1,
         "rt_beta": 0.01,
-        "dt": 0.25,
+        "dt": 0.05,
     }
-    path = _write_manifest(tmp_path, manifest)
-    solver = StuppFKPPSolver(params_from_manifest(read_manifest(path)))
-    assert solver.params["n_steps"] == 40 and solver.params["stopping_time"] == HORIZON
+    entries = read_config(_write_config(tmp_path, config))
+    solver = solver_from_config(entries)
+    assert isinstance(solver, StuppFKPPSolver)
+    assert solver.resolve_time_stepping() == (200, 0.05)
+    assert solver.params["stopping_time"] == HORIZON and "stopping_time" not in solver.config
+    assert solver.config["dt"] == 0.05 and solver.config["n_steps"] is None
     result = solver.solve()
     assert result.success, result.error
-    assert result.final_time == HORIZON
+    assert result.final_time == HORIZON and result.n_steps == 200
+    assert result.derived == {"stopping_time": HORIZON, "voxel_size_mm": (1.0, 1.0, 1.0)}
     untreated = StuppFKPPSolver(base_params(gm, wm)).solve()
     assert result.final_stopping_quantity < untreated.final_stopping_quantity
-    # The solver's own validation reports manifest mistakes: a dose list of
+    written = write_config(solver.config, tmp_path / "written.json")
+    assert read_config(written) == solver.config
+    # The solver's own validation reports config mistakes: a dose list of
     # the wrong length, a missing required parameter.
-    mismatched = read_manifest(_write_manifest(tmp_path, {**manifest, "chemo_doses": [75.0]}))
+    mismatched = read_config(_write_config(tmp_path, {**config, "chemo_doses": [75.0]}))
     with pytest.raises(ValueError, match="chemo_doses"):
-        StuppFKPPSolver(params_from_manifest(mismatched))
-    incomplete = read_manifest(_write_manifest(tmp_path, {**manifest, "rt_alpha": None}))
+        solver_from_config(mismatched)
+    incomplete = read_config(_write_config(tmp_path, {**config, "rt_alpha": None}))
     with pytest.raises(ValueError, match="rt_alpha"):
-        StuppFKPPSolver(params_from_manifest(incomplete))
-
-
-def test_n_steps_from_dt():
-    assert n_steps_from_dt(100.0, 0.05) == 2000
-    assert n_steps_from_dt(10, 0.1) == 100  # 10/0.1 is not exactly 100 in floating point
-    assert n_steps_from_dt(100.0, 0.3) == 334  # rounded up, effective dt < 0.3
-    with pytest.raises(ValueError):
-        n_steps_from_dt(100.0, 0.0)
-    with pytest.raises(ValueError):
-        n_steps_from_dt(0.0, 0.1)
+        solver_from_config(incomplete)

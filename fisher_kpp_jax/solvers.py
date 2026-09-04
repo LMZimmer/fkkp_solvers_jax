@@ -1,7 +1,6 @@
 """The JAX Fisher-KPP forward solvers: ``FKPPSolver``,
 ``TwoCompartmentWithNutrientFKPPSolver``, ``AnisotropicFKPPSolver`` and the
-treatment-extended ``StuppFKPPSolver`` (with its manifest loader
-``treatment_params_from_manifest``).
+treatment-extended ``StuppFKPPSolver``.
 
 Each solver's time step is a module-level function with a stable identity,
 so the jitted time scan's cache persists across solves (see ``operators._run_time_loop``).
@@ -9,7 +8,6 @@ so the jitted time scan's cache persists across solves (see ``operators._run_tim
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar, TypedDict
@@ -31,7 +29,9 @@ from .base import (
     _validate_positive_scalar,
     _validate_tissue_arrays,
     _validate_volume,
+    n_steps_from_dt,  # noqa: F401 - re-exported
 )
+from .config import resolve_config_path
 from .operators import (
     GAUSSIAN_SEED_DIFFUSION_TIME,
     GAUSSIAN_SEED_FLOOR,
@@ -59,7 +59,9 @@ _AXES = ("x", "y", "z")
 
 _COMMON_DEFAULTS: dict[str, Any] = {
     "diffusivity_ratio": 10.0,
-    "voxel_size_mm": (1.0, 1.0, 1.0),
+    # None: from the NIfTI header of the reference volume when it is given
+    # as a path, else 1 mm isotropic.
+    "voxel_size_mm": None,
     "gaussian_seed_scale": 1.0,
     "gaussian_seed_diffusion_time": GAUSSIAN_SEED_DIFFUSION_TIME,
     "gaussian_seed_mass": GAUSSIAN_SEED_MASS,
@@ -69,10 +71,18 @@ _COMMON_DEFAULTS: dict[str, Any] = {
     "stopping_mode": "mass",
     "volume_threshold": None,  # only valid with stopping_mode="volume"
     "snapshot_times": None,  # days at which to record the state, see Result
+    # The time step, at most one of the three (see
+    # BaseFKPPSolver._resolve_time_stepping); None: the stability formula.
     "n_steps": None,
+    "dt": None,  # days
+    "steps_per_day": None,
     "verbose": False,
     "precision": "f32",
 }
+
+# The tissue probability maps of the WM/GM mixture solvers; the white
+# matter map's NIfTI header provides the voxel size and affine.
+_TISSUE_VOLUME_KEYS: frozenset[str] = frozenset({"gray_matter_pbmap", "white_matter_pbmap"})
 
 
 class _SingleFieldSpecificConstants(TypedDict):
@@ -519,6 +529,8 @@ class FKPPSolver(BaseFKPPSolver):
         # Cells with wm + gm below this carry no flux (CSF/background).
         "min_tissue_fraction": 0.1,
     }
+    _VOLUME_KEYS: ClassVar[frozenset[str]] = _TISSUE_VOLUME_KEYS
+    _REFERENCE_VOLUME_KEY: ClassVar[str] = "white_matter_pbmap"
 
     # static methods allows passing of stable module level functions as attributes
     _step_func = staticmethod(_single_field_step)
@@ -624,6 +636,8 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
         "max_tumor_occupancy": 0.9,
         "nt_multiplier": 8,
     }
+    _VOLUME_KEYS: ClassVar[frozenset[str]] = _TISSUE_VOLUME_KEYS
+    _REFERENCE_VOLUME_KEY: ClassVar[str] = "white_matter_pbmap"
 
     _step_func = staticmethod(_two_compartment_step)
     _mass_func = staticmethod(_mass_two_compartment)
@@ -753,6 +767,10 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         "diffusivity_upper_limit": 2,
         "diffusivity_lower_limit": 0,
     }
+    # The tensor field is a 5D NIfTI, (Nx, Ny, Nz, 3, 3); the tissue maps
+    # are only needed with uniform_gray_matter.
+    _VOLUME_KEYS: ClassVar[frozenset[str]] = _TISSUE_VOLUME_KEYS | {"diffusion_tensors"}
+    _REFERENCE_VOLUME_KEY: ClassVar[str] = "diffusion_tensors"
     _step_func = staticmethod(_single_field_step)
     _mass_func = staticmethod(_mass_single)
     _volume_func = staticmethod(_volume_single)
@@ -982,6 +1000,13 @@ class StuppFKPPSolver(BaseFKPPSolver):
     ``stopping_time`` parameter is not accepted; ``params['stopping_time']``
     holds the derived sum after construction.
 
+    In a config the treatment volumes are NIfTI paths like the tissue
+    maps: ``rt_dose`` (Gy, TOTAL over all fractions) directly, and
+    ``resection_cavity`` as ``{"segmentation": <NIfTI path>, "label":
+    <int>}``, the cavity being the voxels carrying that label (values
+    rounded to the nearest integer first). Both may also be given as
+    arrays.
+
     Every treatment parameter is required; a treatment is switched off by
     its values, not by omitting it: an all-False resection_cavity leaves
     the dynamics untouched (the post-resection faces then equal the
@@ -1050,6 +1075,8 @@ class StuppFKPPSolver(BaseFKPPSolver):
         # Cells with wm + gm below this carry no flux (CSF/background).
         "min_tissue_fraction": 0.1,
     }
+    _VOLUME_KEYS: ClassVar[frozenset[str]] = _TISSUE_VOLUME_KEYS | {"rt_dose", "resection_cavity"}
+    _REFERENCE_VOLUME_KEY: ClassVar[str] = "white_matter_pbmap"
 
     # static methods allows passing of stable module level functions as attributes
     _step_func = staticmethod(_stupp_step)
@@ -1060,6 +1087,38 @@ class StuppFKPPSolver(BaseFKPPSolver):
     _wm_lowres: NDArray
     _cavity_lowres: NDArray
     _rt_dose_lowres: NDArray
+
+    @classmethod
+    def _resolve_config_volume(cls, key: str, value: Any, base_dir: Path, where: str) -> Any:
+        """The cavity entry is ``{"segmentation": <NIfTI path>, "label":
+        <int>}`` with the path made absolute; the other volumes are paths."""
+        if key != "resection_cavity" or value is None:
+            return super()._resolve_config_volume(key, value, base_dir, where)
+        if not isinstance(value, Mapping) or set(value) != {"segmentation", "label"}:
+            raise ValueError(
+                f"{where}: resection_cavity must be an object "
+                '{"segmentation": <NIfTI path>, "label": <int>}.'
+            )
+        return {
+            "segmentation": resolve_config_path(
+                value["segmentation"], base_dir, f"{where}: resection_cavity segmentation"
+            ),
+            "label": int(value["label"]),
+        }
+
+    def _load_volume_entry(self, key: str, value: Any) -> tuple[NDArray, Any] | None:
+        """The cavity given as ``{"segmentation": <NIfTI path>, "label":
+        <int>}`` is the boolean mask of the label in the segmentation."""
+        if key != "resection_cavity" or not isinstance(value, Mapping):
+            return super()._load_volume_entry(key, value)
+        if set(value) != {"segmentation", "label"}:
+            raise ValueError(
+                f"{type(self).__name__}: resection_cavity must be an array or "
+                '{"segmentation": <NIfTI path>, "label": <int>}.'
+            )
+        image = nib.load(str(value["segmentation"]))
+        segmentation = np.rint(np.asarray(image.get_fdata(), dtype=np.float64)).astype(np.int64)
+        return segmentation == int(value["label"]), image
 
     def _validate_extra(self, params: dict[str, Any]) -> None:
         name = type(self).__name__
@@ -1193,192 +1252,3 @@ class StuppFKPPSolver(BaseFKPPSolver):
         )
         dt = stopping_time / n_timesteps
         return int(np.ceil(n_timesteps)), dt
-
-
-# --- manifest loader ---
-
-# A run manifest is a JSON object keyed by StuppFKPPSolver parameter name;
-# see params_from_manifest for the three ways its entries differ from the
-# params dict (volumes as NIfTI paths, dt / steps_per_day for the time
-# step, "inf"). Keys starting with '_' are comments.
-_MANIFEST_VOLUME_KEYS: tuple[str, ...] = ("white_matter_pbmap", "gray_matter_pbmap", "rt_dose")
-_MANIFEST_TIME_STEP_KEYS: tuple[str, ...] = ("n_steps", "dt", "steps_per_day")
-_MANIFEST_KEYS: frozenset[str] = (
-    StuppFKPPSolver._REQUIRED | set(StuppFKPPSolver._DEFAULTS) | set(_MANIFEST_TIME_STEP_KEYS)
-)
-
-
-def read_manifest(path: str | Path) -> dict[str, Any]:
-    """
-    Read a StuppFKPPSolver run manifest without loading its volumes.
-
-    The manifest is a JSON object keyed by solver parameter name (see
-    ``params_from_manifest`` for the layout). Returns its entries without
-    the '_' comment keys, every key checked to be a solver parameter (or
-    'dt' / 'steps_per_day'), the cavity entry checked to be
-    ``{"segmentation": <NIfTI path>, "label": <int>}`` and every NIfTI
-    path made absolute (a relative path counts from the manifest's
-    directory). The volumes stay paths, so the entries can be edited,
-    completed or written back as a manifest before ``params_from_manifest``
-    turns them into solver parameters; a missing volume file is reported
-    when it is loaded.
-
-    Args:
-        path: Path of the JSON manifest.
-
-    Returns:
-        The manifest entries.
-    """
-    manifest_path = Path(path)
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"manifest not found: {manifest_path}")
-    with open(manifest_path, encoding="utf-8") as handle:
-        entries = json.load(handle)
-    if not isinstance(entries, Mapping):
-        raise ValueError(f"manifest {manifest_path}: must be a JSON object.")
-    manifest = {key: value for key, value in entries.items() if not key.startswith("_")}
-    unknown = sorted(set(manifest) - _MANIFEST_KEYS)
-    if unknown:
-        raise ValueError(
-            f"manifest {manifest_path}: unknown key(s) {unknown}; every key must be a "
-            f"StuppFKPPSolver parameter or one of {list(_MANIFEST_TIME_STEP_KEYS)}."
-        )
-    for key in _MANIFEST_VOLUME_KEYS:
-        if key in manifest:
-            manifest[key] = _resolve_manifest_path(manifest[key], manifest_path, key)
-    if "resection_cavity" in manifest:
-        cavity = manifest["resection_cavity"]
-        if not isinstance(cavity, Mapping) or set(cavity) != {"segmentation", "label"}:
-            raise ValueError(
-                f"manifest {manifest_path}: resection_cavity must be an object "
-                '{"segmentation": <NIfTI path>, "label": <int>}.'
-            )
-        manifest["resection_cavity"] = {
-            "segmentation": _resolve_manifest_path(
-                cavity["segmentation"], manifest_path, "resection_cavity segmentation"
-            ),
-            "label": int(cavity["label"]),
-        }
-    return manifest
-
-
-def _resolve_manifest_path(value: Any, manifest_path: Path, what: str) -> str:
-    """The absolute path of a NIfTI named in the manifest (a relative path
-    counts from the manifest's directory)."""
-    if not isinstance(value, str):
-        raise ValueError(f"manifest {manifest_path}: {what} must be a NIfTI path, got {value!r}.")
-    volume_path = Path(value)
-    if not volume_path.is_absolute():
-        volume_path = manifest_path.parent / volume_path
-    return str(volume_path)
-
-
-def _load_volume(path: str) -> NDArray:
-    """Load a NIfTI volume as a float64 array."""
-    return np.asarray(nib.load(path).get_fdata(), dtype=np.float64)
-
-
-def params_from_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
-    """
-    Turn manifest entries into StuppFKPPSolver parameters.
-
-    A run manifest is a JSON object keyed by solver parameter name and
-    holding the parameter values, with three differences to the params
-    dict:
-
-    - The volumes 'white_matter_pbmap', 'gray_matter_pbmap' and 'rt_dose'
-      (Gy, TOTAL over all fractions) are NIfTI paths, and 'resection_cavity'
-      is ``{"segmentation": <NIfTI path>, "label": <int>}``: the cavity is
-      the set of voxels carrying that label (values rounded to the nearest
-      integer first). An entry that already holds an array is used as is.
-    - The time step may be given as 'dt' (days) or 'steps_per_day'
-      (dt = 1 / steps_per_day) instead of 'n_steps', at most one of the
-      three. 'dt' and 'steps_per_day' are translated by ``n_steps_from_dt``
-      with the horizon resection_time + time_after_resection.
-    - 'stopping_threshold' may be the string "inf" (JSON has no infinity),
-      and a 'voxel_size_mm' list becomes a tuple.
-
-    All other values pass through; the solver validates them, including
-    the presence of its required parameters. All times are days on the
-    solver clock, whose origin t = 0 is the seed.
-
-    Args:
-        manifest: The entries of ``read_manifest``, possibly edited or
-            completed by the caller.
-
-    Returns:
-        The parameters, ready for ``StuppFKPPSolver(params)``.
-    """
-    params = dict(manifest)
-    for key in _MANIFEST_VOLUME_KEYS:
-        if isinstance(params.get(key), str):
-            params[key] = _load_volume(params[key])
-    cavity = params.get("resection_cavity")
-    if isinstance(cavity, Mapping):
-        segmentation = np.rint(_load_volume(cavity["segmentation"])).astype(np.int64)
-        params["resection_cavity"] = segmentation == int(cavity["label"])
-    if "voxel_size_mm" in params:
-        params["voxel_size_mm"] = tuple(float(v) for v in params["voxel_size_mm"])
-    if isinstance(params.get("stopping_threshold"), str):
-        params["stopping_threshold"] = float(params["stopping_threshold"])
-    return _resolve_time_step(params)
-
-
-def _resolve_time_step(params: dict[str, Any]) -> dict[str, Any]:
-    """Replace 'dt' / 'steps_per_day' in params by 'n_steps' (in place)."""
-    present = [key for key in _MANIFEST_TIME_STEP_KEYS if params.get(key) is not None]
-    if len(present) > 1:
-        raise ValueError(f"set at most one of {list(_MANIFEST_TIME_STEP_KEYS)}, got {present}.")
-    dt = params.pop("dt", None)
-    steps_per_day = params.pop("steps_per_day", None)
-    if steps_per_day is not None:
-        if not (np.isfinite(steps_per_day) and steps_per_day > 0):
-            raise ValueError(
-                f"steps_per_day must be a positive finite number, got {steps_per_day!r}."
-            )
-        dt = 1.0 / float(steps_per_day)
-    if dt is not None:
-        missing = [
-            key for key in ("resection_time", "time_after_resection") if params.get(key) is None
-        ]
-        if missing:
-            raise ValueError(
-                f"{present[0]!r} needs {missing} for the horizon "
-                "resection_time + time_after_resection."
-            )
-        horizon = float(params["resection_time"]) + float(params["time_after_resection"])
-        params["n_steps"] = n_steps_from_dt(horizon, dt)
-    return params
-
-
-def n_steps_from_dt(stopping_time: float, dt: float) -> int:
-    """
-    Translate a requested time step into the solver's n_steps parameter.
-
-    n_steps = ceil(stopping_time / dt), so the effective step
-    stopping_time / n_steps is the largest step <= dt that divides the
-    horizon exactly; a warning reports it when it differs from dt.
-
-    Args:
-        stopping_time: Simulation horizon in days.
-        dt: Requested time step in days, > 0.
-
-    Returns:
-        The number of steps.
-    """
-    stopping_time = float(stopping_time)
-    dt = float(dt)
-    if not (np.isfinite(dt) and dt > 0):
-        raise ValueError(f"dt must be a positive finite number, got {dt!r}.")
-    if not (np.isfinite(stopping_time) and stopping_time > 0):
-        raise ValueError(
-            f"stopping_time must be a positive finite number, got {stopping_time!r}."
-        )
-    n_steps = int(np.ceil(stopping_time / dt - 1e-9))
-    effective = stopping_time / n_steps
-    if abs(effective - dt) > 1e-9 * dt:
-        logger.warning(
-            f"dt={dt:g} does not divide stopping_time={stopping_time:g}; using "
-            f"n_steps={n_steps} (dt={effective:g})."
-        )
-    return n_steps

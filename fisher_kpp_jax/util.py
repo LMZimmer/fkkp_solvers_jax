@@ -1,6 +1,6 @@
-"""Helpers shared by the Stupp scripts: JSON-serializable parameter
-summaries and the treatment-course figure (3x3 montage of axial slices plus
-the total mass over time with the treatment events marked).
+"""Helpers shared by the Stupp scripts: the treatment-course figure (3x3
+montage of axial slices plus the total mass over time with the treatment
+events marked).
 
 ``render`` imports matplotlib when called, so matplotlib is needed only by
 callers that draw the figure, not by the solvers.
@@ -15,34 +15,6 @@ import numpy as np
 
 CAVITY_COLOR = (210 / 255.0, 43 / 255.0, 43 / 255.0, 1)
 SEED_COLOR = (34 / 255.0, 139 / 255.0, 34 / 255.0, 1)
-
-
-def jsonable(value: Any) -> Any:
-    """Convert numpy scalars/arrays, paths, non-finite floats and nested
-    containers to JSON-serializable values."""
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, float) and not np.isfinite(value):
-        return str(value)
-    if isinstance(value, (list, tuple)):
-        return [jsonable(v) for v in value]
-    if isinstance(value, dict):
-        return {k: jsonable(v) for k, v in value.items()}
-    return value
-
-
-def scalar_params(params: dict[str, Any]) -> dict[str, Any]:
-    """The params without the volumes (arrays of more than one dimension),
-    JSON-serializable."""
-    return {
-        key: jsonable(value)
-        for key, value in params.items()
-        if not (isinstance(value, np.ndarray) and value.ndim > 1)
-    }
 
 
 def montage_days(

@@ -1,20 +1,29 @@
 """Fisher-KPP tumor growth forward solvers.
 
-Four solvers share one params-dict interface and return a ``Result``
+Four solvers share one parameter interface and return a ``Result``
 (``StuppFKPPSolver`` extends the isotropic model with resection,
-chemotherapy and radiotherapy; ``solvers.read_manifest`` and
-``solvers.params_from_manifest`` load its parameters from a JSON run
-manifest keyed by parameter name).
-Common solver options: ``precision: "f32" | "f64"`` (default "f32") selects
-the device state dtype, ``n_steps`` pins an explicit step count
-(dt = stopping_time / n_steps) in place of the stability formula, and
-``snapshot_times`` (a list of days) records the state at the nearest steps
-into ``Result.time_series`` with the recorded days in
-``Result.snapshot_times``. The
-explicit-Euler time loop runs as a jitted ``jax.lax.scan`` on GPU when one
-is available, with automatic CPU fallback.
-``scripts/run_reference_solves.py`` checks that the reference results are
-matched.
+chemotherapy and radiotherapy). A solver is built from its parameters as
+one mapping or as keyword arguments, ``Solver(params)`` or
+``Solver(**config)``; volumes (tissue maps, tensors, treatment maps) may be
+arrays or NIfTI paths, in which case the voxel size and affine come from
+the header. Every solver holds its ``config`` (the parameters as given,
+defaults filled in, volumes as paths), ``read_config`` / ``write_config``
+move configs to and from JSON, ``solver_from_config`` builds the solver a
+config names and ``Solver.get_default_config()`` returns the pre-written
+default config of a class. ``solve(store_result=True, outdir=...)`` (or
+``solver.save(outdir)``, ``Result.save``) writes the config, a result
+record and the result volumes into a directory.
+
+Common solver options: ``precision: "f32" | "f64"`` (default "f32")
+selects the device state dtype; the time step is given as at most one of
+``n_steps``, ``dt`` (days) or ``steps_per_day``, raised to the solver's
+stability estimate with a warning when coarser (none given: the
+estimate); ``snapshot_times`` (a list of days) records the state at the
+nearest steps into ``Result.time_series`` with the recorded days in
+``Result.snapshot_times``. The explicit-Euler time loop runs as a jitted
+``jax.lax.scan`` on GPU when one is available, with automatic CPU
+fallback. ``scripts/run_reference_solves.py`` checks that the reference
+results are matched.
 """
 
 from __future__ import annotations
@@ -24,6 +33,14 @@ import os
 import jax
 
 from .base import Result
+from .config import (
+    SOLVER_KEY,
+    VOLUME_IN_MEMORY,
+    read_config,
+    solver_class,
+    solver_from_config,
+    write_config,
+)
 from .solvers import (
     AnisotropicFKPPSolver,
     FKPPSolver,
@@ -45,9 +62,15 @@ except Exception:  # noqa: BLE001
     pass
 
 __all__ = [
+    "SOLVER_KEY",
+    "VOLUME_IN_MEMORY",
     "AnisotropicFKPPSolver",
     "FKPPSolver",
     "Result",
     "StuppFKPPSolver",
     "TwoCompartmentWithNutrientFKPPSolver",
+    "read_config",
+    "solver_class",
+    "solver_from_config",
+    "write_config",
 ]

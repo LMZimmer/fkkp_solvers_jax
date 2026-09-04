@@ -1,14 +1,14 @@
 #!/usr/bin/env python
-"""Run the example Stupp-protocol manifest on the reference_solves tissue maps
+"""Run the example Stupp-protocol config on the reference_solves tissue maps
 with fully synthetic treatment inputs and render the course as a figure.
 
 The counterpart of scripts/run_stupp_example.py without patient data: the
 tissue maps default to reference_solves/{wm,gm}_pbmap.nii.gz and the cavity
 and dose map are derived from the simulation itself instead of segmentations
-and a planning dose. Two solves of fisher_kpp_jax.StuppFKPPSolver with the
-manifest's parameters (scripts/stupp_manifest_example.json by default; its
-volume entries white_matter_pbmap, gray_matter_pbmap, resection_cavity and
-rt_dose are ignored and may be omitted):
+and a planning dose. Two solves with the config's parameters
+(scripts/stupp_config_example.json by default; its volume entries
+white_matter_pbmap, gray_matter_pbmap, resection_cavity and rt_dose are
+ignored and may be null):
 
   1. seed -> resection time with no event firing. The state just BEFORE the
      resection defines the synthetic treatment inputs: the resection cavity
@@ -19,7 +19,7 @@ rt_dose are ignored and may be omitted):
   2. the full treated horizon with those inputs, recording the eight
      montage frames.
 
-The seed is placed at --seed-voxel, replacing the manifest's seed fractions
+The seed is placed at --seed-voxel, replacing the config's seed fractions
 (default (132, 103, 90), right-hemisphere deep white matter around
 mid-height of the grid). The figure shows, on the axial slice through the
 dose map's center of mass (or --slice-z), the gm pbmap as the background
@@ -30,9 +30,12 @@ days inside the radiotherapy block; three evenly spaced days from its end
 to the end of the run (each recorded at the nearest time step). The cavity
 outline and the seed voxel are marked. A total-mass-vs-time panel
 with the treatment events marked sits below. Written into
-<output-dir>/<run-name>/ (exist_ok=False, nothing outside it): overview.png,
-overview.pdf and run_summary.json (parameters, seed voxel, slice, synthetic
-cavity/dose stats, snapshot times and masses, wall times).
+<output-dir>/<run-name>/ (exist_ok=False, nothing outside it): config.json,
+result.json and the initial and final cell density of the treated solve
+(fisher_kpp_jax.Result.save; the synthetic cavity and dose map are in-memory
+arrays, so that config is not reloadable), overview.png, overview.pdf and
+run_summary.json (seed voxel, slice, synthetic cavity/dose stats, the
+pre-resection solve, snapshot times and masses).
 
 Run from the project root, e.g.:
   CUDA_VISIBLE_DEVICES=<free gpu> python scripts/run_stupp_synthetic.py --output-dir runs/
@@ -45,7 +48,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,24 +63,18 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass, distance_transform_edt  # noqa: E402
 
-from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
-from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: E402
-from fisher_kpp_jax.util import (  # noqa: E402
-    jsonable,
-    montage_days,
-    render,
-    scalar_params,
-    select_panels,
-)
+from fisher_kpp_jax import SOLVER_KEY, FKPPSolver, StuppFKPPSolver, read_config  # noqa: E402
+from fisher_kpp_jax.config import jsonable  # noqa: E402
+from fisher_kpp_jax.util import montage_days, render, select_panels  # noqa: E402
 
-DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
+DEFAULT_CONFIG = str(_ROOT / "scripts" / "stupp_config_example.json")
 DEFAULT_WM = str(_ROOT / "reference_solves" / "wm_pbmap.nii.gz")
 DEFAULT_GM = str(_ROOT / "reference_solves" / "gm_pbmap.nii.gz")
 # Right-hemisphere deep white matter around mid-height of the
 # reference_solves grid (the reference solves' seed (140, 116, 55) sits low,
 # near the skull base).
 DEFAULT_SEED_VOXEL = (132, 103, 90)
-# Manifest entries replaced by --wm/--gm and the synthetic cavity and dose map.
+# Config entries replaced by --wm/--gm and the synthetic cavity and dose map.
 SYNTHETIC_VOLUME_KEYS = ("white_matter_pbmap", "gray_matter_pbmap", "resection_cavity", "rt_dose")
 
 
@@ -86,7 +82,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--manifest", default=DEFAULT_MANIFEST, help="run manifest JSON")
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help="run config JSON")
     parser.add_argument("--wm", default=DEFAULT_WM, help="white matter pbmap NIfTI")
     parser.add_argument("--gm", default=DEFAULT_GM, help="gray matter pbmap NIfTI")
     parser.add_argument("--output-dir", required=True, help="parent of the run directory")
@@ -165,13 +161,15 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    # The manifest's volumes are replaced: the tissue maps by --wm/--gm, the
+    # The config's volumes are replaced: the tissue maps by --wm/--gm, the
     # cavity and dose map by the synthetic ones below.
-    manifest = {
+    config = {
         key: value
-        for key, value in read_manifest(args.manifest).items()
+        for key, value in read_config(args.config).items()
         if key not in SYNTHETIC_VOLUME_KEYS
     }
+    if config[SOLVER_KEY] != StuppFKPPSolver.__name__:
+        raise ValueError(f"{args.config} names {config[SOLVER_KEY]}, not StuppFKPPSolver.")
     wm_img = nib.load(args.wm)
     wm = np.asarray(wm_img.get_fdata(), dtype=np.float64)
     gm = np.asarray(nib.load(args.gm).get_fdata(), dtype=np.float64)
@@ -188,39 +186,43 @@ def main(argv: list[str] | None = None) -> int:
         f"gaussian_seed_{axis}_fraction": (seed_voxel[i] + 0.5) / wm.shape[i]
         for i, axis in enumerate("xyz")
     }
-
-    params = params_from_manifest(
-        {
-            "voxel_size_mm": voxel_size,
-            "verbose": False,
-            **manifest,
-            "gray_matter_pbmap": gm,
-            "white_matter_pbmap": wm,
-            **seed_fractions,
-        }
+    # The tissue maps are passed as arrays, so the voxel size is given
+    # explicitly (it would otherwise come from the reference volume's header).
+    config.update(
+        gray_matter_pbmap=gm,
+        white_matter_pbmap=wm,
+        voxel_size_mm=voxel_size,
+        verbose=False,
+        **seed_fractions,
     )
-    resection_time = float(params["resection_time"])
-    stopping_time = resection_time + float(params["time_after_resection"])
-    n_steps = int(params["n_steps"])
-    dt = stopping_time / n_steps
-    print(f"run directory: {run_dir}")
-    print(f"seed voxel {seed_voxel}, {n_steps} steps (dt={dt:.4g} d)")
+    resection_time = float(config["resection_time"])
+    stopping_time = resection_time + float(config["time_after_resection"])
 
     # Solve 1: untreated up to the resection (FKPPSolver, whose dynamics
     # StuppFKPPSolver reproduces up to that step); its final state defines
-    # the synthetic cavity and dose map, inputs of the treated solve.
-    n_pre = int(round(resection_time / dt))
-    wall = time.perf_counter()
+    # the synthetic cavity and dose map, inputs of the treated solve. The
+    # full horizon's time step (the config's time-step entry, raised to the
+    # stability estimate if needed; the two solvers share the estimate)
+    # fixes the pre-resection step count so the resection falls on a step.
     untreated = {
         key: value
-        for key, value in params.items()
-        if key not in StuppFKPPSolver.TREATMENT_KEYS and key != "time_after_resection"
+        for key, value in config.items()
+        if key not in StuppFKPPSolver.TREATMENT_KEYS
+        and key not in ("time_after_resection", SOLVER_KEY)
     }
+    n_steps, dt = FKPPSolver({**untreated, "stopping_time": stopping_time}).resolve_time_stepping()
+    n_pre = int(round(resection_time / dt))
+    print(f"run directory: {run_dir}")
+    print(f"seed voxel {seed_voxel}, {n_steps} steps (dt={dt:.4g} d)")
+    for key in ("n_steps", "dt", "steps_per_day"):
+        untreated.pop(key, None)
     pre = FKPPSolver({**untreated, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
     if not pre.success:
         raise RuntimeError(f"pre-resection solve failed: {pre.error}")
-    wall_pre = time.perf_counter() - wall
-    print(f"pre-resection solve ({n_pre} steps): {wall_pre:.1f} s, mass {pre.final_stopping_quantity:.1f}")
+    print(
+        f"pre-resection solve ({pre.n_steps} steps): {pre.wall_time_s:.1f} s, "
+        f"mass {pre.final_stopping_quantity:.1f}"
+    )
 
     # The synthetic cavity and dose map from the state just before the
     # resection.
@@ -231,8 +233,6 @@ def main(argv: list[str] | None = None) -> int:
         args.total_dose_gy,
         voxel_size,
     )
-    params["resection_cavity"] = cavity
-    params["rt_dose"] = dose
     print(
         f"synthetic cavity (density > {args.tumor_threshold:g}): {int(cavity.sum())} voxels; "
         f"dose target (+{args.margin_mm:g} mm): {int((dose > 0).sum())} voxels "
@@ -242,14 +242,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"slice z={z}")
 
     # Solve 2: the treated horizon, recording the montage frames.
-    panel_days = montage_days(resection_time, dt, params["rt_times"], stopping_time)
-    params["snapshot_times"] = panel_days
-    wall = time.perf_counter()
-    treated = StuppFKPPSolver(params).solve()
+    panel_days = montage_days(resection_time, dt, config["rt_times"], stopping_time)
+    solver = StuppFKPPSolver(
+        {**config, "resection_cavity": cavity, "rt_dose": dose, "snapshot_times": panel_days}
+    )
+    params = solver.params
+    treated = solver.solve(store_result=True, outdir=run_dir)
     if not treated.success:
         raise RuntimeError(f"treated solve failed: {treated.error}")
-    wall_treated = time.perf_counter() - wall
-    print(f"treated solve ({n_steps} steps): {wall_treated:.1f} s, final mass {treated.final_stopping_quantity:.1f}")
+    print(
+        f"treated solve ({treated.n_steps} steps): {treated.wall_time_s:.1f} s, "
+        f"final mass {treated.final_stopping_quantity:.1f}"
+    )
 
     frames = treated.time_series["cell_density"]
     times = treated.snapshot_times
@@ -276,16 +280,15 @@ def main(argv: list[str] | None = None) -> int:
         masses,
         params,
     )
+    # The treated solve's parameters and outcome are in config.json /
+    # result.json (its tissue maps, cavity and dose map as in-memory arrays).
     summary = {
         "run_name": run_name,
         "cli_args": jsonable(vars(args)),
-        "manifest": str(Path(args.manifest).resolve()),
+        "config": str(Path(args.config).resolve()),
         "tissue": {"wm": str(Path(args.wm).resolve()), "gm": str(Path(args.gm).resolve())},
-        "params": scalar_params(params),
         "seed_voxel": list(seed_voxel),
         "slice_z": z,
-        "n_steps": n_steps,
-        "dt": dt,
         "synthetic_treatment": {
             "tumor_threshold": args.tumor_threshold,
             "margin_mm": args.margin_mm,
@@ -294,21 +297,17 @@ def main(argv: list[str] | None = None) -> int:
             "dose_target_voxels": int((dose > 0).sum()),
         },
         "pre_resection": {
+            "n_steps": pre.n_steps,
+            "dt": pre.dt,
             "final_time": pre.final_time,
             "final_mass": pre.final_stopping_quantity,
-            "wall_time_s": wall_pre,
+            "wall_time_s": pre.wall_time_s,
         },
-        "treated": {
-            "final_time": treated.final_time,
-            "stopping_criterion": treated.stopping_criterion,
-            "final_mass": treated.final_stopping_quantity,
-            "wall_time_s": wall_treated,
-            "snapshot_times": jsonable(times),
-            "snapshot_masses": jsonable(masses),
-        },
+        "snapshot_times": jsonable(times),
+        "snapshot_masses": jsonable(masses),
     }
     (run_dir / "run_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"saved {run_dir / 'overview.png'} (+ .pdf, run_summary.json)")
+    print(f"saved {run_dir / 'overview.png'} (+ .pdf, config.json, result.json, run_summary.json)")
     return 0
 
 

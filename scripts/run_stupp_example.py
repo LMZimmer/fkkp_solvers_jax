@@ -1,16 +1,16 @@
 #!/usr/bin/env python
-"""Run the example Stupp-protocol manifest on the SAILOR subject and render
+"""Run the example Stupp-protocol config on the SAILOR subject and render
 the treatment course as a figure.
 
-One solve of fisher_kpp_jax.StuppFKPPSolver with the manifest's parameters
-(scripts/stupp_manifest_example.json by default; it must name the tissue
+One solve of fisher_kpp_jax.StuppFKPPSolver with the config's parameters
+(scripts/stupp_config_example.json by default; it must name the tissue
 maps, the cavity segmentation, the dose map and the time step), recording
 the state at the eight montage days below plus --n-snapshots evenly spaced
 days that sample the mass curve.
 
-The seed is placed at the center of mass of one label of the manifest's
+The seed is placed at the center of mass of one label of the config's
 cavity segmentation (--seed-label, default 3 = enhancing core), replacing the
-manifest's seed fractions. The figure shows, on the axial slice through the
+config's seed fractions. The figure shows, on the axial slice through the
 dose map's center of mass (or --slice-z), the T1c image with the cell
 density overlaid in the style of PredictGBM's multislice plots
 (np.rot90 orientation, inferno overlay, densities below --threshold
@@ -20,8 +20,9 @@ three evenly spaced days from its end to the end of the run (each recorded
 at the nearest time step). The cavity outline and the seed voxel are
 marked. A total-mass-vs-time panel with the treatment events marked sits
 below. Written into <output-dir>/<run-name>/ (exist_ok=False, nothing
-outside it): overview.png, overview.pdf and run_summary.json (parameters,
-seed voxel, slice, snapshot times and masses, wall times).
+outside it): config.json, result.json and the initial and final cell
+density (fisher_kpp_jax.Result.save), overview.png, overview.pdf and
+run_summary.json (seed voxel, slice, snapshot times and masses).
 
 Run from the project root, e.g.:
   CUDA_VISIBLE_DEVICES=<free gpu> python scripts/run_stupp_example.py --output-dir runs/
@@ -34,7 +35,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,27 +50,21 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
 
-from fisher_kpp_jax import StuppFKPPSolver  # noqa: E402
-from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: E402
-from fisher_kpp_jax.util import (  # noqa: E402
-    jsonable,
-    montage_days,
-    render,
-    scalar_params,
-    select_panels,
-)
+from fisher_kpp_jax import read_config, solver_from_config  # noqa: E402
+from fisher_kpp_jax.config import jsonable  # noqa: E402
+from fisher_kpp_jax.util import montage_days, render, select_panels  # noqa: E402
 
-DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
+DEFAULT_CONFIG = str(_ROOT / "scripts" / "stupp_config_example.json")
 # Background image: <session dir of the wm pbmap>/skull_stripped/t1c_skullstripped.nii.gz
 # unless --background-image is given (the SAILOR layout, so a patient change in the
-# manifest's tissue maps carries over).
+# config's tissue maps carries over).
 T1C_RELATIVE = Path("skull_stripped") / "t1c_skullstripped.nii.gz"
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--manifest", default=DEFAULT_MANIFEST, help="run manifest JSON")
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help="run config JSON")
     parser.add_argument(
         "--background-image",
         default=None,
@@ -109,12 +103,10 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    manifest = read_manifest(args.manifest)
-    wm_path, gm_path = manifest["white_matter_pbmap"], manifest["gray_matter_pbmap"]
-    wm_img = nib.load(wm_path)
-    voxel_size = tuple(float(v) for v in wm_img.header.get_zooms()[:3])
+    config = read_config(args.config)
+    wm_path = config["white_matter_pbmap"]
     segmentation = np.rint(
-        nib.load(manifest["resection_cavity"]["segmentation"]).get_fdata()
+        nib.load(config["resection_cavity"]["segmentation"]).get_fdata()
     ).astype(np.int64)
     if not (segmentation == args.seed_label).any():
         raise ValueError(f"seed label {args.seed_label} is absent from the cavity segmentation.")
@@ -124,9 +116,9 @@ def main(argv: list[str] | None = None) -> int:
         f"gaussian_seed_{axis}_fraction": (seed_voxel[i] + 0.5) / segmentation.shape[i]
         for i, axis in enumerate("xyz")
     }
-    params = params_from_manifest(
-        {"voxel_size_mm": voxel_size, "verbose": False, **manifest, **seed_fractions}
-    )
+    config.update(seed_fractions, verbose=False)
+    solver = solver_from_config(config)
+    params = solver.params
     wm = params["white_matter_pbmap"]
     background_path = (
         Path(args.background_image)
@@ -146,25 +138,25 @@ def main(argv: list[str] | None = None) -> int:
     z = args.slice_z if args.slice_z is not None else int(round(center_of_mass(params["rt_dose"])[2]))
 
     resection_time = float(params["resection_time"])
-    stopping_time = resection_time + float(params["time_after_resection"])
-    n_steps = int(params["n_steps"])
-    dt = stopping_time / n_steps
+    stopping_time = float(params["stopping_time"])
+    n_steps, dt = solver.resolve_time_stepping()
     panel_days = montage_days(resection_time, dt, params["rt_times"], stopping_time)
-    # The montage frames plus evenly spaced days sampling the mass curve.
-    params["snapshot_times"] = [*panel_days, *np.linspace(0.0, stopping_time, args.n_snapshots)]
+    # The montage frames plus evenly spaced days sampling the mass curve;
+    # the solver is built again with them requested.
+    config["snapshot_times"] = [*panel_days, *np.linspace(0.0, stopping_time, args.n_snapshots)]
+    solver = solver_from_config(config)
+    params = solver.params
     print(f"run directory: {run_dir}")
     print(f"seed voxel {seed_voxel} (label {args.seed_label} CoM), slice z={z}, {n_steps} steps (dt={dt:.4g} d)")
 
-    wall = time.perf_counter()
-    result = StuppFKPPSolver(params).solve()
+    result = solver.solve(store_result=True, outdir=run_dir)
     if not result.success:
         raise RuntimeError(f"solve failed: {result.error}")
-    wall = time.perf_counter() - wall
     frames = result.time_series["cell_density"]
     times = result.snapshot_times
     masses = frames.sum(axis=(1, 2, 3))
     print(
-        f"solve ({n_steps} steps, {times.size} snapshots): {wall:.1f} s, "
+        f"solve ({result.n_steps} steps, {times.size} snapshots): {result.wall_time_s:.1f} s, "
         f"final mass {result.final_stopping_quantity:.1f}"
     )
     panels = select_panels(result.initial_state["cell_density"], frames, times, panel_days)
@@ -189,26 +181,19 @@ def main(argv: list[str] | None = None) -> int:
         masses,
         params,
     )
+    # The parameters and the outcome are in config.json / result.json.
     summary = {
         "run_name": run_name,
         "cli_args": jsonable(vars(args)),
-        "manifest": str(Path(args.manifest).resolve()),
-        "tissue": {"wm": wm_path, "gm": gm_path},
+        "config": str(Path(args.config).resolve()),
         "background_image": str(background_path),
-        "params": scalar_params(params),
         "seed_voxel": list(seed_voxel),
         "slice_z": z,
-        "n_steps": n_steps,
-        "dt": dt,
-        "final_time": result.final_time,
-        "stopping_criterion": result.stopping_criterion,
-        "final_mass": result.final_stopping_quantity,
-        "wall_time_s": wall,
         "snapshot_times": jsonable(times),
         "snapshot_masses": jsonable(masses),
     }
     (run_dir / "run_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"saved {run_dir / 'overview.png'} (+ .pdf, run_summary.json)")
+    print(f"saved {run_dir / 'overview.png'} (+ .pdf, config.json, result.json, run_summary.json)")
     return 0
 
 

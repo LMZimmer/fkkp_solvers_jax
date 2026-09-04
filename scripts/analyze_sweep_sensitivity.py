@@ -153,9 +153,10 @@ def load_sweep(sweep_dir: Path) -> tuple[list[dict[str, str]], np.ndarray, np.nd
 def seed_wm_covariate(sweep_dir: Path, rows: list[dict[str, str]]) -> np.ndarray | None:
     """WM probability at each configuration's seed voxel, or None.
 
-    The WM pbmap path is taken from the first configuration's
-    run_config.json; if the map (or the CSV's seed_voxel column) is not
-    usable the covariate is dropped with a printed note.
+    The WM pbmap path is taken from the first configuration's config.json
+    (run_config.json in sweeps written before the config refactor); if the
+    map (or the CSV's seed_voxel column) is not usable the covariate is
+    dropped with a printed note.
 
     Args:
         sweep_dir: Sweep directory with the per-configuration run folders.
@@ -170,9 +171,13 @@ def seed_wm_covariate(sweep_dir: Path, rows: list[dict[str, str]]) -> np.ndarray
         print("NOTE: no seed_voxel column; the seed-WM covariate is dropped.")
         return None
     try:
-        run_config = sweep_dir / rows[0]["config"] / "run_config.json"
-        with open(run_config, encoding="utf-8") as handle:
-            wm_path = json.load(handle)["tissue"]["wm"]
+        run_dir = sweep_dir / rows[0]["config"]
+        if (run_dir / "config.json").is_file():
+            with open(run_dir / "config.json", encoding="utf-8") as handle:
+                wm_path = json.load(handle)["white_matter_pbmap"]
+        else:
+            with open(run_dir / "run_config.json", encoding="utf-8") as handle:
+                wm_path = json.load(handle)["tissue"]["wm"]
         wm = np.asarray(nib.load(wm_path).get_fdata(), dtype=np.float64)
     except Exception as error:  # noqa: BLE001 - any unreadable map drops the covariate
         print(f"NOTE: WM pbmap not readable ({error}); the seed-WM covariate is dropped.")

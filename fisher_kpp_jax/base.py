@@ -1,23 +1,37 @@
 """
-``BaseFKPPSolver`` implements the pipeline (validate parameters,
-downsample the tissue fields (on host), crop to the bounding box,
-time stepping (on device), embed and upsample the results.
+``BaseFKPPSolver`` implements the pipeline (validate parameters, load the
+volumes, downsample the tissue fields (on host), crop to the bounding box,
+time stepping (on device), embed and upsample the results), holds the
+config of the run and saves results with their config.
 """
 
 from __future__ import annotations
 
+import json
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, ClassVar, Literal, NotRequired, TypedDict
 
 import jax
 import jax.numpy as jnp
+import nibabel as nib
 import numpy as np
 from loguru import logger
 from numpy.typing import NDArray
 from scipy.ndimage import zoom
 
+from .config import (
+    SOLVER_KEY,
+    VOLUME_IN_MEMORY,
+    jsonable,
+    read_config,
+    register_solver,
+    resolve_config_path,
+    write_config,
+)
 from .operators import (
     SHRINKAGE_LIMIT,
     VANISHING_DENSITY_LIMIT,
@@ -35,6 +49,20 @@ from .operators import (
 CROP_MARGIN: int = 2
 
 DEFAULT_VOLUME_THRESHOLD: float = 0.5
+
+# Voxel size used when the volumes are in-memory arrays and voxel_size_mm
+# is not given.
+DEFAULT_VOXEL_SIZE_MM: tuple[float, float, float] = (1.0, 1.0, 1.0)
+
+# The three ways to give the time step; at most one of them may be set.
+TIME_STEP_KEYS: tuple[str, ...] = ("n_steps", "dt", "steps_per_day")
+
+# Parameters the solver may derive when the config does not give them;
+# their derived values are reported in Result.derived.
+DERIVED_KEYS: tuple[str, ...] = ("stopping_time", "volume_threshold", "voxel_size_mm")
+
+# Directory of the pre-written default configs, one per solver class.
+DEFAULT_CONFIG_DIR: Path = Path(__file__).resolve().parent / "configs"
 
 GAUSSIAN_SEED_POSITION_FRACTION: tuple[str, ...] = tuple(
     f"gaussian_seed_{axis}_fraction" for axis in "xyz"
@@ -91,6 +119,18 @@ class Result:
             frames after an early stop are not recorded, so this holds the
             days actually recorded, ascending.
         error: Description of the failure, else None.
+        config: The solver's config (see ``BaseFKPPSolver.config``), None
+            until ``solve`` fills it in.
+        n_steps: Number of time steps the run used, None if the run failed
+            before the time step was resolved.
+        dt: Time step size in days, None like n_steps.
+        wall_time_s: Wall time of ``solve`` in seconds.
+        derived: Parameter values the solver derived because the config did
+            not give them (``DERIVED_KEYS``): stopping_time, a defaulted
+            volume_threshold, a voxel_size_mm read from a NIfTI header.
+        affine: Voxel-to-world affine of the volumes, from the NIfTI header
+            of the reference volume when it was given as a path, else a
+            diagonal of the voxel size; used to write the result volumes.
     """
 
     success: bool
@@ -102,6 +142,123 @@ class Result:
     time_series: dict[str, NDArray] | None = None
     snapshot_times: NDArray | None = None
     error: str | None = None
+    config: dict[str, Any] | None = None
+    n_steps: int | None = None
+    dt: float | None = None
+    wall_time_s: float | None = None
+    derived: dict[str, Any] = field(default_factory=dict)
+    affine: NDArray | None = None
+
+    def save(
+        self, outdir: str | Path, time_series: bool = False, overwrite: bool = False
+    ) -> Path:
+        """
+        Write the result into a directory.
+
+        Files written (float32 NIfTIs with the Result's affine):
+
+        - ``config.json``: the config (``write_config``), loadable as is,
+          if the Result has one;
+        - ``result.json``: solver name, success, error, stopping criterion,
+          final time, final stopping quantity, n_steps, dt, wall time, grid
+          shape, the recorded snapshot days, the derived parameter values
+          and the list of files written;
+        - ``initial_<field>.nii.gz`` and ``final_<field>.nii.gz`` per state
+          field, for every field the Result holds (a failed Result without
+          states writes the two JSON files only);
+        - ``time_series_<field>.nii.gz`` (4D, frames last) per recorded
+          field, only with time_series=True.
+
+        Args:
+            outdir: Directory to write into, created if needed.
+            time_series: Whether to write the recorded snapshots.
+            overwrite: Whether an existing ``result.json`` in outdir may be
+                overwritten; else it raises.
+
+        Returns:
+            The directory written.
+        """
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        record_path = outdir / "result.json"
+        if record_path.exists() and not overwrite:
+            raise FileExistsError(f"{record_path} exists (pass overwrite=True).")
+        files: list[str] = []
+        if self.config is not None:
+            write_config(self.config, outdir / "config.json")
+            files.append("config.json")
+        affine = np.eye(4) if self.affine is None else self.affine
+        for prefix, states in (("initial", self.initial_state), ("final", self.final_state)):
+            for key, volume in states.items():
+                name = f"{prefix}_{key}.nii.gz"
+                _save_nifti(outdir / name, volume, affine)
+                files.append(name)
+        if time_series and self.time_series is not None:
+            for key, frames in self.time_series.items():
+                name = f"time_series_{key}.nii.gz"
+                _save_nifti(outdir / name, np.moveaxis(frames, 0, -1), affine)
+                files.append(name)
+        grid_shape = None
+        for volume in self.final_state.values():
+            grid_shape = list(volume.shape)
+            break
+        record = {
+            SOLVER_KEY: None if self.config is None else self.config.get(SOLVER_KEY),
+            "success": self.success,
+            "error": self.error,
+            "stopping_criterion": self.stopping_criterion,
+            "final_time": self.final_time,
+            "final_stopping_quantity": self.final_stopping_quantity,
+            "n_steps": self.n_steps,
+            "dt": self.dt,
+            "wall_time_s": self.wall_time_s,
+            "grid_shape": grid_shape,
+            "snapshot_times": jsonable(self.snapshot_times),
+            "derived": jsonable(self.derived),
+            "files": files + ["result.json"],
+        }
+        record_path.write_text(json.dumps(jsonable(record), indent=2) + "\n", encoding="utf-8")
+        return outdir
+
+
+def _save_nifti(path: Path, volume: NDArray, affine: NDArray) -> None:
+    """Write a float32 NIfTI with the given affine."""
+    image = nib.Nifti1Image(np.asarray(volume, dtype=np.float32), np.asarray(affine))
+    image.set_data_dtype(np.float32)
+    nib.save(image, str(path))
+
+
+def n_steps_from_dt(stopping_time: float, dt: float) -> int:
+    """
+    Translate a requested time step into a step count.
+
+    n_steps = ceil(stopping_time / dt), so the effective step
+    stopping_time / n_steps is the largest step <= dt that divides the
+    horizon exactly; a warning reports it when it differs from dt.
+
+    Args:
+        stopping_time: Simulation horizon in days.
+        dt: Requested time step in days, > 0.
+
+    Returns:
+        The number of steps.
+    """
+    stopping_time = float(stopping_time)
+    dt = float(dt)
+    if not (np.isfinite(dt) and dt > 0):
+        raise ValueError(f"dt must be a positive finite number, got {dt!r}.")
+    if not (np.isfinite(stopping_time) and stopping_time > 0):
+        raise ValueError(
+            f"stopping_time must be a positive finite number, got {stopping_time!r}."
+        )
+    n_steps = int(np.ceil(stopping_time / dt - 1e-9))
+    effective = stopping_time / n_steps
+    if abs(effective - dt) > 1e-9 * dt:
+        logger.warning(
+            f"dt={dt:g} does not divide stopping_time={stopping_time:g}; using "
+            f"n_steps={n_steps} (dt={effective:g})."
+        )
+    return n_steps
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +370,20 @@ def _validate_parameters(parameters: dict[str, Any], solver_name: str) -> None:
         raise ValueError(
             f"{solver_name}: n_steps must be a positive integer or None, "
             f"got {n_steps!r}."
+        )
+    for key in ("dt", "steps_per_day"):
+        value = parameters[key]
+        if value is not None and not (
+            np.isscalar(value) and np.isfinite(value) and value > 0
+        ):
+            raise ValueError(
+                f"{solver_name}: {key} must be a positive finite number or None, "
+                f"got {value!r}."
+            )
+    given = [key for key in TIME_STEP_KEYS if parameters[key] is not None]
+    if len(given) > 1:
+        raise ValueError(
+            f"{solver_name}: set at most one of {list(TIME_STEP_KEYS)}, got {given}."
         )
     snapshot_times = parameters["snapshot_times"]
     if snapshot_times is not None:
@@ -368,11 +539,31 @@ class BaseFKPPSolver(ABC):
     """
     Base class implementing the shared solve() pipeline as a template method.
 
-    __init__ merges and validates params against the class's _REQUIRED /
-    _DEFAULTS schema; subclasses implement the solver-specific hooks.
+    A solver is constructed from its parameters, given as one mapping
+    (``Solver(params)``) or as keyword arguments (``Solver(**config)``); a
+    ``"solver"`` entry naming the class is accepted and checked, so a
+    config written by ``Result.save`` or read by ``read_config`` can be
+    passed as is. __init__ merges and validates the parameters against the
+    class's _REQUIRED / _DEFAULTS key sets and loads the volumes given as
+    NIfTI paths; subclasses implement the solver-specific hooks.
 
     Attributes:
-        params: Merged and validated solver parameters.
+        params: Merged and validated solver parameters, volumes as arrays.
+        config: The run's config: the "solver" entry plus every parameter
+            as given, the class defaults filled in for the ones not given
+            and volumes recorded as their path (or the entry they were
+            given as) or as ``VOLUME_IN_MEMORY`` when given as arrays.
+            Derived values are not in it (``DERIVED_KEYS``), so it
+            reproduces the run through ``solver_from_config``.
+        affine: Voxel-to-world affine, from the NIfTI header of the
+            reference volume (``_REFERENCE_VOLUME_KEY``) if that was given
+            as a path, else of any volume given as a path, else a diagonal
+            of the voxel size.
+        result: The Result of the last ``solve``, None before the first.
+        n_steps: Number of time steps of the last (or running) solve, None
+            before the time step was resolved.
+        dt: Time step of the last (or running) solve in days, None like
+            n_steps.
         grid_shape: Low-resolution 3D grid shape, populated by solve() after
             downsampling, before any hook that uses it is called.
         grid_spacing: Grid spacing in mm after downsampling, populated by
@@ -381,6 +572,12 @@ class BaseFKPPSolver(ABC):
             solve() alongside grid_shape.
     """
 
+    params: dict[str, Any]
+    config: dict[str, Any]
+    affine: NDArray
+    result: Result | None
+    n_steps: int | None
+    dt: float | None
     grid_shape: tuple[int, int, int]
     grid_spacing: tuple[float, float, float]
     seed_voxel: tuple[int, int, int]
@@ -388,6 +585,12 @@ class BaseFKPPSolver(ABC):
     # Required and default parameters, implemented by each solver
     _REQUIRED: ClassVar[frozenset[str]]
     _DEFAULTS: ClassVar[dict[str, Any]]
+
+    # Parameters holding volumes (arrays in params, NIfTI paths in a
+    # config), and the one whose NIfTI header provides the voxel size and
+    # affine when it is given as a path.
+    _VOLUME_KEYS: ClassVar[frozenset[str]]
+    _REFERENCE_VOLUME_KEY: ClassVar[str]
 
     # Device functions of the time loop, set per solver class. They must be
     # module-level functions (see ``operators._run_time_loop`` for the
@@ -402,15 +605,182 @@ class BaseFKPPSolver(ABC):
         Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
     ] = staticmethod(_no_guard)
 
-    def __init__(self, params: Mapping[str, Any]) -> None:
-        merged = _merge_parameters(
-            params, self._REQUIRED, self._DEFAULTS, type(self).__name__
-        )
-        _validate_parameters(merged, type(self).__name__)
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        register_solver(cls)
+
+    def __init__(self, params: Mapping[str, Any] | None = None, /, **kwargs: Any) -> None:
+        name = type(self).__name__
+        if params is not None and kwargs:
+            raise TypeError(
+                f"{name}: give the parameters either as one mapping or as keyword "
+                "arguments, not both."
+            )
+        given = dict(params) if params is not None else dict(kwargs)
+        named = given.pop(SOLVER_KEY, None)
+        if named is not None and named != name:
+            raise ValueError(f"{name}: the config names solver {named!r}.")
+        merged = _merge_parameters(given, self._REQUIRED, self._DEFAULTS, name)
+        # The config records the parameters as given, before the volumes
+        # are loaded and before validation derives anything.
+        self.config = self._build_config(given)
+        self.result = None
+        self.n_steps = None
+        self.dt = None
+        header_voxel_size = self._load_volumes(merged)
+        self._resolve_voxel_size(merged, header_voxel_size)
+        _validate_parameters(merged, name)
         for key in GAUSSIAN_SEED_POSITION_FRACTION:
-            _validate_unit_interval(merged, key, type(self).__name__)
+            _validate_unit_interval(merged, key, name)
         self._validate_extra(merged)
         self.params = merged
+
+    @classmethod
+    def config_keys(cls) -> frozenset[str]:
+        """The parameter names of the class: required ones and defaults."""
+        return frozenset(cls._REQUIRED) | frozenset(cls._DEFAULTS)
+
+    @classmethod
+    def get_default_config(cls) -> dict[str, Any]:
+        """
+        The class's default config, read from
+        ``fisher_kpp_jax/configs/<ClassName>.json``.
+
+        The file defines every parameter, required ones included, with the
+        example volumes shipped with the repository as paths (an entry is
+        null where no example volume is available yet); the optional
+        entries equal the class defaults.
+
+        Returns:
+            The config entries with absolute volume paths (``read_config``).
+        """
+        return read_config(DEFAULT_CONFIG_DIR / f"{cls.__name__}.json", solver=cls)
+
+    def _build_config(self, given: Mapping[str, Any]) -> dict[str, Any]:
+        """
+        The config of the given parameters: the "solver" entry, the given
+        entries in their order, then the defaults not given. A volume given
+        as an array is recorded as ``VOLUME_IN_MEMORY``; a path or a
+        solver-specific entry is kept.
+        """
+        config: dict[str, Any] = {SOLVER_KEY: type(self).__name__}
+        for key, value in given.items():
+            config[key] = self._config_volume_entry(value) if key in self._VOLUME_KEYS else value
+        for key, value in self._DEFAULTS.items():
+            if key not in config:
+                config[key] = value
+        return config
+
+    @staticmethod
+    def _config_volume_entry(value: Any) -> Any:
+        """The config record of a volume parameter value."""
+        if value is None or isinstance(value, (str, Path)):
+            return None if value is None else str(value)
+        if isinstance(value, Mapping):
+            return dict(value)
+        return VOLUME_IN_MEMORY
+
+    @classmethod
+    def _resolve_config_volume(cls, key: str, value: Any, base_dir: Path, where: str) -> Any:
+        """
+        Resolve a volume entry of a config file for ``read_config``: a
+        NIfTI path is made absolute (relative to base_dir, the config's
+        directory), None stays None. Solvers with other entry formats
+        override this.
+        """
+        if value is None:
+            return None
+        return resolve_config_path(value, base_dir, f"{where}: {key}")
+
+    def _load_volume_entry(self, key: str, value: Any) -> tuple[NDArray, Any] | None:
+        """
+        Load one volume parameter given as a NIfTI path.
+
+        Args:
+            key: Parameter name.
+            value: The parameter value as given.
+
+        Returns:
+            (array, image) with the float64 array and the nibabel image the
+            path was loaded from, or None if the value is not a path (an
+            array passes through unchanged). Solvers with other entry
+            formats (a labelled segmentation) override this.
+        """
+        if isinstance(value, (str, Path)):
+            if str(value) == VOLUME_IN_MEMORY:
+                raise ValueError(
+                    f"{type(self).__name__}: {key} was an in-memory array when the config "
+                    "was written and cannot be reloaded; give a NIfTI path or an array."
+                )
+            image = nib.load(str(value))
+            return np.asarray(image.get_fdata(), dtype=np.float64), image
+        return None
+
+    def _load_volumes(self, merged: dict[str, Any]) -> tuple[float, float, float] | None:
+        """
+        Replace the volume parameters given as paths by their arrays (in
+        place) and set the affine.
+
+        The reference volume is loaded first, so its header wins when it
+        is a path; else the first other path's header; else the affine is
+        a diagonal of the voxel size (set by ``_resolve_voxel_size``).
+
+        Returns:
+            The voxel size of the header the affine came from, or None
+            when no volume was given as a path.
+        """
+        name = type(self).__name__
+        header_voxel_size: tuple[float, float, float] | None = None
+        affine: NDArray | None = None
+        others = sorted(self._VOLUME_KEYS - {self._REFERENCE_VOLUME_KEY})
+        for key in (self._REFERENCE_VOLUME_KEY, *others):
+            value = merged.get(key)
+            if value is None:
+                if key in self._REQUIRED:
+                    raise ValueError(f"{name}: {key} is None; give a NIfTI path or an array.")
+                continue
+            loaded = self._load_volume_entry(key, value)
+            if loaded is None:
+                continue
+            merged[key], image = loaded
+            if affine is None and image is not None:
+                affine = np.asarray(image.affine, dtype=np.float64)
+                header_voxel_size = tuple(float(v) for v in image.header.get_zooms()[:3])
+        if affine is not None:
+            self.affine = affine
+        return header_voxel_size
+
+    def _resolve_voxel_size(
+        self, merged: dict[str, Any], header_voxel_size: tuple[float, float, float] | None
+    ) -> None:
+        """
+        Set merged['voxel_size_mm'] (in place): the given value if any (a
+        warning names a differing header value), else the reference
+        volume's header value, else ``DEFAULT_VOXEL_SIZE_MM``; and the
+        affine if no header provided one.
+        """
+        name = type(self).__name__
+        given = merged["voxel_size_mm"]
+        if given is None:
+            voxel_size = header_voxel_size or DEFAULT_VOXEL_SIZE_MM
+        else:
+            values = np.asarray(given, dtype=np.float64)
+            if values.shape != (3,) or not np.all(np.isfinite(values)) or np.any(values <= 0):
+                raise ValueError(
+                    f"{name}: voxel_size_mm must be three positive finite numbers, got {given!r}."
+                )
+            voxel_size = tuple(float(v) for v in values)
+            if header_voxel_size is not None and not np.allclose(
+                voxel_size, header_voxel_size, rtol=1e-4, atol=0
+            ):
+                logger.warning(
+                    f"{name}: voxel_size_mm={voxel_size} differs from the NIfTI header's "
+                    f"{header_voxel_size}; using the given value (the affine stays the "
+                    "header's)."
+                )
+        merged["voxel_size_mm"] = voxel_size
+        if not hasattr(self, "affine"):
+            self.affine = np.diag((*voxel_size, 1.0))
 
     def _validate_extra(self, params: dict[str, Any]) -> None:
         """Solver-specific validation beyond the shared parameters. The
@@ -453,19 +823,41 @@ class BaseFKPPSolver(ABC):
             floor=self.params["gaussian_seed_floor"],
         )
 
-    def solve(self) -> Result:
+    def solve(
+        self,
+        store_result: bool = False,
+        outdir: str | Path | None = None,
+        save_time_series: bool = False,
+    ) -> Result:
         """
         Run the full pipeline.
+
+        The Result carries the config, the resolved n_steps and dt, the
+        wall time, the derived parameter values and the affine, and is
+        kept as ``self.result``.
+
+        Args:
+            store_result: Whether to save the Result into outdir afterwards
+                (``save``), a failed one included.
+            outdir: Directory to save into; required with store_result.
+            save_time_series: Whether the saved Result includes the
+                recorded snapshots.
 
         Returns:
             The Result of the run.
         """
+        if store_result and outdir is None:
+            raise ValueError("store_result=True needs an outdir.")
+        self.result = None
+        self.n_steps = None
+        self.dt = None
+        start = time.perf_counter()
         try:
-            return self._run_pipeline()
+            result = self._run_pipeline()
         except Exception as exc:  # noqa: BLE001 - all failures become an error Result
             if self.params["verbose"]:
                 logger.error(f"Solver failed: {exc}")
-            return Result(
+            result = Result(
                 success=False,
                 initial_state={},
                 final_state={},
@@ -474,6 +866,60 @@ class BaseFKPPSolver(ABC):
                 stopping_criterion="error",
                 error=str(exc),
             )
+        result.wall_time_s = time.perf_counter() - start
+        result.config = dict(self.config)
+        result.n_steps = self.n_steps
+        result.dt = self.dt
+        result.derived = self._derived_parameters()
+        result.affine = self.affine
+        self.result = result
+        if store_result:
+            self.save(outdir, time_series=save_time_series)
+        return result
+
+    def save(
+        self, outdir: str | Path, time_series: bool = False, overwrite: bool = False
+    ) -> Path:
+        """
+        Save the Result of the last ``solve`` (``Result.save``).
+
+        Args:
+            outdir: Directory to write into, created if needed.
+            time_series: Whether to write the recorded snapshots.
+            overwrite: Whether an existing result in outdir may be
+                overwritten.
+
+        Returns:
+            The directory written.
+        """
+        if self.result is None:
+            raise RuntimeError(f"{type(self).__name__}: nothing to save, call solve() first.")
+        return self.result.save(outdir, time_series=time_series, overwrite=overwrite)
+
+    def _derived_parameters(self) -> dict[str, Any]:
+        """The ``DERIVED_KEYS`` values the solver derived because the config
+        does not give them."""
+        return {
+            key: self.params[key]
+            for key in DERIVED_KEYS
+            if key in self.params
+            and self.params[key] is not None
+            and self.config.get(key) is None
+        }
+
+    def resolve_time_stepping(self) -> tuple[int, float]:
+        """
+        The (n_steps, dt) a solve will use, before running one.
+
+        Sets up the grid (downsampling the input fields, checking the
+        seed) as ``solve`` does, since the stability estimate needs the
+        grid spacing.
+
+        Returns:
+            (n_steps, dt), see ``_resolve_time_stepping``.
+        """
+        self._setup_grid()
+        return self._resolve_time_stepping()
 
     def _run_pipeline(self) -> Result:
         original_shape, _ = self._setup_grid()
@@ -516,20 +962,49 @@ class BaseFKPPSolver(ABC):
 
     def _resolve_time_stepping(self) -> tuple[int, float]:
         """
-        Choose the number of simulation time steps and the step size dt.
+        Choose the number of simulation time steps and the step size dt,
+        and store them as ``n_steps`` / ``dt``.
+
+        Without a time-step parameter the solver's own stability formula
+        (``_time_step_count``) decides. A given ``n_steps``, ``dt`` or
+        ``steps_per_day`` (at most one; dt = 1 / steps_per_day; dt is
+        translated by ``n_steps_from_dt``) is used as long as it gives at
+        least the formula's step count; a coarser request is raised to the
+        formula's (n_steps, dt) with a warning.
 
         Returns:
-            (n_steps, dt): the solver's own stability formula by default, or
-            the explicit n_steps override (dt = stopping_time / n_steps).
+            (n_steps, dt).
         """
-        if self.params["n_steps"] is None:
-            n_steps, dt = self._time_step_count()
-            dt = float(dt)
+        params = self.params
+        name = type(self).__name__
+        stopping_time = float(params["stopping_time"])
+        n_formula, dt_formula = self._time_step_count()
+        n_formula, dt_formula = int(n_formula), float(dt_formula)
+        requested: str | None = None
+        if params["n_steps"] is not None:
+            n_steps = int(params["n_steps"])
+            requested = f"n_steps={n_steps}"
+        elif params["dt"] is not None:
+            n_steps = n_steps_from_dt(stopping_time, float(params["dt"]))
+            requested = f"dt={float(params['dt']):g}"
+        elif params["steps_per_day"] is not None:
+            n_steps = n_steps_from_dt(stopping_time, 1.0 / float(params["steps_per_day"]))
+            requested = f"steps_per_day={float(params['steps_per_day']):g}"
+        if requested is None:
+            n_steps, dt = n_formula, dt_formula
+        elif n_steps < n_formula:
+            logger.warning(
+                f"{name}: {requested} gives {n_steps} steps (dt={stopping_time / n_steps:g}), "
+                f"fewer than the stability estimate of {n_formula} (dt={dt_formula:g}); "
+                "using the estimate."
+            )
+            n_steps, dt = n_formula, dt_formula
         else:
-            n_steps = int(self.params["n_steps"])
-            dt = float(self.params["stopping_time"]) / n_steps
-        if self.params["verbose"]:
+            dt = stopping_time / n_steps
+        if params["verbose"]:
             logger.info(f"Number of simulation timesteps: {n_steps}")
+        self.n_steps = n_steps
+        self.dt = dt
         return n_steps, dt
 
     def _run_device_loop(self, n_steps: int, dt: float) -> _TimeLoopOutputs:
@@ -692,6 +1167,13 @@ class BaseFKPPSolver(ABC):
             k: embed(v, box, lowres_shape)
             for k, v in loop_results.final_state_cropped.items()
         }
+        # Solvers without a device guard: an explicit-Euler blow-up surfaces
+        # as NaN/inf in the final state.
+        error = guard_error
+        if error is None and not all(np.isfinite(v).all() for v in final_state.values()):
+            error = "non-finite final state (time step too large?)"
+            if self.params["verbose"]:
+                logger.error(f"Solver failed: {error}")
 
         time_series: dict[str, NDArray] | None = None
         if loop_results.buffers is not None:
@@ -705,7 +1187,7 @@ class BaseFKPPSolver(ABC):
                     np.stack(upsampled) if upsampled else np.zeros((0, *original_shape))
                 )
 
-        if guard_error is not None:
+        if error is not None:
             stopping_criterion: Literal["time", "threshold", "error"] = "error"
         elif stop_kind == _STOP_THRESHOLD:
             stopping_criterion = "threshold"
@@ -713,7 +1195,7 @@ class BaseFKPPSolver(ABC):
             stopping_criterion = "time"
 
         return Result(
-            success=guard_error is None,
+            success=error is None,
             initial_state={
                 k: self._upsample_to(v, original_shape)
                 for k, v in loop_results.initial_state.items()
@@ -727,7 +1209,7 @@ class BaseFKPPSolver(ABC):
             stopping_criterion=stopping_criterion,
             time_series=time_series,
             snapshot_times=loop_results.snapshot_times,
-            error=guard_error,
+            error=error,
         )
 
     def _downsample(
@@ -817,8 +1299,10 @@ class BaseFKPPSolver(ABC):
         Return (N_simulation_steps, dt) from the solver's own ad-hoc
         stability formula.
 
-        Bypassed entirely when the ``n_steps`` param is set. The three
-        formulas are deliberately not unified -- do not merge or "fix" them.
+        A given time step (``n_steps``, ``dt`` or ``steps_per_day``)
+        replaces it unless it is coarser, see ``_resolve_time_stepping``.
+        The three formulas are deliberately not unified -- do not merge or
+        "fix" them.
         """
 
     def _check_seed(self) -> None:
