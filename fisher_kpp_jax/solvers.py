@@ -27,6 +27,8 @@ from .base import (
     _SharedConstants,
     _validate_event_times,
     _validate_nonnegative_scalar,
+    _validate_nonnegative_sequence,
+    _validate_positive_scalar,
     _validate_tissue_arrays,
     _validate_volume,
 )
@@ -36,7 +38,7 @@ from .operators import (
     GAUSSIAN_SEED_MASS,
     SHRINKAGE_LIMIT,
     VANISHING_DENSITY_LIMIT,
-    chemo_concentration,
+    chemo_exposure,
     diffusion_term,
     elongate_tensor_along_principal_axis,
     face_average,
@@ -158,8 +160,10 @@ class _StuppSpecificConstants(_SingleFieldSpecificConstants):
             is zero.
         chemo_times: Chemotherapy session times in days, 1-D at the state
             dtype.
-        chemo_kill_rate: Chemotherapy kill rate per unit concentration,
-            0-d scalar at the state dtype.
+        chemo_doses: Chemotherapy session doses in mg/m^2, 1-D at the
+            state dtype, one per entry of chemo_times.
+        chemo_kill_rate: Chemotherapy kill rate per unit dose (1/day per
+            mg/m^2), 0-d scalar at the state dtype.
         chemo_decay_rate: Exponential decay rate of the drug
             concentration, 0-d scalar at the state dtype.
         rt_times: Radiotherapy fraction times in days, 1-D at the state
@@ -172,6 +176,7 @@ class _StuppSpecificConstants(_SingleFieldSpecificConstants):
     cavity: jax.Array
     face_diffusivities_post: dict[str, jax.Array]
     chemo_times: jax.Array
+    chemo_doses: jax.Array
     chemo_kill_rate: jax.Array
     chemo_decay_rate: jax.Array
     rt_times: jax.Array
@@ -349,19 +354,27 @@ def _stupp_step(
     In-step operation order:
 
       1. Euler update at the pre-step state,
-         du/dt = div(D grad u) + rho u (1 - u) - chemo_kill_rate C(t0) u,
+         du/dt = div(D grad u) + rho u (1 - u),
          with D = the post-resection faces once t1 >= resection_time,
          else the pre-resection faces;
-      2. radiotherapy impulse u <- u exp(-E(x) n_hits), n_hits = number of
+      2. chemotherapy impulse u <- u exp(-chemo_kill_rate E_ct), with
+         E_ct = int_{t0}^{t1} C dt the exact drug exposure of the step
+         (``chemo_exposure``), so the chemotherapy kill is independent of
+         the step size;
+      3. radiotherapy impulse u <- u exp(-E(x) n_hits), n_hits = number of
          rt_times in (t0, t1] (exact impulse map, not part of the Euler
          right-hand side);
-      3. resection projection u <- 0 inside the cavity, for every step
+      4. resection projection u <- 0 inside the cavity, for every step
          with t1 >= resection_time (idempotent).
+
+    The two impulses are pointwise multiplications and commute; the
+    projection is applied last so that the cavity is empty at the end of
+    every post-resection step.
 
     Every treatment term is evaluated in every step. With neutral
     treatment values (an all-False cavity, a zero chemotherapy kill rate
-    or no session, a zero radiotherapy log kill) the update equals
-    ``_single_field_step`` up to floating-point rounding.
+    or zero doses or no session, a zero radiotherapy log kill) the update
+    equals ``_single_field_step`` up to floating-point rounding.
 
     Args:
         state: State dict with key 'cell_density'.
@@ -382,14 +395,19 @@ def _stupp_step(
     faces_post = constants["face_diffusivities_post"]
     faces = {key: jnp.where(post, faces_post[key], faces_pre[key]) for key in faces_pre}
 
-    concentration = chemo_concentration(
-        t0, constants["chemo_times"], constants["chemo_decay_rate"]
-    )
-    reaction = logistic_growth(u, rho) - constants["chemo_kill_rate"] * concentration * u
+    reaction = logistic_growth(u, rho)
     diffusion = diffusion_term(u, faces, constants["grid_spacing"])
     delta_u = (diffusion + reaction) * dt
     u = u + delta_u
 
+    exposure = chemo_exposure(
+        t0,
+        t1,
+        constants["chemo_times"],
+        constants["chemo_doses"],
+        constants["chemo_decay_rate"],
+    )
+    u = u * jnp.exp(-constants["chemo_kill_rate"] * exposure)
     rt_times = constants["rt_times"]
     n_hits = jnp.sum(jnp.logical_and(rt_times > t0, rt_times <= t1)).astype(u.dtype)
     u = u * jnp.exp(-constants["rt_log_kill"] * n_hits)
@@ -942,7 +960,8 @@ _STUPP_TREATMENT_KEYS: frozenset[str] = frozenset(
         "resection_time",
         "resection_cavity",
         "chemo_times",
-        "chemo_kill_rate",
+        "chemo_doses",  # mg/m^2 per session, one per chemo_times entry
+        "chemo_kill_rate",  # 1/day per mg/m^2
         "chemo_decay_rate",
         "rt_times",
         "rt_dose",  # TOTAL dose over all fractions, 3D array in Gy
@@ -951,45 +970,57 @@ _STUPP_TREATMENT_KEYS: frozenset[str] = frozenset(
     }
 )
 
-# Number of host-side sample points of the chemotherapy concentration used
-# by StuppFKPPSolver's time-step formula.
-_CHEMO_CONCENTRATION_SAMPLES: int = 10001
-
-
 class StuppFKPPSolver(BaseFKPPSolver):
     """
     Isotropic Fisher-KPP solver on WM/GM tissue maps, extended by the
     treatment effects of a Stupp protocol: surgical resection,
     chemotherapy (CT) and radiotherapy (RT).
 
-    State key: 'cell_density' (u in [0, 1]); grid in mm, time in days on
-    the ``stopping_time`` clock with the seed at t = 0.
+    State key: 'cell_density' (u in [0, 1]); grid in mm, time in days
+    with the seed at t = 0. The horizon is given relative to the surgery:
+    the run ends at resection_time + time_after_resection. The shared
+    ``stopping_time`` parameter is not accepted; ``params['stopping_time']``
+    holds the derived sum after construction.
 
     Every treatment parameter is required; a treatment is switched off by
     its values, not by omitting it: an all-False resection_cavity leaves
     the dynamics untouched (the post-resection faces then equal the
-    pre-resection ones), an empty chemo_times or chemo_kill_rate = 0
-    removes the chemotherapy term, and a zero rt_dose (or
-    rt_alpha = rt_beta = 0) makes the radiotherapy impulse the identity.
-    With all three neutral the solver reproduces ``FKPPSolver`` up to
-    floating-point rounding (the treatment terms are still evaluated, so
-    the compiled arithmetic is not identical).
+    pre-resection ones), an empty chemo_times, chemo_kill_rate = 0 or
+    all-zero chemo_doses removes the chemotherapy kill (chemo_decay_rate
+    must stay > 0), and a zero rt_dose (or rt_alpha = rt_beta = 0) makes
+    the radiotherapy impulse the identity. With all three neutral the
+    solver reproduces ``FKPPSolver`` up to floating-point rounding (the
+    treatment terms are still evaluated, so the compiled arithmetic is
+    not identical).
 
-    Continuous model (explicit Euler at the pre-step state, drug
-    concentration evaluated at the step start t0)::
+    Continuous model (explicit Euler at the pre-step state; growth and
+    diffusion only)::
 
-        du/dt = div(D grad u) + rho u (1 - u) - chemo_kill_rate C(t) u
-        C(t)  = sum_j [t >= chemo_times[j]] exp(-chemo_decay_rate (t - chemo_times[j]))
+        du/dt = div(D grad u) + rho u (1 - u)
+
+    Chemotherapy acts through the drug concentration C(t), in which each
+    session j at chemo_times[j] deposits its dose chemo_doses[j] (mg/m^2)
+    that decays exponentially::
+
+        C(t) = sum_j chemo_doses[j] [t >= chemo_times[j]]
+                     exp(-chemo_decay_rate (t - chemo_times[j]))
 
     Discrete events, applied after the Euler update of the step whose
     interval (t0, t1] contains them, in this order (see ``_stupp_step``):
 
-      1. RT impulse: u <- u exp(-E(x) n_hits) with the linear-quadratic
+      1. CT impulse: u <- u exp(-chemo_kill_rate E_ct) with
+         E_ct = int_{t0}^{t1} C dt the exact exposure of the step
+         (``chemo_exposure``). chemo_kill_rate is the kill rate per unit
+         dose, in 1/day per mg/m^2, so the log kill of one session of
+         dose d over its whole decay is chemo_kill_rate d / chemo_decay_rate.
+         The exposure is exact for any step size, so a fitted kill rate
+         is transferable across time steps.
+      2. RT impulse: u <- u exp(-E(x) n_hits) with the linear-quadratic
          log kill E(x) = rt_alpha d(x) + rt_beta d(x)^2 and n_hits the
          number of rt_times in (t0, t1]. Per-fraction dose convention:
          rt_dose holds the TOTAL dose over all fractions, so
          d(x) = rt_dose / len(rt_times) (computed once on the host).
-      2. Resection: u <- 0 inside resection_cavity for every step with
+      3. Resection: u <- 0 inside resection_cavity for every step with
          t1 >= resection_time, and from the same step on the face
          diffusivities switch to a post-resection set in which every face
          touching a cavity voxel is zero (zero-flux Neumann on the cavity
@@ -1006,11 +1037,12 @@ class StuppFKPPSolver(BaseFKPPSolver):
             "gaussian_seed_y_fraction",
             "gaussian_seed_z_fraction",
             "resolution_factor",
+            "time_after_resection",  # days; the horizon is resection_time + it
         }
         | _STUPP_TREATMENT_KEYS
     )
     _DEFAULTS: ClassVar[dict[str, Any]] = {
-        **_COMMON_DEFAULTS,
+        **{key: value for key, value in _COMMON_DEFAULTS.items() if key != "stopping_time"},
         # Cells with wm + gm below this carry no flux (CSF/background).
         "min_tissue_fraction": 0.1,
     }
@@ -1025,27 +1057,30 @@ class StuppFKPPSolver(BaseFKPPSolver):
     _cavity_lowres: NDArray
     _rt_dose_lowres: NDArray
 
-    def _validate_extra(self, params: Mapping[str, Any]) -> None:
+    def _validate_extra(self, params: dict[str, Any]) -> None:
         name = type(self).__name__
         _validate_tissue_arrays(params, name)
-        stopping_time = float(params["stopping_time"])
         shape = params["gray_matter_pbmap"].shape
 
         resection_time = _validate_nonnegative_scalar(params, "resection_time", name)
-        if resection_time > stopping_time:
-            logger.warning(
-                f"{name}: resection_time={resection_time:g} lies beyond "
-                f"stopping_time={stopping_time:g} and will never fire."
-            )
+        time_after = _validate_nonnegative_scalar(params, "time_after_resection", name)
+        # The horizon of the shared pipeline, derived; not an input.
+        params["stopping_time"] = resection_time + time_after
         cavity = _validate_volume(params, "resection_cavity", shape, name)
         if cavity.dtype != bool and not np.isin(cavity, (0, 1)).all():
             raise ValueError(
                 f"{name}: resection_cavity must be a binary (bool or 0/1) array."
             )
 
-        _validate_event_times(params, "chemo_times", name)
+        chemo_times = _validate_event_times(params, "chemo_times", name)
+        chemo_doses = _validate_nonnegative_sequence(params, "chemo_doses", name)
+        if chemo_doses.size != chemo_times.size:
+            raise ValueError(
+                f"{name}: chemo_doses has {chemo_doses.size} entries but chemo_times "
+                f"has {chemo_times.size}; one dose per session is required."
+            )
         _validate_nonnegative_scalar(params, "chemo_kill_rate", name)
-        _validate_nonnegative_scalar(params, "chemo_decay_rate", name)
+        _validate_positive_scalar(params, "chemo_decay_rate", name)
 
         rt_times = _validate_event_times(params, "rt_times", name)
         if rt_times.size < 1:
@@ -1127,6 +1162,9 @@ class StuppFKPPSolver(BaseFKPPSolver):
             "chemo_times": jnp.asarray(
                 np.asarray(params["chemo_times"], dtype=np.float64), dtype=self._dtype
             ),
+            "chemo_doses": jnp.asarray(
+                np.asarray(params["chemo_doses"], dtype=np.float64), dtype=self._dtype
+            ),
             "chemo_kill_rate": self._dynamic_scalar(params["chemo_kill_rate"]),
             "chemo_decay_rate": self._dynamic_scalar(params["chemo_decay_rate"]),
             "rt_times": jnp.asarray(rt_times, dtype=self._dtype),
@@ -1135,34 +1173,14 @@ class StuppFKPPSolver(BaseFKPPSolver):
             ),
         }
 
-    def _max_chemo_concentration(self) -> float:
-        """
-        Host-side upper bound of the drug concentration C(t) over
-        [0, stopping_time]: C is evaluated with numpy on a dense grid plus
-        the session times themselves (where its local maxima lie). Zero
-        without a session.
-        """
-        params = self.params
-        stopping_time = float(params["stopping_time"])
-        session_times = np.asarray(params["chemo_times"], dtype=np.float64)
-        decay_rate = float(params["chemo_decay_rate"])
-        grid = np.union1d(
-            np.linspace(0.0, stopping_time, _CHEMO_CONCENTRATION_SAMPLES),
-            session_times[session_times <= stopping_time],
-        )
-        elapsed = grid[:, None] - session_times[None, :]
-        concentration = np.where(elapsed >= 0, np.exp(-decay_rate * elapsed), 0.0)
-        return float(concentration.sum(axis=1).max(initial=0.0))
-
     def _time_step_count(self) -> tuple[int, float]:
         # NOTE: preliminary stability heuristic -- the isotropic formula of
-        # FKPPSolver with the reaction bound extended from rho to
-        # rho + chemo_kill_rate * max_t C(t); the RT and resection events
-        # are impulse maps and do not constrain dt.
+        # FKPPSolver; the CT, RT and resection events are impulse maps and
+        # do not constrain dt.
         stopping_time = self.params["stopping_time"]
         diffusivity_wm = self.params["white_matter_diffusivity"]
         rho = self.params["rho"]
-        reaction_rate = rho + self.params["chemo_kill_rate"] * self._max_chemo_concentration()
+        reaction_rate = rho
         dx, dy, dz = self.grid_spacing
         # np.power kept deliberately: CPython's ** is not bit-identical to it.
         n_timesteps = max(
@@ -1182,23 +1200,22 @@ _MANIFEST_SECTIONS: dict[str, tuple[str, ...] | None] = {
     "tissue": ("wm", "gm"),
     "solver": None,
     "resection": ("time", "tumor_segmentation", "cavity_label"),
-    "chemotherapy": ("times", "kill_rate", "decay_rate"),
+    "chemotherapy": ("times", "doses", "kill_rate", "decay_rate"),
     "radiotherapy": ("times", "dose", "alpha", "beta"),
 }
 _MANIFEST_TREATMENT_SECTIONS = ("resection", "chemotherapy", "radiotherapy")
 
 # Keys accepted in the 'solver' section: every scalar StuppFKPPSolver
 # parameter (the volumes come from the 'tissue' section, the treatment
-# parameters from their own sections) plus the horizon alternative
-# 'time_after_resection' (stopping_time = resection time + it) and the
-# time-step alternatives 'dt' and 'steps_per_day', translated to n_steps.
-_MANIFEST_HORIZON_KEYS: tuple[str, ...] = ("stopping_time", "time_after_resection")
+# parameters from their own sections; the horizon is the solver's own
+# 'time_after_resection') plus the time-step alternatives 'dt' and
+# 'steps_per_day', translated to n_steps.
 _MANIFEST_TIME_STEP_KEYS: tuple[str, ...] = ("n_steps", "dt", "steps_per_day")
 _MANIFEST_SOLVER_KEYS: frozenset[str] = frozenset(
     (StuppFKPPSolver._REQUIRED | set(StuppFKPPSolver._DEFAULTS))
     - {"gray_matter_pbmap", "white_matter_pbmap"}
     - _STUPP_TREATMENT_KEYS
-) | set(_MANIFEST_HORIZON_KEYS) | set(_MANIFEST_TIME_STEP_KEYS)
+) | set(_MANIFEST_TIME_STEP_KEYS)
 
 
 def _read_manifest(path: str | Path) -> tuple[Path, dict[str, Any]]:
@@ -1330,53 +1347,23 @@ def tissue_paths_from_manifest(path: str | Path) -> dict[str, Path]:
     }
 
 
-def resolve_horizon(
+def resolve_time_step(
     params: dict[str, Any], resection_time: float | None
 ) -> dict[str, Any]:
     """
-    Translate the horizon alternative 'time_after_resection' of a params
-    dict into the solver's stopping_time parameter,
-    stopping_time = resection_time + time_after_resection.
-
-    At most one of 'stopping_time' and 'time_after_resection' may be set;
-    the latter needs a resection time.
-
-    Args:
-        params: Parameter dict, possibly holding 'time_after_resection'.
-        resection_time: The resection time in days, or None if the run has
-            no resection.
-
-    Returns:
-        A copy without 'time_after_resection', with 'stopping_time' set if
-        it was present.
-    """
-    params = dict(params)
-    present = [key for key in _MANIFEST_HORIZON_KEYS if params.get(key) is not None]
-    if len(present) > 1:
-        raise ValueError(f"set at most one of {list(_MANIFEST_HORIZON_KEYS)}, got {present}.")
-    time_after = params.pop("time_after_resection", None)
-    if time_after is not None:
-        if resection_time is None:
-            raise ValueError("'time_after_resection' requires a resection time.")
-        if not (np.isfinite(time_after) and time_after >= 0):
-            raise ValueError(
-                f"time_after_resection must be a finite nonnegative number, got {time_after!r}."
-            )
-        params["stopping_time"] = float(resection_time) + float(time_after)
-    return params
-
-
-def resolve_time_step(params: dict[str, Any]) -> dict[str, Any]:
-    """
     Translate the time-step alternatives 'dt' and 'steps_per_day' of a
-    params dict into the solver's n_steps parameter.
+    StuppFKPPSolver params dict into the solver's n_steps parameter.
 
     At most one of 'n_steps', 'dt' and 'steps_per_day' may be set; 'dt'
-    and 'steps_per_day' (dt = 1 / steps_per_day) need 'stopping_time' in
-    the same dict and go through ``n_steps_from_dt``.
+    and 'steps_per_day' (dt = 1 / steps_per_day) go through
+    ``n_steps_from_dt`` with the horizon resection_time +
+    'time_after_resection', so they need that key in the same dict and a
+    resection time.
 
     Args:
         params: Parameter dict, possibly holding 'dt' or 'steps_per_day'.
+        resection_time: The resection time in days; None is accepted when
+            no translation is needed.
 
     Returns:
         A copy without 'dt' / 'steps_per_day', with 'n_steps' set if one
@@ -1395,9 +1382,12 @@ def resolve_time_step(params: dict[str, Any]) -> dict[str, Any]:
             )
         dt = 1.0 / float(steps_per_day)
     if dt is not None:
-        if params.get("stopping_time") is None:
-            raise ValueError(f"{present[0]!r} requires 'stopping_time' alongside it.")
-        params["n_steps"] = n_steps_from_dt(params["stopping_time"], dt)
+        if params.get("time_after_resection") is None:
+            raise ValueError(f"{present[0]!r} requires 'time_after_resection' alongside it.")
+        if resection_time is None:
+            raise ValueError(f"{present[0]!r} requires a resection time.")
+        horizon = float(resection_time) + float(params["time_after_resection"])
+        params["n_steps"] = n_steps_from_dt(horizon, dt)
     return params
 
 
@@ -1410,17 +1400,16 @@ def solver_params_from_manifest(
 
     The section may hold any scalar StuppFKPPSolver parameter under its
     solver name (rho, white_matter_diffusivity, diffusivity_ratio,
-    resolution_factor, stopping_time, n_steps, precision,
+    resolution_factor, time_after_resection, n_steps, precision,
     gaussian_seed_x/y/z_fraction, gaussian_seed_scale/diffusion_time/
     mass/floor, voxel_size_mm, stopping_threshold, stopping_mode,
     volume_threshold, min_tissue_fraction, n_time_series_snapshots,
-    verbose), plus the horizon alternative 'time_after_resection'
-    (stopping_time = the manifest's resection time + it, see
-    ``resolve_horizon``) and the time-step alternatives 'dt' (days) and
+    verbose), plus the time-step alternatives 'dt' (days) and
     'steps_per_day', translated to n_steps by ``resolve_time_step`` with
-    the resolved stopping_time. A 'stopping_threshold' of "inf" is
-    accepted (JSON has no infinity); voxel_size_mm lists become tuples.
-    Values are passed through otherwise; the solver validates them.
+    the horizon = the manifest's resection time + time_after_resection. A
+    'stopping_threshold' of "inf" is accepted (JSON has no infinity);
+    voxel_size_mm lists become tuples. Values are passed through
+    otherwise; the solver validates them.
 
     The treatment parameters live in their own sections, see
     ``treatment_params_from_manifest``; the tissue maps in 'tissue', see
@@ -1428,12 +1417,10 @@ def solver_params_from_manifest(
 
     Args:
         path: Path of the JSON manifest.
-        resolve: Translate 'time_after_resection' into 'stopping_time'
-            and 'dt' / 'steps_per_day' into 'n_steps' (the default). With
-            False they are returned as given (checked for mutual
-            exclusivity only), for callers that merge further overrides
-            before calling ``resolve_horizon`` / ``resolve_time_step``
-            themselves.
+        resolve: Translate 'dt' / 'steps_per_day' into 'n_steps' (the
+            default). With False they are returned as given (checked for
+            mutual exclusivity only), for callers that merge further
+            overrides before calling ``resolve_time_step`` themselves.
 
     Returns:
         The solver parameters of the section (an empty dict if absent);
@@ -1444,19 +1431,18 @@ def solver_params_from_manifest(
     if "solver" not in manifest:
         return {}
     params = _manifest_section(manifest, "solver")
-    for group in (_MANIFEST_HORIZON_KEYS, _MANIFEST_TIME_STEP_KEYS):
-        present = [key for key in group if key in params]
-        if len(present) > 1:
-            raise ValueError(
-                f"manifest section 'solver': set at most one of {list(group)}, "
-                f"not {present}."
-            )
+    present = [key for key in _MANIFEST_TIME_STEP_KEYS if key in params]
+    if len(present) > 1:
+        raise ValueError(
+            f"manifest section 'solver': set at most one of "
+            f"{list(_MANIFEST_TIME_STEP_KEYS)}, not {present}."
+        )
     if resolve:
         resection_time = None
         if "resection" in manifest:
             resection_time = float(_manifest_section(manifest, "resection")["time"])
         try:
-            params = resolve_time_step(resolve_horizon(params, resection_time))
+            params = resolve_time_step(params, resection_time)
         except ValueError as exc:
             raise ValueError(f"manifest section 'solver': {exc}") from exc
     if "voxel_size_mm" in params:
@@ -1477,8 +1463,8 @@ def treatment_params_from_manifest(path: str | Path) -> dict[str, Any]:
 
         "resection":     {"time": <day>, "tumor_segmentation": <NIfTI path>,
                           "cavity_label": <int>}
-        "chemotherapy":  {"times": [<days>], "kill_rate": <1/day>,
-                          "decay_rate": <1/day>}
+        "chemotherapy":  {"times": [<days>], "doses": [<mg/m^2>, one per time],
+                          "kill_rate": <1/day per mg/m^2>, "decay_rate": <1/day>}
         "radiotherapy":  {"times": [<days>], "dose": <NIfTI path, TOTAL Gy>,
                           "alpha": <1/Gy>, "beta": <1/Gy^2>}
 
@@ -1500,9 +1486,9 @@ def treatment_params_from_manifest(path: str | Path) -> dict[str, Any]:
     Returns:
         The solver parameters of the treatment sections, ready to be merged
         into the StuppFKPPSolver params dict: 'resection_time',
-        'resection_cavity' (bool array), 'chemo_times', 'chemo_kill_rate',
-        'chemo_decay_rate', 'rt_times', 'rt_dose' (float64 array, Gy),
-        'rt_alpha', 'rt_beta'.
+        'resection_cavity' (bool array), 'chemo_times', 'chemo_doses'
+        (float64 array, mg/m^2), 'chemo_kill_rate', 'chemo_decay_rate',
+        'rt_times', 'rt_dose' (float64 array, Gy), 'rt_alpha', 'rt_beta'.
     """
     manifest_path, manifest = _read_manifest(path)
     missing = [name for name in _MANIFEST_TREATMENT_SECTIONS if name not in manifest]
@@ -1521,6 +1507,7 @@ def treatment_params_from_manifest(path: str | Path) -> dict[str, Any]:
     params["resection_cavity"] = np.rint(segmentation).astype(np.int64) == label
     section = _manifest_section(manifest, "chemotherapy")
     params["chemo_times"] = np.asarray(section["times"], dtype=np.float64)
+    params["chemo_doses"] = np.asarray(section["doses"], dtype=np.float64)
     params["chemo_kill_rate"] = float(section["kill_rate"])
     params["chemo_decay_rate"] = float(section["decay_rate"])
     section = _manifest_section(manifest, "radiotherapy")

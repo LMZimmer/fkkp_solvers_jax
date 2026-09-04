@@ -247,6 +247,32 @@ def _validate_nonnegative_scalar(
     return float(value)
 
 
+def _validate_positive_scalar(
+    parameters: Mapping[str, Any], key: str, solver_name: str
+) -> float:
+    """Check that the parameter named key is a finite scalar > 0; return it
+    as a float."""
+    value = parameters[key]
+    if not (np.isscalar(value) and np.isfinite(value) and value > 0):
+        raise ValueError(
+            f"{solver_name}: {key} must be a finite positive scalar, got {value!r}."
+        )
+    return float(value)
+
+
+def _validate_nonnegative_sequence(
+    parameters: Mapping[str, Any], key: str, solver_name: str
+) -> NDArray:
+    """Check that the parameter named key is a 1-D sequence of finite
+    nonnegative numbers; return it as a float64 array."""
+    values = np.asarray(parameters[key], dtype=np.float64)
+    if values.ndim != 1:
+        raise ValueError(f"{solver_name}: {key} must be a 1-D sequence.")
+    if not np.all(np.isfinite(values)) or np.any(values < 0):
+        raise ValueError(f"{solver_name}: {key} must be finite and nonnegative.")
+    return values
+
+
 def _validate_event_times(
     parameters: Mapping[str, Any], key: str, solver_name: str
 ) -> NDArray:
@@ -256,11 +282,7 @@ def _validate_event_times(
     parameters' stopping_time are legal but never fire; a warning names
     them.
     """
-    times = np.asarray(parameters[key], dtype=np.float64)
-    if times.ndim != 1:
-        raise ValueError(f"{solver_name}: {key} must be a 1-D sequence of times.")
-    if not np.all(np.isfinite(times)) or np.any(times < 0):
-        raise ValueError(f"{solver_name}: {key} must be finite and nonnegative.")
+    times = _validate_nonnegative_sequence(parameters, key, solver_name)
     stopping_time = float(parameters["stopping_time"])
     late = times[times > stopping_time]
     if late.size:
@@ -337,8 +359,10 @@ class BaseFKPPSolver(ABC):
         self._validate_extra(merged)
         self.params = merged
 
-    def _validate_extra(self, params: Mapping[str, Any]) -> None:
-        """Solver-specific validation beyond the shared parameters."""
+    def _validate_extra(self, params: dict[str, Any]) -> None:
+        """Solver-specific validation beyond the shared parameters. The
+        merged dict is passed and may be completed with derived parameters
+        (as ``_validate_parameters`` does for volume_threshold)."""
 
     @property
     def voxel_volume(self) -> float:

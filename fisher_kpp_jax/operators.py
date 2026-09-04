@@ -304,18 +304,28 @@ def elongate_tensor_along_principal_axis(
 
 
 def chemo_concentration(
-    t: jax.Array, session_times: jax.Array, decay_rate: jax.Array
+    t: jax.Array,
+    session_times: jax.Array,
+    session_doses: jax.Array,
+    decay_rate: jax.Array,
 ) -> jax.Array:
     """
     Evaluate the chemotherapy drug concentration at time t.
 
-    Each session deposits a unit concentration that decays exponentially:
-    C(t) = sum_j [t >= session_times[j]] * exp(-decay_rate * (t -
-    session_times[j])). Sessions in the future of t contribute zero.
+    Each session j deposits a concentration equal to its dose d_j that
+    decays exponentially::
+
+        C(t) = sum_j d_j [t >= t_j] exp(-decay_rate (t - t_j))
+
+    Sessions in the future of t contribute zero. The solver integrates C
+    over each step with ``chemo_exposure`` instead of sampling it; this
+    point evaluation is kept for tests and plots.
 
     Args:
         t: Evaluation time, 0-d scalar.
-        session_times: Chemotherapy session times, 1-D array.
+        session_times: Chemotherapy session times t_j, 1-D array.
+        session_doses: Session doses d_j (mg/m^2), 1-D array of the same
+            length as session_times.
         decay_rate: Exponential decay rate of the concentration, 0-d
             scalar.
 
@@ -323,8 +333,51 @@ def chemo_concentration(
         The concentration C(t), 0-d, at the dtype of the inputs.
     """
     elapsed = t - session_times
-    contributions = jnp.where(elapsed >= 0, jnp.exp(-decay_rate * elapsed), 0)
+    contributions = jnp.where(
+        elapsed >= 0, session_doses * jnp.exp(-decay_rate * elapsed), 0
+    )
     return jnp.sum(contributions)
+
+
+def chemo_exposure(
+    t0: jax.Array,
+    t1: jax.Array,
+    session_times: jax.Array,
+    session_doses: jax.Array,
+    decay_rate: jax.Array,
+) -> jax.Array:
+    """
+    Integrate the chemotherapy drug concentration over the interval
+    [t0, t1] in closed form.
+
+    With C(t) of ``chemo_concentration`` and a_j = (t0 - t_j)^+,
+    b_j = (t1 - t_j)^+ the exposure is::
+
+        int_{t0}^{t1} C dt = (1 / decay_rate) sum_j d_j (exp(-decay_rate a_j)
+                                                          - exp(-decay_rate b_j))
+
+    which is exact for any interval length and for session times inside
+    the interval (then a_j = 0). Sessions after t1 contribute exactly zero
+    (a_j = b_j = 0). The difference is evaluated as
+    exp(-decay_rate a_j) * (-expm1(-decay_rate (b_j - a_j))) so that short
+    intervals keep their precision in f32.
+
+    Args:
+        t0: Interval start, 0-d scalar.
+        t1: Interval end, 0-d scalar, >= t0.
+        session_times: Chemotherapy session times t_j, 1-D array.
+        session_doses: Session doses d_j (mg/m^2), 1-D array of the same
+            length as session_times.
+        decay_rate: Exponential decay rate of the concentration, 0-d
+            scalar, > 0.
+
+    Returns:
+        The exposure, 0-d, at the dtype of the inputs.
+    """
+    a = jnp.maximum(t0 - session_times, 0)
+    b = jnp.maximum(t1 - session_times, 0)
+    per_session = jnp.exp(-decay_rate * a) * (-jnp.expm1(-decay_rate * (b - a)))
+    return jnp.sum(session_doses * per_session) / decay_rate
 
 
 def lq_log_kill(

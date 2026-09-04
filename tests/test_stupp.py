@@ -6,8 +6,9 @@ reduces to ``FKPPSolver`` with neutral treatment values (every treatment
 parameter is required; ``neutral_treatment_params`` switches the three
 treatments off through their values), (b) closed forms of the three
 treatment effects in limits where they decouple from growth/diffusion (RT
-impulse under mass-conserving diffusion, chemotherapy under pure reaction,
-resection projection and cavity isolation), (c) the jit-cache and precision
+impulse under mass-conserving diffusion, the exact chemotherapy exposure
+without growth and diffusion, resection projection and cavity isolation),
+(c) the jit-cache and precision
 behavior, (d) parameter validation and (e) the JSON manifest loader.
 """
 
@@ -25,7 +26,6 @@ from loguru import logger
 from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, operators
 from fisher_kpp_jax.solvers import (
     n_steps_from_dt,
-    resolve_horizon,
     resolve_time_step,
     solver_params_from_manifest,
     tissue_paths_from_manifest,
@@ -37,9 +37,10 @@ _COMMON = dict(
     gaussian_seed_y_fraction=0.5,
     gaussian_seed_z_fraction=0.5,
     resolution_factor=0.6,
-    stopping_time=10,
     precision="f64",
 )
+# Horizon of the Stupp runs: resection at day 2 + 8 days = 10 days.
+HORIZON = 10.0
 
 # f32 vs f64 tolerance on the final field of a short treated solve, matching
 # the untreated test_solvers.py budget (observed max-abs difference ~1e-4).
@@ -52,8 +53,10 @@ def neutral_treatment_params(shape: tuple[int, int, int], **overrides) -> dict:
     times lie inside the 10-day horizon so that nothing warns."""
     params = dict(
         resection_time=2.0,
+        time_after_resection=HORIZON - 2.0,
         resection_cavity=np.zeros(shape, dtype=bool),
         chemo_times=np.array([1.0, 3.0, 5.0]),
+        chemo_doses=np.array([75.0, 75.0, 75.0]),
         chemo_kill_rate=0.0,
         chemo_decay_rate=0.5,
         rt_times=np.array([3.3, 5.3, 7.3]),
@@ -92,9 +95,11 @@ def treatment_params(shape: tuple[int, int, int], **overrides) -> dict:
     """All three treatments enabled with events inside a 10-day horizon."""
     params = dict(
         resection_time=2.0,
+        time_after_resection=HORIZON - 2.0,
         resection_cavity=off_center_cavity(shape),
         chemo_times=np.array([1.0, 3.0, 5.0]),
-        chemo_kill_rate=0.1,
+        chemo_doses=np.array([75.0, 150.0, 200.0]),
+        chemo_kill_rate=0.1 / 75,  # per mg/m^2: a 75 mg/m^2 session kills as 0.1 per unit
         chemo_decay_rate=0.5,
         rt_times=np.array([3.3, 5.3, 7.3]),
         rt_dose=np.full(shape, 6.0),
@@ -130,7 +135,7 @@ def test_neutral_treatment_equals_fkpp(tissue_phantom):
     gm, wm = tissue_phantom
     params = base_params(gm, wm, n_time_series_snapshots=3)
     untreated = {k: v for k, v in params.items() if k not in neutral_treatment_params(gm.shape)}
-    reference = FKPPSolver(untreated).solve()
+    reference = FKPPSolver({**untreated, "stopping_time": HORIZON}).solve()
     result = StuppFKPPSolver(params).solve()
     assert reference.success and result.success, (reference.error, result.error)
     assert result.final_time == reference.final_time
@@ -174,7 +179,7 @@ def test_rt_impulse_is_exact(tissue_phantom):
     initial_mass = lowres_seed_mass(solver)
     dose_per_fraction = total_dose / rt_times.size
     log_kill = alpha * dose_per_fraction + beta * dose_per_fraction**2
-    n_hits = int((rt_times <= params["stopping_time"]).sum())
+    n_hits = int((rt_times <= HORIZON).sum())
     assert n_hits == 4
     np.testing.assert_allclose(
         result.final_stopping_quantity,
@@ -189,77 +194,65 @@ def test_rt_impulse_is_exact(tissue_phantom):
     )
 
 
-def _chemo_concentration_numpy(t, times, decay):
-    elapsed = t - times
-    return np.where(elapsed >= 0, np.exp(-decay * elapsed), 0.0).sum()
-
-
-@pytest.mark.parametrize("n_steps", [100, 200, 400])
-def test_ct_matches_euler_product_and_closed_form(tissue_phantom, n_steps):
-    """rho=0, D=0: each step scales every voxel by 1 - dt k C(t0), so the
-    final mass is the initial mass times the product of these factors
-    exactly (f64), and approximates the closed form
-    m0 exp(-k sum_j (1 - exp(-decay (T - t_j)_+)) / decay) with an O(dt)
-    relative error; the bound below is verified empirically
-    (test_ct_error_is_first_order)."""
-    gm, wm = tissue_phantom
-    times = np.array([1.0, 3.0, 5.0])
-    kill_rate, decay_rate, horizon = 0.3, 0.5, 10.0
-    params = base_params(
+def _ct_only_params(gm, wm, n_steps: int, doses: np.ndarray, **overrides) -> dict:
+    """Chemotherapy alone: no growth, no diffusion, off-grid session times."""
+    return base_params(
         gm,
         wm,
         rho=0.0,
         white_matter_diffusivity=0.0,
-        stopping_time=horizon,
         n_steps=n_steps,
-        chemo_times=times,
-        chemo_kill_rate=kill_rate,
-        chemo_decay_rate=decay_rate,
+        chemo_times=np.array([1.37, 3.0, 5.91]),
+        chemo_doses=doses,
+        chemo_kill_rate=0.3 / 75,
+        chemo_decay_rate=0.5,
+        **overrides,
     )
-    solver = StuppFKPPSolver(params)
-    result = solver.solve()
-    assert result.success, result.error
-    m0 = lowres_seed_mass(solver)
-    dt = horizon / n_steps
-    factors = [
-        1 - dt * kill_rate * _chemo_concentration_numpy(s * dt, times, decay_rate)
-        for s in range(n_steps)
-    ]
-    np.testing.assert_allclose(
-        result.final_stopping_quantity, m0 * np.prod(factors), rtol=1e-12
-    )
-    exposure = ((1 - np.exp(-decay_rate * np.maximum(horizon - times, 0))) / decay_rate).sum()
-    closed_form = m0 * np.exp(-kill_rate * exposure)
-    rel_error = abs(result.final_stopping_quantity - closed_form) / closed_form
-    assert rel_error < 0.8 * dt  # empirically ~0.64 * dt for this schedule
 
 
-def test_ct_error_is_first_order(tissue_phantom):
-    """Doubling the step count roughly halves the closed-form error."""
+def _ct_closed_form_survival(params: dict) -> float:
+    """exp(-k sum_j d_j (1 - exp(-lambda (T - t_j)^+)) / lambda) over the horizon."""
+    times = np.asarray(params["chemo_times"], dtype=np.float64)
+    doses = np.asarray(params["chemo_doses"], dtype=np.float64)
+    decay = float(params["chemo_decay_rate"])
+    elapsed = np.maximum(HORIZON - times, 0.0)
+    return float(np.exp(-params["chemo_kill_rate"] * np.sum(doses * (1 - np.exp(-decay * elapsed))) / decay))
+
+
+@pytest.mark.parametrize("n_steps", [100, 200, 400])
+def test_ct_is_exact_and_step_independent(tissue_phantom, n_steps):
+    """rho=0, D=0: the per-step exposure is integrated in closed form, so
+    the final mass equals m0 exp(-k sum_j d_j (1 - exp(-lambda (T - t_j)))
+    / lambda) for every step count (session times off the step grid), and
+    the step counts agree with each other."""
     gm, wm = tissue_phantom
-    times = np.array([1.0, 3.0, 5.0])
-    kill_rate, decay_rate, horizon = 0.3, 0.5, 10.0
-    exposure = ((1 - np.exp(-decay_rate * (horizon - times))) / decay_rate).sum()
-    errors = []
-    for n_steps in (100, 200, 400):
-        solver = StuppFKPPSolver(
-            base_params(
-                gm,
-                wm,
-                rho=0.0,
-                white_matter_diffusivity=0.0,
-                stopping_time=horizon,
-                n_steps=n_steps,
-                chemo_times=times,
-                chemo_kill_rate=kill_rate,
-                chemo_decay_rate=decay_rate,
-            )
-        )
+    doses = np.array([75.0, 150.0, 200.0])
+    results = {}
+    for steps in (100, 200, 400):
+        solver = StuppFKPPSolver(_ct_only_params(gm, wm, steps, doses))
         result = solver.solve()
-        closed_form = lowres_seed_mass(solver) * np.exp(-kill_rate * exposure)
-        errors.append(abs(result.final_stopping_quantity - closed_form) / closed_form)
-    ratios = np.array(errors[:-1]) / np.array(errors[1:])
-    assert np.all(ratios > 1.7) and np.all(ratios < 2.3), errors
+        assert result.success, result.error
+        results[steps] = (result.final_stopping_quantity, lowres_seed_mass(solver))
+    final, m0 = results[n_steps]
+    np.testing.assert_allclose(
+        final, m0 * _ct_closed_form_survival(_ct_only_params(gm, wm, n_steps, doses)), rtol=1e-10
+    )
+    for other, (other_final, _) in results.items():
+        np.testing.assert_allclose(final, other_final, rtol=1e-12)
+
+
+def test_ct_dose_scales_log_kill(tissue_phantom):
+    """Doubling every dose squares the survival factor final / m0."""
+    gm, wm = tissue_phantom
+    doses = np.array([75.0, 150.0, 200.0])
+    survival = []
+    for factor in (1.0, 2.0):
+        solver = StuppFKPPSolver(_ct_only_params(gm, wm, 200, factor * doses))
+        result = solver.solve()
+        assert result.success, result.error
+        survival.append(result.final_stopping_quantity / lowres_seed_mass(solver))
+    assert survival[0] < 1.0
+    np.testing.assert_allclose(survival[1], survival[0] ** 2, rtol=1e-10)
 
 
 def test_resection_projection_and_isolation(tissue_phantom):
@@ -278,6 +271,7 @@ def test_resection_projection_and_isolation(tissue_phantom):
         rho=0.0,
         resolution_factor=1.0,
         resection_time=0.0,
+        time_after_resection=HORIZON,
         resection_cavity=cavity,
         n_time_series_snapshots=n_snapshots,
     )
@@ -311,6 +305,7 @@ def test_resection_mid_run(tissue_phantom):
         wm,
         resolution_factor=1.0,
         resection_time=5.0,
+        time_after_resection=HORIZON - 5.0,
         resection_cavity=cavity,
         n_time_series_snapshots=n_snapshots,
     )
@@ -327,16 +322,19 @@ def test_resection_mid_run(tissue_phantom):
 
 
 def test_events_beyond_horizon_are_inert(tissue_phantom):
-    """Treatments whose event times all lie beyond stopping_time leave the
-    result identical to the untreated run (the concentration is exactly
-    zero, no fraction is hit, the resection never activates)."""
+    """Chemotherapy and radiotherapy whose event times all lie beyond the
+    horizon leave the result identical to the untreated run (the
+    concentration is exactly zero, no fraction is hit). The resection can
+    never lie beyond the horizon, which is measured from it."""
     gm, wm = tissue_phantom
-    late = treatment_params(
-        gm.shape,
-        resection_time=50.0,
-        chemo_times=np.array([20.0, 30.0]),
-        rt_times=np.array([25.0, 26.0]),
-    )
+    full = treatment_params(gm.shape)
+    late = {
+        "chemo_times": np.array([20.0, 30.0]),
+        "chemo_doses": np.array([75.0, 150.0]),
+        "chemo_kill_rate": full["chemo_kill_rate"],
+        "rt_times": np.array([25.0, 26.0]),
+        "rt_dose": full["rt_dose"],
+    }
     params = base_params(gm, wm, n_time_series_snapshots=3)
     reference = StuppFKPPSolver(params).solve()
     result = StuppFKPPSolver({**params, **late}).solve()
@@ -368,8 +366,9 @@ def test_late_event_times_warn(tissue_phantom):
 
 
 def test_no_retrace_on_treatment_value_change(tissue_phantom):
-    """Treatment VALUES (times, rates, dose, alpha/beta, cavity mask) are
-    traced device arguments: re-solves that change only them, with the
+    """Treatment VALUES (times, chemo doses, rates, RT dose, alpha/beta,
+    cavity mask) are traced device arguments: re-solves that change only
+    them, with the
     same treatment configuration and the same number of session times,
     reuse the compiled scan (operators.SCAN_TRACE_COUNT is a trace-time
     counter)."""
@@ -385,9 +384,11 @@ def test_no_retrace_on_treatment_value_change(tissue_phantom):
             **params,
             "rho": 0.16,
             "resection_time": 4.0,
+            "time_after_resection": HORIZON - 4.0,  # keep the horizon (step count)
             "resection_cavity": other_cavity,
             "chemo_times": np.array([0.5, 2.5, 6.5]),
-            "chemo_kill_rate": 0.2,
+            "chemo_doses": np.array([80.0, 160.0, 210.0]),
+            "chemo_kill_rate": 0.2 / 75,
             "chemo_decay_rate": 0.7,
             "rt_times": np.array([2.2, 4.2, 6.2]),
             "rt_dose": np.full(gm.shape, 9.0),
@@ -452,12 +453,34 @@ def test_validation_errors(tissue_phantom):
         build(**{**full, "rt_times": np.array([])})
     with pytest.raises(ValueError, match="chemo_kill_rate"):
         build(**{**full, "chemo_kill_rate": -0.1})
+    # Chemo doses: one finite nonnegative dose per session.
+    with pytest.raises(ValueError, match="chemo_doses"):
+        build(**{**full, "chemo_doses": np.array([75.0, 150.0])})
+    with pytest.raises(ValueError, match="chemo_doses"):
+        build(**{**full, "chemo_doses": np.array([75.0, -1.0, 200.0])})
+    with pytest.raises(ValueError, match="chemo_doses"):
+        build(**{**full, "chemo_doses": np.zeros((3, 1))})
+    with pytest.raises(ValueError, match="chemo_doses"):
+        build(**{**full, "chemo_doses": np.array([75.0, np.inf, 200.0])})
+    # The decay rate divides the exposure: zero is no longer an "off" value.
+    with pytest.raises(ValueError, match="chemo_decay_rate"):
+        build(**{**full, "chemo_decay_rate": 0.0})
+    # Chemotherapy is switched off by the kill rate or by the doses.
+    build(**{**full, "chemo_kill_rate": 0.0})
+    build(**{**full, "chemo_doses": np.zeros(3)})
     with pytest.raises(ValueError, match="rt_alpha"):
         build(**{**full, "rt_alpha": np.nan})
     with pytest.raises(ValueError, match="resection_time"):
         build(**{**full, "resection_time": -1.0})
+    with pytest.raises(ValueError, match="time_after_resection"):
+        build(**{**full, "time_after_resection": -1.0})
     with pytest.raises(ValueError, match="unknown"):
         build(**{**full, "rt_gamma": 1.0})
+    # The horizon is time_after_resection only; stopping_time is not accepted.
+    with pytest.raises(ValueError, match="stopping_time"):
+        build(**{**full, "stopping_time": 10.0})
+    solver = build(**full)
+    assert solver.params["stopping_time"] == full["resection_time"] + full["time_after_resection"]
 
 
 # --- manifest loader ---
@@ -494,7 +517,12 @@ def test_manifest_loader_full(manifest_dir):
             "tumor_segmentation": str(tmp_path / "seg.nii.gz"),
             "cavity_label": 4,
         },
-        "chemotherapy": {"times": [24, 25, 26], "kill_rate": 0.05, "decay_rate": 1.0},
+        "chemotherapy": {
+            "times": [24, 25, 26],
+            "doses": [75, 150, 200],
+            "kill_rate": 0.05,
+            "decay_rate": 1.0,
+        },
         "radiotherapy": {
             "times": [24.0, 25.0],
             "dose": "dose.nii.gz",  # relative to the manifest directory
@@ -508,6 +536,7 @@ def test_manifest_loader_full(manifest_dir):
         "resection_time",
         "resection_cavity",
         "chemo_times",
+        "chemo_doses",
         "chemo_kill_rate",
         "chemo_decay_rate",
         "rt_times",
@@ -521,6 +550,8 @@ def test_manifest_loader_full(manifest_dir):
     assert params["resection_cavity"].any() and not params["resection_cavity"].all()
     np.testing.assert_array_equal(params["chemo_times"], [24.0, 25.0, 26.0])
     assert params["chemo_times"].dtype == np.float64
+    np.testing.assert_array_equal(params["chemo_doses"], [75.0, 150.0, 200.0])
+    assert params["chemo_doses"].dtype == np.float64
     assert params["chemo_kill_rate"] == 0.05 and params["chemo_decay_rate"] == 1.0
     np.testing.assert_array_equal(params["rt_times"], [24.0, 25.0])
     np.testing.assert_array_equal(params["rt_dose"], dose)
@@ -529,7 +560,9 @@ def test_manifest_loader_full(manifest_dir):
 
 def test_manifest_loader_requires_all_sections(manifest_dir):
     tmp_path, _, _ = manifest_dir
-    manifest = {"chemotherapy": {"times": [1.0], "kill_rate": 0.1, "decay_rate": 0.5}}
+    manifest = {
+        "chemotherapy": {"times": [1.0], "doses": [75.0], "kill_rate": 0.1, "decay_rate": 0.5}
+    }
     with pytest.raises(ValueError, match=r"missing treatment section.*resection.*radiotherapy"):
         treatment_params_from_manifest(_write_manifest(tmp_path, manifest))
     with pytest.raises(ValueError, match="missing treatment section"):
@@ -542,10 +575,17 @@ def test_manifest_loader_errors(manifest_dir):
         treatment_params_from_manifest(tmp_path / "missing.json")
     full = {
         "resection": {"time": 1, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4},
-        "chemotherapy": {"times": [1], "kill_rate": 1, "decay_rate": 1},
+        "chemotherapy": {"times": [1], "doses": [75], "kill_rate": 1, "decay_rate": 1},
         "radiotherapy": {"times": [1], "dose": "dose.nii.gz", "alpha": 0.1, "beta": 0.01},
     }
     treatment_params_from_manifest(_write_manifest(tmp_path, full))  # accepted
+    with pytest.raises(ValueError, match=r"missing key\(s\).*doses"):
+        treatment_params_from_manifest(
+            _write_manifest(
+                tmp_path,
+                {**full, "chemotherapy": {"times": [1], "kill_rate": 1, "decay_rate": 1}},
+            )
+        )
     missing_volume = {
         **full,
         "resection": {**full["resection"], "tumor_segmentation": str(tmp_path / "nope.nii.gz")},
@@ -578,7 +618,12 @@ def test_manifest_params_drive_solver(manifest_dir, tissue_phantom):
     _write_nifti(tmp_path / "dose24.nii.gz", np.full(gm.shape, 6.0, dtype=np.float32))
     manifest = {
         "resection": {"time": 2.0, "tumor_segmentation": "seg24.nii.gz", "cavity_label": 4},
-        "chemotherapy": {"times": [3.3, 5.3], "kill_rate": 0.1, "decay_rate": 0.5},
+        "chemotherapy": {
+            "times": [3.3, 5.3],
+            "doses": [75.0, 150.0],
+            "kill_rate": 0.1 / 75,
+            "decay_rate": 0.5,
+        },
         "radiotherapy": {"times": [3.3, 5.3], "dose": "dose24.nii.gz", "alpha": 0.1, "beta": 0.01},
     }
     treatment = treatment_params_from_manifest(_write_manifest(tmp_path, manifest))
@@ -586,11 +631,17 @@ def test_manifest_params_drive_solver(manifest_dir, tissue_phantom):
     assert result.success, result.error
     untreated = StuppFKPPSolver(base_params(gm, wm)).solve()
     assert result.final_stopping_quantity < untreated.final_stopping_quantity
+    # A dose list of the wrong length passes the loader and fails in the solver.
+    mismatched = {**manifest, "chemotherapy": {**manifest["chemotherapy"], "doses": [75.0]}}
+    treatment = treatment_params_from_manifest(_write_manifest(tmp_path, mismatched))
+    with pytest.raises(ValueError, match="chemo_doses"):
+        StuppFKPPSolver(base_params(gm, wm, **treatment))
 
 
 def test_manifest_solver_and_tissue_sections(manifest_dir):
     """The optional 'solver' section maps 1:1 to scalar solver params (dt
-    becomes n_steps, voxel_size_mm a tuple, "inf" a float); 'tissue' gives
+    becomes n_steps with the horizon resection time + time_after_resection,
+    voxel_size_mm a tuple, "inf" a float); 'tissue' gives
     the resolved pbmap paths; both are ignored by the treatment loader."""
     tmp_path, _, _ = manifest_dir
     manifest = {
@@ -600,14 +651,14 @@ def test_manifest_solver_and_tissue_sections(manifest_dir):
             "rho": 0.12,
             "white_matter_diffusivity": 0.4,
             "gaussian_seed_x_fraction": 0.4,
-            "stopping_time": 20.0,
+            "time_after_resection": 10.0,
             "dt": 0.1,
             "voxel_size_mm": [1.0, 1.5, 2.0],
             "stopping_threshold": "inf",
             "precision": "f64",
         },
         "resection": {"time": 10.0, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4},
-        "chemotherapy": {"times": [1.0], "kill_rate": 0.1, "decay_rate": 0.5},
+        "chemotherapy": {"times": [1.0], "doses": [75.0], "kill_rate": 0.1, "decay_rate": 0.5},
         "radiotherapy": {"times": [12.0], "dose": "dose.nii.gz", "alpha": 0.1, "beta": 0.01},
     }
     path = _write_manifest(tmp_path, manifest)
@@ -616,7 +667,7 @@ def test_manifest_solver_and_tissue_sections(manifest_dir):
         "rho": 0.12,
         "white_matter_diffusivity": 0.4,
         "gaussian_seed_x_fraction": 0.4,
-        "stopping_time": 20.0,
+        "time_after_resection": 10.0,
         "n_steps": 200,
         "voxel_size_mm": (1.0, 1.5, 2.0),
         "stopping_threshold": np.inf,
@@ -630,6 +681,7 @@ def test_manifest_solver_and_tissue_sections(manifest_dir):
         "resection_time",
         "resection_cavity",
         "chemo_times",
+        "chemo_doses",
         "chemo_kill_rate",
         "chemo_decay_rate",
         "rt_times",
@@ -648,11 +700,20 @@ def test_manifest_solver_section_drives_solver(manifest_dir, tissue_phantom):
     tmp_path, _, _ = manifest_dir
     path = _write_manifest(
         tmp_path,
-        {"solver": {"rho": 0.0, "white_matter_diffusivity": 0.3, "stopping_time": 5, "dt": 0.25}},
+        {
+            "resection": {"time": 2.0, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4},
+            "solver": {
+                "rho": 0.0,
+                "white_matter_diffusivity": 0.3,
+                "time_after_resection": 3.0,
+                "dt": 0.25,
+            },
+        },
     )
     params = {**base_params(gm, wm), **solver_params_from_manifest(path)}
     solver = StuppFKPPSolver(params)
     assert solver.params["n_steps"] == 20 and solver.params["rho"] == 0.0
+    assert solver.params["stopping_time"] == 5.0
     result = solver.solve()
     assert result.success and result.final_time == 5
 
@@ -665,18 +726,30 @@ def test_manifest_solver_section_errors(manifest_dir):
         solver_params_from_manifest(_write_manifest(tmp_path, {"solver": {"rt_alpha": 0.1}}))
     with pytest.raises(ValueError, match="at most one"):
         solver_params_from_manifest(
-            _write_manifest(tmp_path, {"solver": {"stopping_time": 1, "dt": 0.1, "n_steps": 5}})
+            _write_manifest(
+                tmp_path, {"solver": {"time_after_resection": 1, "dt": 0.1, "n_steps": 5}}
+            )
         )
     with pytest.raises(ValueError, match="at most one"):
         solver_params_from_manifest(
-            _write_manifest(tmp_path, {"solver": {"stopping_time": 1, "dt": 0.1, "steps_per_day": 3}})
+            _write_manifest(
+                tmp_path, {"solver": {"time_after_resection": 1, "dt": 0.1, "steps_per_day": 3}}
+            )
         )
-    with pytest.raises(ValueError, match="requires 'stopping_time'"):
+    with pytest.raises(ValueError, match="requires 'time_after_resection'"):
         solver_params_from_manifest(_write_manifest(tmp_path, {"solver": {"dt": 0.1}}))
+    with pytest.raises(ValueError, match="requires a resection time"):
+        solver_params_from_manifest(
+            _write_manifest(tmp_path, {"solver": {"time_after_resection": 1, "dt": 0.1}})
+        )
     with pytest.raises(ValueError, match="steps_per_day"):
         solver_params_from_manifest(
-            _write_manifest(tmp_path, {"solver": {"stopping_time": 1, "steps_per_day": 0}})
+            _write_manifest(
+                tmp_path, {"solver": {"time_after_resection": 1, "steps_per_day": 0}}
+            )
         )
+    with pytest.raises(ValueError, match="unknown key.*stopping_time"):
+        solver_params_from_manifest(_write_manifest(tmp_path, {"solver": {"stopping_time": 5}}))
     with pytest.raises(FileNotFoundError, match="wm pbmap"):
         tissue_paths_from_manifest(
             _write_manifest(tmp_path, {"tissue": {"wm": "nope.nii.gz", "gm": "seg.nii.gz"}})
@@ -696,55 +769,32 @@ def test_n_steps_from_dt():
 
 
 def test_steps_per_day_and_unresolved_manifest(manifest_dir):
-    """steps_per_day is dt = 1 / steps_per_day; with resolve=False the
-    loader hands the time-step keys through for a later
-    ``resolve_time_step`` on the merged params."""
-    tmp_path, _, _ = manifest_dir
-    path = _write_manifest(tmp_path, {"solver": {"stopping_time": 200.0, "steps_per_day": 3}})
-    assert solver_params_from_manifest(path) == {"stopping_time": 200.0, "n_steps": 600}
-    raw = solver_params_from_manifest(path, resolve=False)
-    assert raw == {"stopping_time": 200.0, "steps_per_day": 3}
-    assert resolve_time_step({**raw, "stopping_time": 50.0}) == {
-        "stopping_time": 50.0,
-        "n_steps": 150,
-    }
-    assert resolve_time_step({"rho": 1.0}) == {"rho": 1.0}
-    assert resolve_time_step({"n_steps": 7}) == {"n_steps": 7}
-    with pytest.raises(ValueError, match="at most one"):
-        resolve_time_step({"stopping_time": 1.0, "n_steps": 7, "dt": 0.1})
-    with pytest.raises(ValueError, match="requires 'stopping_time'"):
-        resolve_time_step({"steps_per_day": 3})
-
-
-def test_time_after_resection(manifest_dir):
-    """The horizon alternative: stopping_time = resection time + time after
-    resection, resolved from the manifest's own resection section."""
+    """steps_per_day is dt = 1 / steps_per_day over the horizon resection
+    time + time_after_resection; with resolve=False the loader hands the
+    time-step keys through for a later ``resolve_time_step`` on the merged
+    params."""
     tmp_path, _, _ = manifest_dir
     resection = {"time": 10.0, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4}
     path = _write_manifest(
         tmp_path,
-        {"resection": resection, "solver": {"time_after_resection": 100.0, "steps_per_day": 3}},
+        {"resection": resection, "solver": {"time_after_resection": 190.0, "steps_per_day": 3}},
     )
-    assert solver_params_from_manifest(path) == {"stopping_time": 110.0, "n_steps": 330}
-    assert solver_params_from_manifest(path, resolve=False) == {
-        "time_after_resection": 100.0,
-        "steps_per_day": 3,
+    assert solver_params_from_manifest(path) == {"time_after_resection": 190.0, "n_steps": 600}
+    raw = solver_params_from_manifest(path, resolve=False)
+    assert raw == {"time_after_resection": 190.0, "steps_per_day": 3}
+    assert resolve_time_step({**raw, "time_after_resection": 40.0}, 10.0) == {
+        "time_after_resection": 40.0,
+        "n_steps": 150,
     }
-    assert resolve_horizon({"time_after_resection": 5.0, "rho": 1.0}, 2.0) == {
-        "stopping_time": 7.0,
-        "rho": 1.0,
-    }
-    assert resolve_horizon({"stopping_time": 7.0}, None) == {"stopping_time": 7.0}
+    assert resolve_time_step({"rho": 1.0}, None) == {"rho": 1.0}
+    assert resolve_time_step({"n_steps": 7}, None) == {"n_steps": 7}
+    # Without a time step to translate no resection time is needed.
+    assert solver_params_from_manifest(
+        _write_manifest(tmp_path, {"solver": {"time_after_resection": 1}})
+    ) == {"time_after_resection": 1}
     with pytest.raises(ValueError, match="at most one"):
-        solver_params_from_manifest(
-            _write_manifest(
-                tmp_path,
-                {"resection": resection, "solver": {"time_after_resection": 1, "stopping_time": 2}},
-            )
-        )
-    with pytest.raises(ValueError, match="requires a resection"):
-        solver_params_from_manifest(
-            _write_manifest(tmp_path, {"solver": {"time_after_resection": 1}})
-        )
-    with pytest.raises(ValueError, match="nonnegative"):
-        resolve_horizon({"time_after_resection": -1.0}, 2.0)
+        resolve_time_step({"time_after_resection": 1.0, "n_steps": 7, "dt": 0.1}, 2.0)
+    with pytest.raises(ValueError, match="requires 'time_after_resection'"):
+        resolve_time_step({"steps_per_day": 3}, 2.0)
+    with pytest.raises(ValueError, match="requires a resection time"):
+        resolve_time_step({"time_after_resection": 1.0, "steps_per_day": 3}, None)

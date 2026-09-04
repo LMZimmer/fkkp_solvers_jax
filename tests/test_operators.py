@@ -230,25 +230,79 @@ def test_elongate_tensor_along_principal_axis(tensor_phantom: np.ndarray) -> Non
 
 
 def test_chemo_concentration() -> None:
-    """Superposition of unit doses decaying exponentially from each session
-    time; zero before the first session."""
+    """Superposition of the session doses decaying exponentially from each
+    session time; zero before the first session. Unit doses reproduce the
+    former unit-concentration model."""
     times = np.array([2.0, 5.0, 9.0])
+    ones = np.ones_like(times)
     decay = 0.3
-    assert _x64(jax_ops.chemo_concentration, 1.999, times, decay) == 0.0
+    assert _x64(jax_ops.chemo_concentration, 1.999, times, ones, decay) == 0.0
     # Exactly at a session time the dose counts in full.
-    np.testing.assert_allclose(_x64(jax_ops.chemo_concentration, 2.0, times, decay), 1.0)
+    np.testing.assert_allclose(_x64(jax_ops.chemo_concentration, 2.0, times, ones, decay), 1.0)
     # Single active dose: the decayed value.
     np.testing.assert_allclose(
-        _x64(jax_ops.chemo_concentration, 4.0, times, decay), np.exp(-0.3 * 2.0), rtol=1e-14
+        _x64(jax_ops.chemo_concentration, 4.0, times, ones, decay),
+        np.exp(-0.3 * 2.0),
+        rtol=1e-14,
     )
     # Superposition: the sum of the individual contributions.
     t = 7.5
     expected = sum(np.exp(-decay * (t - s)) for s in times if t >= s)
-    ours = _x64(jax_ops.chemo_concentration, t, times, decay)
+    ours = _x64(jax_ops.chemo_concentration, t, times, ones, decay)
     assert ours.shape == ()
     np.testing.assert_allclose(ours, expected, rtol=1e-14)
-    singles = [_x64(jax_ops.chemo_concentration, t, np.array([s]), decay) for s in times]
+    singles = [
+        _x64(jax_ops.chemo_concentration, t, np.array([s]), np.ones(1), decay) for s in times
+    ]
     np.testing.assert_allclose(ours, np.sum(singles), rtol=1e-14)
+    # Doses scale their session's contribution.
+    doses = np.array([75.0, 150.0, 200.0])
+    expected = sum(d * np.exp(-decay * (t - s)) for s, d in zip(times, doses) if t >= s)
+    np.testing.assert_allclose(
+        _x64(jax_ops.chemo_concentration, t, times, doses, decay), expected, rtol=1e-14
+    )
+
+
+def _concentration_numpy(t: float, times: np.ndarray, doses: np.ndarray, decay: float) -> float:
+    elapsed = t - times
+    return float(np.sum(np.where(elapsed >= 0, doses * np.exp(-decay * elapsed), 0.0)))
+
+
+def test_chemo_exposure() -> None:
+    """The closed-form step exposure int_{t0}^{t1} C dt: zero before every
+    session, equal to numerical quadrature of C for intervals that contain
+    a session time and intervals after it, linear in the doses, and
+    additive over a partition of [0, T] to the total exposure."""
+    from scipy.integrate import quad
+
+    times = np.array([2.0, 5.0, 9.0])
+    doses = np.array([75.0, 150.0, 200.0])
+    decay = 0.3
+
+    def exposure(t0: float, t1: float, d: np.ndarray = doses) -> np.ndarray:
+        return _x64(jax_ops.chemo_exposure, t0, t1, times, d, decay)
+
+    # (i) Entirely before every session: exactly zero.
+    assert exposure(0.0, 1.999) == 0.0
+    assert exposure(0.0, 1.999).shape == ()
+    # (ii) Intervals containing a session time, and intervals after it.
+    for t0, t1 in [(1.5, 2.5), (4.0, 5.5), (8.9, 9.1), (3.0, 4.0), (6.0, 8.0), (9.5, 30.0)]:
+        inside = [s for s in times if t0 < s < t1]
+        reference, _ = quad(
+            _concentration_numpy, t0, t1, args=(times, doses, decay), points=inside or None,
+            limit=200, epsabs=0.0, epsrel=1e-13,
+        )
+        np.testing.assert_allclose(exposure(t0, t1), reference, rtol=1e-10)
+    # (iii) Linear in the doses.
+    np.testing.assert_allclose(exposure(1.0, 7.0, 2.0 * doses), 2.0 * exposure(1.0, 7.0), rtol=1e-14)
+    single = [exposure(1.0, 7.0, np.where(np.arange(3) == j, doses, 0.0)) for j in range(3)]
+    np.testing.assert_allclose(exposure(1.0, 7.0), np.sum(single), rtol=1e-14)
+    # (iv) Additive over a partition of [0, T] to the total exposure.
+    horizon = 12.0
+    grid = np.linspace(0.0, horizon, 97)
+    total = sum(exposure(a, b) for a, b in zip(grid[:-1], grid[1:]))
+    expected = np.sum(doses * (1.0 - np.exp(-decay * np.maximum(horizon - times, 0.0)))) / decay
+    np.testing.assert_allclose(total, expected, rtol=1e-12)
 
 
 def test_lq_log_kill() -> None:
