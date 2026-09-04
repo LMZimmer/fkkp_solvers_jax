@@ -24,7 +24,15 @@ Swept parameters and default ranges (uniform):
   chemo_kill_rate          6.67e-4   - 2.67e-2  1/day per mg/m^2 (not in the file;
                            the former 0.05 - 2.0 per unit concentration / 75 mg/m^2)
   chemo_decay_rate         1.0       - 20.0     1/day      (not in the file)
-  rt_alpha                 0.02      - 0.3      1/Gy       (not in the file); rt_beta = 0.1 * rt_alpha
+  rt_alpha                 0.02      - 0.3      1/Gy       (not in the file)
+  rt_beta                  0.002     - 0.03     1/Gy^2     (not in the file; the
+                           former 0.1 * rt_alpha band, now sampled independently)
+  gaussian_seed_mass       100       - 500                 (not in the file; peak
+                           density mass / (4 pi t)^(3/2) = 0.2 - 1.0 at the default
+                           seed diffusion time t = 5, above the seed floor 0.1)
+  gaussian_seed_scale      0.5       - 2.0                 (not in the file; widens
+                           the seed by the factor, the peak stays, the seeded mass
+                           becomes gaussian_seed_mass * scale^3)
   seed voxel               uniformly among the cavity voxels (the label of the
                            base manifest's resection_cavity segmentation) that
                            carry tissue
@@ -92,8 +100,10 @@ DEFAULT_RANGES: dict[str, tuple[float, float]] = {
     "chemo_kill_rate": (0.05 / 75, 2.0 / 75),  # 1/day per mg/m^2
     "chemo_decay_rate": (1.0, 20.0),
     "rt_alpha": (0.02, 0.3),
+    "rt_beta": (0.002, 0.03),  # 1/Gy^2
+    "gaussian_seed_mass": (100.0, 500.0),
+    "gaussian_seed_scale": (0.5, 2.0),
 }
-BETA_OVER_ALPHA = 0.1
 
 # Defaults sized for an unattended ~10 h run on 4 GPUs (~12 s per
 # configuration per GPU on the 1 mm SAILOR grid, ~5.6 MB per configuration).
@@ -156,7 +166,6 @@ def sample_configs(
         config: dict[str, Any] = {"config": f"config_{index:04d}"}
         for name, (low, high) in ranges.items():
             config[name] = float(rng.uniform(low, high))
-        config["rt_beta"] = BETA_OVER_ALPHA * config["rt_alpha"]
         voxel = cavity_voxels[rng.integers(len(cavity_voxels))]
         config["seed_voxel"] = [int(v) for v in voxel]
         for axis, (v, n) in enumerate(zip(voxel, grid_shape)):
@@ -185,6 +194,8 @@ def config_manifest(
         "chemo_decay_rate",
         "rt_alpha",
         "rt_beta",
+        "gaussian_seed_mass",
+        "gaussian_seed_scale",
     ):
         manifest[key] = config[key]
     resolution = float(base.get("resolution_factor", 1.0))
@@ -276,7 +287,6 @@ def main(argv: list[str] | None = None) -> int:
         "base_manifest": str(manifest_path),
         "cli_args": vars(args),
         "ranges": {name: list(bounds) for name, bounds in ranges.items()},
-        "rt_beta": f"{BETA_OVER_ALPHA} * rt_alpha",
         "n_cavity_voxels": int(len(cavity_voxels)),
         "background_image": background_image,
         "configs": configs,
@@ -297,7 +307,6 @@ def main(argv: list[str] | None = None) -> int:
     columns = [
         "config",
         *ranges,
-        "rt_beta",
         "seed_voxel",
         "steps_per_day",
         "success",
