@@ -7,7 +7,7 @@
 # sm_75 support is needed at this version.
 jax[cuda12]==0.11.0
 jaxlib==0.11.0
-nibabel==5.4.2  # NIfTI I/O of solvers.treatment_params_from_manifest
+nibabel==5.4.2  # NIfTI I/O of solvers.params_from_manifest
 numpy==2.5.2
 scipy==1.18.0
 

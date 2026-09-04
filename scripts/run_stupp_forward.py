@@ -69,7 +69,13 @@ from scipy.ndimage import center_of_mass  # noqa: E402
 
 from fisher_kpp_jax import StuppFKPPSolver  # noqa: E402
 from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: E402
-from run_stupp_example import montage_days, render, select_panels  # noqa: E402
+from fisher_kpp_jax.util import (  # noqa: E402
+    jsonable,
+    montage_days,
+    render,
+    scalar_params,
+    select_panels,
+)
 
 DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
 DEFAULT_THRESHOLD = 0.01  # overlay transparency threshold (cell density)
@@ -161,30 +167,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def default_run_name() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"stupp_{stamp}_{os.getpid()}"
-
-
-def jsonable(value: Any) -> Any:
-    """Convert numpy scalars/1-D arrays and paths to JSON-serializable values."""
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, float) and not np.isfinite(value):
-        return str(value)  # np.inf stopping_threshold
-    if isinstance(value, (list, tuple)):
-        return [jsonable(v) for v in value]
-    return value
-
-
-def scalar_params(params: dict[str, Any]) -> dict[str, Any]:
-    """The params without the volumes (pbmaps, cavity, dose)."""
-    return {
-        key: jsonable(value)
-        for key, value in params.items()
-        if not (isinstance(value, np.ndarray) and value.ndim > 1)
-    }
 
 
 def main(argv: list[str] | None = None) -> int:

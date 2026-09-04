@@ -28,8 +28,7 @@ overlay, densities below --threshold transparent), three by three: the
 seed, one step before and one day after the resection; three evenly spaced
 days inside the radiotherapy block; three evenly spaced days from its end
 to the end of the run (each recorded at the nearest time step). The cavity
-outline and the seed voxel are marked. The figure helpers are those of
-scripts/run_stupp_example.py. A total-mass-vs-time panel
+outline and the seed voxel are marked. A total-mass-vs-time panel
 with the treatment events marked sits below. Written into
 <output-dir>/<run-name>/ (exist_ok=False, nothing outside it): overview.png,
 overview.pdf and run_summary.json (parameters, seed voxel, slice, synthetic
@@ -64,7 +63,7 @@ from scipy.ndimage import center_of_mass, distance_transform_edt  # noqa: E402
 
 from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
 from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: E402
-from run_stupp_example import (  # noqa: E402
+from fisher_kpp_jax.util import (  # noqa: E402
     jsonable,
     montage_days,
     render,
