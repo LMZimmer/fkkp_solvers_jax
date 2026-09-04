@@ -1027,6 +1027,10 @@ class StuppFKPPSolver(BaseFKPPSolver):
          boundary).
     """
 
+    # The treatment parameters, which FKPPSolver does not have (a params
+    # dict without them and time_after_resection, plus stopping_time, is
+    # the untreated FKPPSolver run).
+    TREATMENT_KEYS: ClassVar[frozenset[str]] = _STUPP_TREATMENT_KEYS
     _REQUIRED: ClassVar[frozenset[str]] = frozenset(
         {
             "white_matter_diffusivity",
@@ -1039,7 +1043,7 @@ class StuppFKPPSolver(BaseFKPPSolver):
             "resolution_factor",
             "time_after_resection",  # days; the horizon is resection_time + it
         }
-        | _STUPP_TREATMENT_KEYS
+        | TREATMENT_KEYS
     )
     _DEFAULTS: ClassVar[dict[str, Any]] = {
         **{key: value for key, value in _COMMON_DEFAULTS.items() if key != "stopping_time"},
@@ -1191,100 +1195,160 @@ class StuppFKPPSolver(BaseFKPPSolver):
         return int(np.ceil(n_timesteps)), dt
 
 
-# --- manifest loaders ---
+# --- manifest loader ---
 
-# Manifest schema: section name -> required keys (None: the free-form
-# 'solver' section, validated against _MANIFEST_SOLVER_KEYS). Keys starting
-# with '_' (comments) are ignored everywhere.
-_MANIFEST_SECTIONS: dict[str, tuple[str, ...] | None] = {
-    "tissue": ("wm", "gm"),
-    "solver": None,
-    "resection": ("time", "tumor_segmentation", "cavity_label"),
-    "chemotherapy": ("times", "doses", "kill_rate", "decay_rate"),
-    "radiotherapy": ("times", "dose", "alpha", "beta"),
-}
-_MANIFEST_TREATMENT_SECTIONS = ("resection", "chemotherapy", "radiotherapy")
-
-# Keys accepted in the 'solver' section: every scalar StuppFKPPSolver
-# parameter (the volumes come from the 'tissue' section, the treatment
-# parameters from their own sections; the horizon is the solver's own
-# 'time_after_resection') plus the time-step alternatives 'dt' and
-# 'steps_per_day', translated to n_steps.
+# A run manifest is a JSON object keyed by StuppFKPPSolver parameter name;
+# see params_from_manifest for the three ways its entries differ from the
+# params dict (volumes as NIfTI paths, dt / steps_per_day for the time
+# step, "inf"). Keys starting with '_' are comments.
+_MANIFEST_VOLUME_KEYS: tuple[str, ...] = ("white_matter_pbmap", "gray_matter_pbmap", "rt_dose")
 _MANIFEST_TIME_STEP_KEYS: tuple[str, ...] = ("n_steps", "dt", "steps_per_day")
-_MANIFEST_SOLVER_KEYS: frozenset[str] = frozenset(
-    (StuppFKPPSolver._REQUIRED | set(StuppFKPPSolver._DEFAULTS))
-    - {"gray_matter_pbmap", "white_matter_pbmap"}
-    - _STUPP_TREATMENT_KEYS
-) | set(_MANIFEST_TIME_STEP_KEYS)
+_MANIFEST_KEYS: frozenset[str] = (
+    StuppFKPPSolver._REQUIRED | set(StuppFKPPSolver._DEFAULTS) | set(_MANIFEST_TIME_STEP_KEYS)
+)
 
 
-def _read_manifest(path: str | Path) -> tuple[Path, dict[str, Any]]:
-    """Read and structurally check a manifest: a JSON object whose non-'_'
-    top-level keys are known sections."""
+def read_manifest(path: str | Path) -> dict[str, Any]:
+    """
+    Read a StuppFKPPSolver run manifest without loading its volumes.
+
+    The manifest is a JSON object keyed by solver parameter name (see
+    ``params_from_manifest`` for the layout). Returns its entries without
+    the '_' comment keys, every key checked to be a solver parameter (or
+    'dt' / 'steps_per_day'), the cavity entry checked to be
+    ``{"segmentation": <NIfTI path>, "label": <int>}`` and every NIfTI
+    path made absolute (a relative path counts from the manifest's
+    directory). The volumes stay paths, so the entries can be edited,
+    completed or written back as a manifest before ``params_from_manifest``
+    turns them into solver parameters; a missing volume file is reported
+    when it is loaded.
+
+    Args:
+        path: Path of the JSON manifest.
+
+    Returns:
+        The manifest entries.
+    """
     manifest_path = Path(path)
     if not manifest_path.is_file():
         raise FileNotFoundError(f"manifest not found: {manifest_path}")
     with open(manifest_path, encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    if not isinstance(manifest, Mapping):
+        entries = json.load(handle)
+    if not isinstance(entries, Mapping):
         raise ValueError(f"manifest {manifest_path}: must be a JSON object.")
-    unknown = sorted(
-        key
-        for key in manifest
-        if not key.startswith("_") and key not in _MANIFEST_SECTIONS
-    )
+    manifest = {key: value for key, value in entries.items() if not key.startswith("_")}
+    unknown = sorted(set(manifest) - _MANIFEST_KEYS)
     if unknown:
         raise ValueError(
-            f"manifest {manifest_path}: unknown top-level key(s) {unknown}; "
-            f"expected a subset of {list(_MANIFEST_SECTIONS)}."
+            f"manifest {manifest_path}: unknown key(s) {unknown}; every key must be a "
+            f"StuppFKPPSolver parameter or one of {list(_MANIFEST_TIME_STEP_KEYS)}."
         )
-    return manifest_path, dict(manifest)
-
-
-def _manifest_section(manifest: Mapping[str, Any], name: str) -> dict[str, Any]:
-    """Return the checked manifest section name without its '_' keys: for
-    the fixed-schema sections all keys present and none unknown, for the
-    'solver' section only known solver keys."""
-    section = manifest[name]
-    if not isinstance(section, Mapping):
-        raise ValueError(f"manifest section {name!r} must be a JSON object.")
-    present = {key for key in section if not key.startswith("_")}
-    keys = _MANIFEST_SECTIONS[name]
-    if keys is None:
-        unknown = sorted(present - _MANIFEST_SOLVER_KEYS)
-        if unknown:
+    for key in _MANIFEST_VOLUME_KEYS:
+        if key in manifest:
+            manifest[key] = _manifest_volume_path(manifest[key], manifest_path, key)
+    if "resection_cavity" in manifest:
+        cavity = manifest["resection_cavity"]
+        if not isinstance(cavity, Mapping) or set(cavity) != {"segmentation", "label"}:
             raise ValueError(
-                f"manifest section {name!r}: unknown key(s) {unknown}; expected "
-                f"a subset of {sorted(_MANIFEST_SOLVER_KEYS)}."
+                f"manifest {manifest_path}: resection_cavity must be an object "
+                '{"segmentation": <NIfTI path>, "label": <int>}.'
             )
-        return {key: section[key] for key in sorted(present)}
-    unknown = sorted(present - set(keys))
-    if unknown:
-        raise ValueError(
-            f"manifest section {name!r}: unknown key(s) {unknown}; expected "
-            f"{list(keys)}."
-        )
-    missing = [key for key in keys if key not in present]
-    if missing:
-        raise ValueError(f"manifest section {name!r} is missing key(s) {missing}.")
-    return {key: section[key] for key in keys}
+        manifest["resection_cavity"] = {
+            "segmentation": _manifest_volume_path(
+                cavity["segmentation"], manifest_path, "resection_cavity segmentation"
+            ),
+            "label": int(cavity["label"]),
+        }
+    return manifest
 
 
-def _manifest_file(path_value: Any, manifest_path: Path, what: str) -> Path:
-    """Resolve a file named in the manifest (relative to the manifest's
-    directory) and check that it exists."""
-    path = Path(str(path_value))
-    if not path.is_absolute():
-        path = manifest_path.parent / path
-    if not path.is_file():
-        raise FileNotFoundError(f"manifest {manifest_path}: {what} not found: {path}")
-    return path
+def _manifest_volume_path(value: Any, manifest_path: Path, what: str) -> str:
+    """The absolute path of a NIfTI named in the manifest (a relative path
+    counts from the manifest's directory)."""
+    if not isinstance(value, str):
+        raise ValueError(f"manifest {manifest_path}: {what} must be a NIfTI path, got {value!r}.")
+    volume_path = Path(value)
+    if not volume_path.is_absolute():
+        volume_path = manifest_path.parent / volume_path
+    return str(volume_path)
 
 
-def _load_manifest_volume(path_value: Any, manifest_path: Path, what: str) -> NDArray:
-    """Load a NIfTI volume named in the manifest as a float64 array."""
-    path = _manifest_file(path_value, manifest_path, f"{what} volume")
-    return np.asarray(nib.load(str(path)).get_fdata(), dtype=np.float64)
+def _load_volume(path: str) -> NDArray:
+    """Load a NIfTI volume as a float64 array."""
+    return np.asarray(nib.load(path).get_fdata(), dtype=np.float64)
+
+
+def params_from_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Turn manifest entries into StuppFKPPSolver parameters.
+
+    A run manifest is a JSON object keyed by solver parameter name and
+    holding the parameter values, with three differences to the params
+    dict:
+
+    - The volumes 'white_matter_pbmap', 'gray_matter_pbmap' and 'rt_dose'
+      (Gy, TOTAL over all fractions) are NIfTI paths, and 'resection_cavity'
+      is ``{"segmentation": <NIfTI path>, "label": <int>}``: the cavity is
+      the set of voxels carrying that label (values rounded to the nearest
+      integer first). An entry that already holds an array is used as is.
+    - The time step may be given as 'dt' (days) or 'steps_per_day'
+      (dt = 1 / steps_per_day) instead of 'n_steps', at most one of the
+      three. 'dt' and 'steps_per_day' are translated by ``n_steps_from_dt``
+      with the horizon resection_time + time_after_resection.
+    - 'stopping_threshold' may be the string "inf" (JSON has no infinity),
+      and a 'voxel_size_mm' list becomes a tuple.
+
+    All other values pass through; the solver validates them, including
+    the presence of its required parameters. All times are days on the
+    solver clock, whose origin t = 0 is the seed.
+
+    Args:
+        manifest: The entries of ``read_manifest``, possibly edited or
+            completed by the caller.
+
+    Returns:
+        The parameters, ready for ``StuppFKPPSolver(params)``.
+    """
+    params = dict(manifest)
+    for key in _MANIFEST_VOLUME_KEYS:
+        if isinstance(params.get(key), str):
+            params[key] = _load_volume(params[key])
+    cavity = params.get("resection_cavity")
+    if isinstance(cavity, Mapping):
+        segmentation = np.rint(_load_volume(cavity["segmentation"])).astype(np.int64)
+        params["resection_cavity"] = segmentation == int(cavity["label"])
+    if "voxel_size_mm" in params:
+        params["voxel_size_mm"] = tuple(float(v) for v in params["voxel_size_mm"])
+    if isinstance(params.get("stopping_threshold"), str):
+        params["stopping_threshold"] = float(params["stopping_threshold"])
+    return _resolve_time_step(params)
+
+
+def _resolve_time_step(params: dict[str, Any]) -> dict[str, Any]:
+    """Replace 'dt' / 'steps_per_day' in params by 'n_steps' (in place)."""
+    present = [key for key in _MANIFEST_TIME_STEP_KEYS if params.get(key) is not None]
+    if len(present) > 1:
+        raise ValueError(f"set at most one of {list(_MANIFEST_TIME_STEP_KEYS)}, got {present}.")
+    dt = params.pop("dt", None)
+    steps_per_day = params.pop("steps_per_day", None)
+    if steps_per_day is not None:
+        if not (np.isfinite(steps_per_day) and steps_per_day > 0):
+            raise ValueError(
+                f"steps_per_day must be a positive finite number, got {steps_per_day!r}."
+            )
+        dt = 1.0 / float(steps_per_day)
+    if dt is not None:
+        missing = [
+            key for key in ("resection_time", "time_after_resection") if params.get(key) is None
+        ]
+        if missing:
+            raise ValueError(
+                f"{present[0]!r} needs {missing} for the horizon "
+                "resection_time + time_after_resection."
+            )
+        horizon = float(params["resection_time"]) + float(params["time_after_resection"])
+        params["n_steps"] = n_steps_from_dt(horizon, dt)
+    return params
 
 
 def n_steps_from_dt(stopping_time: float, dt: float) -> int:
@@ -1318,201 +1382,3 @@ def n_steps_from_dt(stopping_time: float, dt: float) -> int:
             f"n_steps={n_steps} (dt={effective:g})."
         )
     return n_steps
-
-
-def tissue_paths_from_manifest(path: str | Path) -> dict[str, Path]:
-    """
-    Load the tissue-map paths of a manifest's optional 'tissue' section.
-
-    ::
-
-        "tissue": {"wm": <white matter pbmap NIfTI>, "gm": <gray matter pbmap NIfTI>}
-
-    Paths are absolute or relative to the manifest's directory and must
-    exist. See ``treatment_params_from_manifest`` for the manifest layout.
-
-    Args:
-        path: Path of the JSON manifest.
-
-    Returns:
-        {'wm': path, 'gm': path} if the section is present, else {}.
-    """
-    manifest_path, manifest = _read_manifest(path)
-    if "tissue" not in manifest:
-        return {}
-    section = _manifest_section(manifest, "tissue")
-    return {
-        key: _manifest_file(section[key], manifest_path, f"{key} pbmap")
-        for key in ("wm", "gm")
-    }
-
-
-def resolve_time_step(
-    params: dict[str, Any], resection_time: float | None
-) -> dict[str, Any]:
-    """
-    Translate the time-step alternatives 'dt' and 'steps_per_day' of a
-    StuppFKPPSolver params dict into the solver's n_steps parameter.
-
-    At most one of 'n_steps', 'dt' and 'steps_per_day' may be set; 'dt'
-    and 'steps_per_day' (dt = 1 / steps_per_day) go through
-    ``n_steps_from_dt`` with the horizon resection_time +
-    'time_after_resection', so they need that key in the same dict and a
-    resection time.
-
-    Args:
-        params: Parameter dict, possibly holding 'dt' or 'steps_per_day'.
-        resection_time: The resection time in days; None is accepted when
-            no translation is needed.
-
-    Returns:
-        A copy without 'dt' / 'steps_per_day', with 'n_steps' set if one
-        of them was present.
-    """
-    params = dict(params)
-    present = [key for key in _MANIFEST_TIME_STEP_KEYS if params.get(key) is not None]
-    if len(present) > 1:
-        raise ValueError(f"set at most one of {list(_MANIFEST_TIME_STEP_KEYS)}, got {present}.")
-    dt = params.pop("dt", None)
-    steps_per_day = params.pop("steps_per_day", None)
-    if steps_per_day is not None:
-        if not (np.isfinite(steps_per_day) and steps_per_day > 0):
-            raise ValueError(
-                f"steps_per_day must be a positive finite number, got {steps_per_day!r}."
-            )
-        dt = 1.0 / float(steps_per_day)
-    if dt is not None:
-        if params.get("time_after_resection") is None:
-            raise ValueError(f"{present[0]!r} requires 'time_after_resection' alongside it.")
-        if resection_time is None:
-            raise ValueError(f"{present[0]!r} requires a resection time.")
-        horizon = float(resection_time) + float(params["time_after_resection"])
-        params["n_steps"] = n_steps_from_dt(horizon, dt)
-    return params
-
-
-def solver_params_from_manifest(
-    path: str | Path, resolve: bool = True
-) -> dict[str, Any]:
-    """
-    Load the scalar solver parameters of a manifest's optional 'solver'
-    section.
-
-    The section may hold any scalar StuppFKPPSolver parameter under its
-    solver name (rho, white_matter_diffusivity, diffusivity_ratio,
-    resolution_factor, time_after_resection, n_steps, precision,
-    gaussian_seed_x/y/z_fraction, gaussian_seed_scale/diffusion_time/
-    mass/floor, voxel_size_mm, stopping_threshold, stopping_mode,
-    volume_threshold, min_tissue_fraction, n_time_series_snapshots,
-    verbose), plus the time-step alternatives 'dt' (days) and
-    'steps_per_day', translated to n_steps by ``resolve_time_step`` with
-    the horizon = the manifest's resection time + time_after_resection. A
-    'stopping_threshold' of "inf" is accepted (JSON has no infinity);
-    voxel_size_mm lists become tuples. Values are passed through
-    otherwise; the solver validates them.
-
-    The treatment parameters live in their own sections, see
-    ``treatment_params_from_manifest``; the tissue maps in 'tissue', see
-    ``tissue_paths_from_manifest``.
-
-    Args:
-        path: Path of the JSON manifest.
-        resolve: Translate 'dt' / 'steps_per_day' into 'n_steps' (the
-            default). With False they are returned as given (checked for
-            mutual exclusivity only), for callers that merge further
-            overrides before calling ``resolve_time_step`` themselves.
-
-    Returns:
-        The solver parameters of the section (an empty dict if absent);
-        with resolve=True ready to be merged into the StuppFKPPSolver
-        params dict.
-    """
-    _, manifest = _read_manifest(path)
-    if "solver" not in manifest:
-        return {}
-    params = _manifest_section(manifest, "solver")
-    present = [key for key in _MANIFEST_TIME_STEP_KEYS if key in params]
-    if len(present) > 1:
-        raise ValueError(
-            f"manifest section 'solver': set at most one of "
-            f"{list(_MANIFEST_TIME_STEP_KEYS)}, not {present}."
-        )
-    if resolve:
-        resection_time = None
-        if "resection" in manifest:
-            resection_time = float(_manifest_section(manifest, "resection")["time"])
-        try:
-            params = resolve_time_step(params, resection_time)
-        except ValueError as exc:
-            raise ValueError(f"manifest section 'solver': {exc}") from exc
-    if "voxel_size_mm" in params:
-        params["voxel_size_mm"] = tuple(float(v) for v in params["voxel_size_mm"])
-    if isinstance(params.get("stopping_threshold"), str):
-        params["stopping_threshold"] = float(params["stopping_threshold"])
-    return params
-
-
-def treatment_params_from_manifest(path: str | Path) -> dict[str, Any]:
-    """
-    Load the StuppFKPPSolver treatment parameters from a JSON manifest.
-
-    The manifest is a JSON object of sections. This function reads the
-    three treatment sections, all of which must be present (the solver
-    requires every treatment parameter; see ``StuppFKPPSolver`` for the
-    values that switch a treatment off)::
-
-        "resection":     {"time": <day>, "tumor_segmentation": <NIfTI path>,
-                          "cavity_label": <int>}
-        "chemotherapy":  {"times": [<days>], "doses": [<mg/m^2>, one per time],
-                          "kill_rate": <1/day per mg/m^2>, "decay_rate": <1/day>}
-        "radiotherapy":  {"times": [<days>], "dose": <NIfTI path, TOTAL Gy>,
-                          "alpha": <1/Gy>, "beta": <1/Gy^2>}
-
-    The companion sections 'solver' (scalar solver parameters, see
-    ``solver_params_from_manifest``) and 'tissue' (pbmap paths, see
-    ``tissue_paths_from_manifest``) are validated here but not returned.
-    All times are days on the solver clock, whose origin t = 0 is the
-    seed: the simulated time before resection is resection 'time' itself.
-
-    Top-level and per-section keys starting with '_' are comments and are
-    ignored. NIfTI paths are absolute or relative to the manifest's
-    directory; the volumes are loaded with nibabel. The resection cavity
-    is ``segmentation == cavity_label`` (values rounded to the nearest
-    integer first).
-
-    Args:
-        path: Path of the JSON manifest.
-
-    Returns:
-        The solver parameters of the treatment sections, ready to be merged
-        into the StuppFKPPSolver params dict: 'resection_time',
-        'resection_cavity' (bool array), 'chemo_times', 'chemo_doses'
-        (float64 array, mg/m^2), 'chemo_kill_rate', 'chemo_decay_rate',
-        'rt_times', 'rt_dose' (float64 array, Gy), 'rt_alpha', 'rt_beta'.
-    """
-    manifest_path, manifest = _read_manifest(path)
-    missing = [name for name in _MANIFEST_TREATMENT_SECTIONS if name not in manifest]
-    if missing:
-        raise ValueError(
-            f"manifest {manifest_path}: missing treatment section(s) {missing}; "
-            f"StuppFKPPSolver requires all of {list(_MANIFEST_TREATMENT_SECTIONS)}."
-        )
-    params: dict[str, Any] = {}
-    section = _manifest_section(manifest, "resection")
-    segmentation = _load_manifest_volume(
-        section["tumor_segmentation"], manifest_path, "tumor_segmentation"
-    )
-    label = int(section["cavity_label"])
-    params["resection_time"] = float(section["time"])
-    params["resection_cavity"] = np.rint(segmentation).astype(np.int64) == label
-    section = _manifest_section(manifest, "chemotherapy")
-    params["chemo_times"] = np.asarray(section["times"], dtype=np.float64)
-    params["chemo_doses"] = np.asarray(section["doses"], dtype=np.float64)
-    params["chemo_kill_rate"] = float(section["kill_rate"])
-    params["chemo_decay_rate"] = float(section["decay_rate"])
-    section = _manifest_section(manifest, "radiotherapy")
-    params["rt_times"] = np.asarray(section["times"], dtype=np.float64)
-    params["rt_dose"] = _load_manifest_volume(section["dose"], manifest_path, "dose")
-    params["rt_alpha"] = float(section["alpha"])
-    params["rt_beta"] = float(section["beta"])
-    return params

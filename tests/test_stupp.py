@@ -24,13 +24,7 @@ import pytest
 from loguru import logger
 
 from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, operators
-from fisher_kpp_jax.solvers import (
-    n_steps_from_dt,
-    resolve_time_step,
-    solver_params_from_manifest,
-    tissue_paths_from_manifest,
-    treatment_params_from_manifest,
-)
+from fisher_kpp_jax.solvers import n_steps_from_dt, params_from_manifest, read_manifest
 
 _COMMON = dict(
     gaussian_seed_x_fraction=0.5,
@@ -507,255 +501,182 @@ def manifest_dir(tmp_path: Path) -> tuple[Path, np.ndarray, np.ndarray]:
     return tmp_path, segmentation, dose.astype(np.float32).astype(np.float64)
 
 
-def test_manifest_loader_full(manifest_dir):
-    tmp_path, segmentation, dose = manifest_dir
+def test_treatment_keys():
+    """TREATMENT_KEYS are exactly the parameters FKPPSolver does not have
+    (besides time_after_resection), so dropping them gives an FKPPSolver run."""
+    stupp = StuppFKPPSolver._REQUIRED | set(StuppFKPPSolver._DEFAULTS)
+    fkpp = FKPPSolver._REQUIRED | set(FKPPSolver._DEFAULTS)
+    assert StuppFKPPSolver.TREATMENT_KEYS == stupp - fkpp - {"time_after_resection"}
+    assert set(neutral_treatment_params((2, 2, 2))) == StuppFKPPSolver.TREATMENT_KEYS | {
+        "time_after_resection"
+    }
+
+
+def test_read_manifest(manifest_dir):
+    """Comments are dropped, keys checked, NIfTI paths made absolute
+    (relative to the manifest's directory) but not loaded."""
+    tmp_path, _, _ = manifest_dir
     manifest = {
         "_note": "ignored",
-        "resection": {
-            "_comment": "ignored",
-            "time": 10,
-            "tumor_segmentation": str(tmp_path / "seg.nii.gz"),
-            "cavity_label": 4,
-        },
-        "chemotherapy": {
-            "times": [24, 25, 26],
-            "doses": [75, 150, 200],
-            "kill_rate": 0.05,
-            "decay_rate": 1.0,
-        },
-        "radiotherapy": {
-            "times": [24.0, 25.0],
-            "dose": "dose.nii.gz",  # relative to the manifest directory
-            "alpha": 0.1,
-            "beta": 0.01,
-            "_units": "ignored",
-        },
+        "white_matter_pbmap": "seg.nii.gz",
+        "rho": 0.12,
+        "chemo_times": [24, 25, 26],
+        "resection_cavity": {"segmentation": str(tmp_path / "seg.nii.gz"), "label": 4.0},
+        "rt_dose": "dose.nii.gz",
+        "dt": 0.1,
     }
-    params = treatment_params_from_manifest(_write_manifest(tmp_path, manifest))
+    entries = read_manifest(_write_manifest(tmp_path, manifest))
+    assert entries == {
+        "white_matter_pbmap": str(tmp_path / "seg.nii.gz"),
+        "rho": 0.12,
+        "chemo_times": [24, 25, 26],
+        "resection_cavity": {"segmentation": str(tmp_path / "seg.nii.gz"), "label": 4},
+        "rt_dose": str(tmp_path / "dose.nii.gz"),
+        "dt": 0.1,
+    }
+    # A missing volume file is only reported on loading.
+    read_manifest(_write_manifest(tmp_path, {"rt_dose": "nope.nii.gz"}))
+    assert read_manifest(_write_manifest(tmp_path, {"_only": 1})) == {}
+
+
+def test_read_manifest_errors(manifest_dir):
+    tmp_path, _, _ = manifest_dir
+    with pytest.raises(FileNotFoundError, match="manifest not found"):
+        read_manifest(tmp_path / "missing.json")
+    with pytest.raises(ValueError, match="JSON object"):
+        read_manifest(_write_manifest(tmp_path, [1, 2]))
+    with pytest.raises(ValueError, match=r"unknown key\(s\) \['D', 'chemotherapy'\]"):
+        read_manifest(_write_manifest(tmp_path, {"rho": 1, "D": 2, "chemotherapy": {}}))
+    with pytest.raises(ValueError, match="unknown key.*stopping_time"):
+        read_manifest(_write_manifest(tmp_path, {"stopping_time": 5}))
+    with pytest.raises(ValueError, match="rt_dose must be a NIfTI path"):
+        read_manifest(_write_manifest(tmp_path, {"rt_dose": 60.0}))
+    for cavity in ("seg.nii.gz", {"segmentation": "seg.nii.gz"}, {"path": "x", "label": 4}):
+        with pytest.raises(ValueError, match="resection_cavity must be an object"):
+            read_manifest(_write_manifest(tmp_path, {"resection_cavity": cavity}))
+
+
+def test_params_from_manifest(manifest_dir):
+    """Volumes are loaded (the cavity as segmentation == label), dt becomes
+    n_steps with the horizon resection_time + time_after_resection,
+    voxel_size_mm a tuple, "inf" a float; everything else passes through."""
+    tmp_path, segmentation, dose = manifest_dir
+    entries = read_manifest(
+        _write_manifest(
+            tmp_path,
+            {
+                "white_matter_pbmap": "dose.nii.gz",
+                "resection_time": 10,
+                "time_after_resection": 10.0,
+                "resection_cavity": {"segmentation": "seg.nii.gz", "label": 4},
+                "chemo_times": [24, 25, 26],
+                "chemo_doses": [75, 150, 200],
+                "rt_dose": "dose.nii.gz",
+                "dt": 0.1,
+                "voxel_size_mm": [1.0, 1.5, 2.0],
+                "stopping_threshold": "inf",
+                "precision": "f64",
+            },
+        )
+    )
+    params = params_from_manifest(entries)
     assert set(params) == {
+        "white_matter_pbmap",
         "resection_time",
+        "time_after_resection",
         "resection_cavity",
         "chemo_times",
         "chemo_doses",
-        "chemo_kill_rate",
-        "chemo_decay_rate",
-        "rt_times",
         "rt_dose",
-        "rt_alpha",
-        "rt_beta",
+        "n_steps",
+        "voxel_size_mm",
+        "stopping_threshold",
+        "precision",
     }
-    assert params["resection_time"] == 10.0
+    np.testing.assert_array_equal(params["white_matter_pbmap"], dose)
+    assert params["white_matter_pbmap"].dtype == np.float64
     assert params["resection_cavity"].dtype == bool
     np.testing.assert_array_equal(params["resection_cavity"], segmentation == 4)
     assert params["resection_cavity"].any() and not params["resection_cavity"].all()
-    np.testing.assert_array_equal(params["chemo_times"], [24.0, 25.0, 26.0])
-    assert params["chemo_times"].dtype == np.float64
-    np.testing.assert_array_equal(params["chemo_doses"], [75.0, 150.0, 200.0])
-    assert params["chemo_doses"].dtype == np.float64
-    assert params["chemo_kill_rate"] == 0.05 and params["chemo_decay_rate"] == 1.0
-    np.testing.assert_array_equal(params["rt_times"], [24.0, 25.0])
     np.testing.assert_array_equal(params["rt_dose"], dose)
-    assert params["rt_alpha"] == 0.1 and params["rt_beta"] == 0.01
+    assert params["chemo_times"] == [24, 25, 26] and params["chemo_doses"] == [75, 150, 200]
+    assert params["n_steps"] == 200 and params["resection_time"] == 10
+    assert params["voxel_size_mm"] == (1.0, 1.5, 2.0)
+    assert params["stopping_threshold"] == np.inf and params["precision"] == "f64"
+    # Arrays already in place are used as is (callers may replace volumes).
+    cavity = np.zeros((6, 7, 8), dtype=bool)
+    replaced = params_from_manifest({**entries, "resection_cavity": cavity, "rt_dose": dose})
+    assert replaced["resection_cavity"] is cavity and replaced["rt_dose"] is dose
+    # steps_per_day is the other time-step form.
+    assert params_from_manifest({**entries, "dt": None, "steps_per_day": 4})["n_steps"] == 80
+    assert "dt" not in params_from_manifest({"rho": 1.0})
 
 
-def test_manifest_loader_requires_all_sections(manifest_dir):
+def test_params_from_manifest_errors(manifest_dir):
     tmp_path, _, _ = manifest_dir
-    manifest = {
-        "chemotherapy": {"times": [1.0], "doses": [75.0], "kill_rate": 0.1, "decay_rate": 0.5}
-    }
-    with pytest.raises(ValueError, match=r"missing treatment section.*resection.*radiotherapy"):
-        treatment_params_from_manifest(_write_manifest(tmp_path, manifest))
-    with pytest.raises(ValueError, match="missing treatment section"):
-        treatment_params_from_manifest(_write_manifest(tmp_path, {"_only": 1}))
-
-
-def test_manifest_loader_errors(manifest_dir):
-    tmp_path, _, _ = manifest_dir
-    with pytest.raises(FileNotFoundError, match="manifest not found"):
-        treatment_params_from_manifest(tmp_path / "missing.json")
-    full = {
-        "resection": {"time": 1, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4},
-        "chemotherapy": {"times": [1], "doses": [75], "kill_rate": 1, "decay_rate": 1},
-        "radiotherapy": {"times": [1], "dose": "dose.nii.gz", "alpha": 0.1, "beta": 0.01},
-    }
-    treatment_params_from_manifest(_write_manifest(tmp_path, full))  # accepted
-    with pytest.raises(ValueError, match=r"missing key\(s\).*doses"):
-        treatment_params_from_manifest(
-            _write_manifest(
-                tmp_path,
-                {**full, "chemotherapy": {"times": [1], "kill_rate": 1, "decay_rate": 1}},
-            )
-        )
-    missing_volume = {
-        **full,
-        "resection": {**full["resection"], "tumor_segmentation": str(tmp_path / "nope.nii.gz")},
-    }
+    horizon = {"resection_time": 10.0, "time_after_resection": 1.0}
+    with pytest.raises(ValueError, match="at most one"):
+        params_from_manifest({**horizon, "dt": 0.1, "n_steps": 5})
+    with pytest.raises(ValueError, match="at most one"):
+        params_from_manifest({**horizon, "dt": 0.1, "steps_per_day": 3})
+    with pytest.raises(ValueError, match=r"'dt' needs \['resection_time'\]"):
+        params_from_manifest({"time_after_resection": 1.0, "dt": 0.1})
+    with pytest.raises(ValueError, match=r"'steps_per_day' needs .*time_after_resection"):
+        params_from_manifest({"resection_time": 1.0, "steps_per_day": 3})
+    with pytest.raises(ValueError, match="steps_per_day"):
+        params_from_manifest({**horizon, "steps_per_day": 0})
     with pytest.raises(FileNotFoundError, match="nope.nii.gz"):
-        treatment_params_from_manifest(_write_manifest(tmp_path, missing_volume))
-    with pytest.raises(ValueError, match="unknown top-level"):
-        treatment_params_from_manifest(_write_manifest(tmp_path, {**full, "surgery": {}}))
-    with pytest.raises(ValueError, match="unknown key"):
-        treatment_params_from_manifest(
-            _write_manifest(
-                tmp_path, {**full, "chemotherapy": {**full["chemotherapy"], "dose": 2}}
-            )
-        )
-    with pytest.raises(ValueError, match="missing key"):
-        treatment_params_from_manifest(
-            _write_manifest(tmp_path, {**full, "radiotherapy": {"times": [1], "alpha": 0.1}})
-        )
-    with pytest.raises(ValueError, match="JSON object"):
-        treatment_params_from_manifest(_write_manifest(tmp_path, {**full, "resection": [1, 2]}))
+        params_from_manifest(read_manifest(_write_manifest(tmp_path, {"rt_dose": "nope.nii.gz"})))
+    with pytest.raises(FileNotFoundError, match="nope.nii.gz"):
+        params_from_manifest({"resection_cavity": {"segmentation": "nope.nii.gz", "label": 1}})
 
 
-def test_manifest_params_drive_solver(manifest_dir, tissue_phantom):
-    """The loader output merges straight into the solver params."""
+def test_manifest_drives_solver(manifest_dir, tissue_phantom):
+    """A complete manifest is a complete StuppFKPPSolver params dict."""
     tmp_path, _, _ = manifest_dir
     gm, wm = tissue_phantom
     segmentation = np.zeros(gm.shape, dtype=np.int16)
     segmentation[off_center_cavity(gm.shape)] = 4
+    _write_nifti(tmp_path / "wm24.nii.gz", wm)
+    _write_nifti(tmp_path / "gm24.nii.gz", gm)
     _write_nifti(tmp_path / "seg24.nii.gz", segmentation)
     _write_nifti(tmp_path / "dose24.nii.gz", np.full(gm.shape, 6.0, dtype=np.float32))
     manifest = {
-        "resection": {"time": 2.0, "tumor_segmentation": "seg24.nii.gz", "cavity_label": 4},
-        "chemotherapy": {
-            "times": [3.3, 5.3],
-            "doses": [75.0, 150.0],
-            "kill_rate": 0.1 / 75,
-            "decay_rate": 0.5,
-        },
-        "radiotherapy": {"times": [3.3, 5.3], "dose": "dose24.nii.gz", "alpha": 0.1, "beta": 0.01},
-    }
-    treatment = treatment_params_from_manifest(_write_manifest(tmp_path, manifest))
-    result = StuppFKPPSolver(base_params(gm, wm, **treatment)).solve()
-    assert result.success, result.error
-    untreated = StuppFKPPSolver(base_params(gm, wm)).solve()
-    assert result.final_stopping_quantity < untreated.final_stopping_quantity
-    # A dose list of the wrong length passes the loader and fails in the solver.
-    mismatched = {**manifest, "chemotherapy": {**manifest["chemotherapy"], "doses": [75.0]}}
-    treatment = treatment_params_from_manifest(_write_manifest(tmp_path, mismatched))
-    with pytest.raises(ValueError, match="chemo_doses"):
-        StuppFKPPSolver(base_params(gm, wm, **treatment))
-
-
-def test_manifest_solver_and_tissue_sections(manifest_dir):
-    """The optional 'solver' section maps 1:1 to scalar solver params (dt
-    becomes n_steps with the horizon resection time + time_after_resection,
-    voxel_size_mm a tuple, "inf" a float); 'tissue' gives
-    the resolved pbmap paths; both are ignored by the treatment loader."""
-    tmp_path, _, _ = manifest_dir
-    manifest = {
-        "tissue": {"wm": "seg.nii.gz", "gm": str(tmp_path / "dose.nii.gz")},
-        "solver": {
-            "_units": "ignored",
-            "rho": 0.12,
-            "white_matter_diffusivity": 0.4,
-            "gaussian_seed_x_fraction": 0.4,
-            "time_after_resection": 10.0,
-            "dt": 0.1,
-            "voxel_size_mm": [1.0, 1.5, 2.0],
-            "stopping_threshold": "inf",
-            "precision": "f64",
-        },
-        "resection": {"time": 10.0, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4},
-        "chemotherapy": {"times": [1.0], "doses": [75.0], "kill_rate": 0.1, "decay_rate": 0.5},
-        "radiotherapy": {"times": [12.0], "dose": "dose.nii.gz", "alpha": 0.1, "beta": 0.01},
+        "_note": "the phantom run of base_params / treatment_params",
+        "white_matter_pbmap": "wm24.nii.gz",
+        "gray_matter_pbmap": "gm24.nii.gz",
+        "white_matter_diffusivity": 0.3,
+        "rho": 0.15,
+        **_COMMON,
+        "resection_time": 2.0,
+        "time_after_resection": HORIZON - 2.0,
+        "resection_cavity": {"segmentation": "seg24.nii.gz", "label": 4},
+        "chemo_times": [3.3, 5.3],
+        "chemo_doses": [75.0, 150.0],
+        "chemo_kill_rate": 0.1 / 75,
+        "chemo_decay_rate": 0.5,
+        "rt_times": [3.3, 5.3],
+        "rt_dose": "dose24.nii.gz",
+        "rt_alpha": 0.1,
+        "rt_beta": 0.01,
+        "dt": 0.25,
     }
     path = _write_manifest(tmp_path, manifest)
-    solver = solver_params_from_manifest(path)
-    assert solver == {
-        "rho": 0.12,
-        "white_matter_diffusivity": 0.4,
-        "gaussian_seed_x_fraction": 0.4,
-        "time_after_resection": 10.0,
-        "n_steps": 200,
-        "voxel_size_mm": (1.0, 1.5, 2.0),
-        "stopping_threshold": np.inf,
-        "precision": "f64",
-    }
-    assert tissue_paths_from_manifest(path) == {
-        "wm": tmp_path / "seg.nii.gz",
-        "gm": tmp_path / "dose.nii.gz",
-    }
-    assert set(treatment_params_from_manifest(path)) == {
-        "resection_time",
-        "resection_cavity",
-        "chemo_times",
-        "chemo_doses",
-        "chemo_kill_rate",
-        "chemo_decay_rate",
-        "rt_times",
-        "rt_dose",
-        "rt_alpha",
-        "rt_beta",
-    }
-    # Absent 'solver' / 'tissue' sections give empty results.
-    minimal = _write_manifest(tmp_path, {"_only": 1})
-    assert solver_params_from_manifest(minimal) == {}
-    assert tissue_paths_from_manifest(minimal) == {}
-
-
-def test_manifest_solver_section_drives_solver(manifest_dir, tissue_phantom):
-    gm, wm = tissue_phantom
-    tmp_path, _, _ = manifest_dir
-    path = _write_manifest(
-        tmp_path,
-        {
-            "resection": {"time": 2.0, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4},
-            "solver": {
-                "rho": 0.0,
-                "white_matter_diffusivity": 0.3,
-                "time_after_resection": 3.0,
-                "dt": 0.25,
-            },
-        },
-    )
-    params = {**base_params(gm, wm), **solver_params_from_manifest(path)}
-    solver = StuppFKPPSolver(params)
-    assert solver.params["n_steps"] == 20 and solver.params["rho"] == 0.0
-    assert solver.params["stopping_time"] == 5.0
+    solver = StuppFKPPSolver(params_from_manifest(read_manifest(path)))
+    assert solver.params["n_steps"] == 40 and solver.params["stopping_time"] == HORIZON
     result = solver.solve()
-    assert result.success and result.final_time == 5
-
-
-def test_manifest_solver_section_errors(manifest_dir):
-    tmp_path, _, _ = manifest_dir
-    with pytest.raises(ValueError, match="unknown key"):
-        solver_params_from_manifest(_write_manifest(tmp_path, {"solver": {"rho": 1, "D": 2}}))
-    with pytest.raises(ValueError, match="rt_alpha"):  # treatment keys have their own sections
-        solver_params_from_manifest(_write_manifest(tmp_path, {"solver": {"rt_alpha": 0.1}}))
-    with pytest.raises(ValueError, match="at most one"):
-        solver_params_from_manifest(
-            _write_manifest(
-                tmp_path, {"solver": {"time_after_resection": 1, "dt": 0.1, "n_steps": 5}}
-            )
-        )
-    with pytest.raises(ValueError, match="at most one"):
-        solver_params_from_manifest(
-            _write_manifest(
-                tmp_path, {"solver": {"time_after_resection": 1, "dt": 0.1, "steps_per_day": 3}}
-            )
-        )
-    with pytest.raises(ValueError, match="requires 'time_after_resection'"):
-        solver_params_from_manifest(_write_manifest(tmp_path, {"solver": {"dt": 0.1}}))
-    with pytest.raises(ValueError, match="requires a resection time"):
-        solver_params_from_manifest(
-            _write_manifest(tmp_path, {"solver": {"time_after_resection": 1, "dt": 0.1}})
-        )
-    with pytest.raises(ValueError, match="steps_per_day"):
-        solver_params_from_manifest(
-            _write_manifest(
-                tmp_path, {"solver": {"time_after_resection": 1, "steps_per_day": 0}}
-            )
-        )
-    with pytest.raises(ValueError, match="unknown key.*stopping_time"):
-        solver_params_from_manifest(_write_manifest(tmp_path, {"solver": {"stopping_time": 5}}))
-    with pytest.raises(FileNotFoundError, match="wm pbmap"):
-        tissue_paths_from_manifest(
-            _write_manifest(tmp_path, {"tissue": {"wm": "nope.nii.gz", "gm": "seg.nii.gz"}})
-        )
-    with pytest.raises(ValueError, match="missing"):
-        tissue_paths_from_manifest(_write_manifest(tmp_path, {"tissue": {"wm": "seg.nii.gz"}}))
+    assert result.success, result.error
+    assert result.final_time == HORIZON
+    untreated = StuppFKPPSolver(base_params(gm, wm)).solve()
+    assert result.final_stopping_quantity < untreated.final_stopping_quantity
+    # The solver's own validation reports manifest mistakes: a dose list of
+    # the wrong length, a missing required parameter.
+    mismatched = read_manifest(_write_manifest(tmp_path, {**manifest, "chemo_doses": [75.0]}))
+    with pytest.raises(ValueError, match="chemo_doses"):
+        StuppFKPPSolver(params_from_manifest(mismatched))
+    incomplete = read_manifest(_write_manifest(tmp_path, {**manifest, "rt_alpha": None}))
+    with pytest.raises(ValueError, match="rt_alpha"):
+        StuppFKPPSolver(params_from_manifest(incomplete))
 
 
 def test_n_steps_from_dt():
@@ -766,35 +687,3 @@ def test_n_steps_from_dt():
         n_steps_from_dt(100.0, 0.0)
     with pytest.raises(ValueError):
         n_steps_from_dt(0.0, 0.1)
-
-
-def test_steps_per_day_and_unresolved_manifest(manifest_dir):
-    """steps_per_day is dt = 1 / steps_per_day over the horizon resection
-    time + time_after_resection; with resolve=False the loader hands the
-    time-step keys through for a later ``resolve_time_step`` on the merged
-    params."""
-    tmp_path, _, _ = manifest_dir
-    resection = {"time": 10.0, "tumor_segmentation": "seg.nii.gz", "cavity_label": 4}
-    path = _write_manifest(
-        tmp_path,
-        {"resection": resection, "solver": {"time_after_resection": 190.0, "steps_per_day": 3}},
-    )
-    assert solver_params_from_manifest(path) == {"time_after_resection": 190.0, "n_steps": 600}
-    raw = solver_params_from_manifest(path, resolve=False)
-    assert raw == {"time_after_resection": 190.0, "steps_per_day": 3}
-    assert resolve_time_step({**raw, "time_after_resection": 40.0}, 10.0) == {
-        "time_after_resection": 40.0,
-        "n_steps": 150,
-    }
-    assert resolve_time_step({"rho": 1.0}, None) == {"rho": 1.0}
-    assert resolve_time_step({"n_steps": 7}, None) == {"n_steps": 7}
-    # Without a time step to translate no resection time is needed.
-    assert solver_params_from_manifest(
-        _write_manifest(tmp_path, {"solver": {"time_after_resection": 1}})
-    ) == {"time_after_resection": 1}
-    with pytest.raises(ValueError, match="at most one"):
-        resolve_time_step({"time_after_resection": 1.0, "n_steps": 7, "dt": 0.1}, 2.0)
-    with pytest.raises(ValueError, match="requires 'time_after_resection'"):
-        resolve_time_step({"steps_per_day": 3}, 2.0)
-    with pytest.raises(ValueError, match="requires a resection time"):
-        resolve_time_step({"time_after_resection": 1.0, "steps_per_day": 3}, None)

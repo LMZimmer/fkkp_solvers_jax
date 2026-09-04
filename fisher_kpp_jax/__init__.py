@@ -2,8 +2,9 @@
 
 Four solvers share one params-dict interface and return a ``Result``
 (``StuppFKPPSolver`` extends the isotropic model with resection,
-chemotherapy and radiotherapy; ``solvers.treatment_params_from_manifest``
-loads its treatment parameters from a JSON manifest).
+chemotherapy and radiotherapy; ``solvers.read_manifest`` and
+``solvers.params_from_manifest`` load its parameters from a JSON run
+manifest keyed by parameter name).
 Common solver options: ``precision: "f32" | "f64"`` (default "f32") selects
 the device state dtype, and ``n_steps`` pins an explicit step count
 (dt = stopping_time / n_steps) in place of the stability formula. The
