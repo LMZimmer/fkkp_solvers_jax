@@ -2,15 +2,16 @@
 """Run the example Stupp-protocol manifest on the SAILOR subject and render
 the treatment course as a figure.
 
-Two solves of fisher_kpp_jax.StuppFKPPSolver with the manifest's solver and
-treatment parameters (scripts/stupp_manifest_example.json by default):
+Two solves of fisher_kpp_jax.StuppFKPPSolver with the manifest's parameters
+(scripts/stupp_manifest_example.json by default; it must name the tissue
+maps, the cavity segmentation and the dose map):
 
   1. seed -> resection time with no event firing (the state just BEFORE
      the resection),
   2. the full treated horizon with evenly spaced snapshots (--n-snapshots).
 
 The seed is placed at the center of mass of one label of the manifest's
-tumor segmentation (--seed-label, default 3 = enhancing core), replacing the
+cavity segmentation (--seed-label, default 3 = enhancing core), replacing the
 manifest's seed fractions. The figure shows, on the axial slice through the
 dose map's center of mass (or --slice-z), the T1c image with the cell
 density overlaid in the style of PredictGBM's multislice plots
@@ -52,19 +53,13 @@ import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
 
 from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
-from fisher_kpp_jax.solvers import (  # noqa: E402
-    solver_params_from_manifest,
-    tissue_paths_from_manifest,
-    treatment_params_from_manifest,
-)
+from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: E402
 
 DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
 # Background image: <session dir of the wm pbmap>/skull_stripped/t1c_skullstripped.nii.gz
 # unless --t1c is given (the SAILOR layout, so a patient change in the
-# manifest's 'tissue' section carries over).
+# manifest's tissue maps carries over).
 T1C_RELATIVE = Path("skull_stripped") / "t1c_skullstripped.nii.gz"
-DEFAULT_WM = "/mnt/Drive4/lucas/SAILOR/processed/sub-01/ses-01/tissue_segmentation/wm_pbmap.nii.gz"
-DEFAULT_GM = "/mnt/Drive4/lucas/SAILOR/processed/sub-01/ses-01/tissue_segmentation/gm_pbmap.nii.gz"
 
 CAVITY_COLOR = (210 / 255.0, 43 / 255.0, 43 / 255.0, 1)
 SEED_COLOR = (34 / 255.0, 139 / 255.0, 34 / 255.0, 1)
@@ -211,7 +206,7 @@ def render(
     times: np.ndarray,
     masses: np.ndarray,
     pre_points: list[tuple[float, float]],
-    treatment: dict[str, Any],
+    params: dict[str, Any],
 ) -> None:
     import matplotlib
 
@@ -256,13 +251,13 @@ def render(
     if pre_points:
         ax.plot(*zip(*pre_points), "s", color="gray", label="before resection")
     ax.axvline(
-        float(treatment["resection_time"]), color=CAVITY_COLOR, linewidth=1.5, label="resection"
+        float(params["resection_time"]), color=CAVITY_COLOR, linewidth=1.5, label="resection"
     )
     # Radiotherapy days as lines, split by whether chemotherapy is given the
     # same day; chemotherapy-only days (daily sessions, many of them) as one
     # shaded band per contiguous block of sessions.
-    rt_days = np.atleast_1d(np.asarray(treatment["rt_times"], dtype=np.float64))
-    ct_days = np.atleast_1d(np.asarray(treatment["chemo_times"], dtype=np.float64))
+    rt_days = np.atleast_1d(np.asarray(params["rt_times"], dtype=np.float64))
+    ct_days = np.atleast_1d(np.asarray(params["chemo_times"], dtype=np.float64))
     with_ct = np.isin(rt_days, ct_days)
     for days, label, color in (
         (rt_days[with_ct], "radio- + chemotherapy", "blue"),
@@ -298,49 +293,36 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    with open(args.manifest, encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    tissue_paths = tissue_paths_from_manifest(args.manifest)
-    wm_path = str(tissue_paths.get("wm", DEFAULT_WM))
-    gm_path = str(tissue_paths.get("gm", DEFAULT_GM))
+    manifest = read_manifest(args.manifest)
+    wm_path, gm_path = manifest["white_matter_pbmap"], manifest["gray_matter_pbmap"]
     wm_img = nib.load(wm_path)
-    wm = np.asarray(wm_img.get_fdata(), dtype=np.float64)
-    gm = np.asarray(nib.load(gm_path).get_fdata(), dtype=np.float64)
+    voxel_size = tuple(float(v) for v in wm_img.header.get_zooms()[:3])
+    segmentation = np.rint(
+        nib.load(manifest["resection_cavity"]["segmentation"]).get_fdata()
+    ).astype(np.int64)
+    if not (segmentation == args.seed_label).any():
+        raise ValueError(f"seed label {args.seed_label} is absent from the cavity segmentation.")
+    seed_voxel = tuple(int(v) for v in np.rint(center_of_mass(segmentation == args.seed_label)))
+    # +0.5 so the solver's int(fraction * N) lands on the voxel.
+    seed_fractions = {
+        f"gaussian_seed_{axis}_fraction": (seed_voxel[i] + 0.5) / segmentation.shape[i]
+        for i, axis in enumerate("xyz")
+    }
+    params = params_from_manifest(
+        {"voxel_size_mm": voxel_size, "verbose": False, **manifest, **seed_fractions}
+    )
+    wm = params["white_matter_pbmap"]
     t1c_path = Path(args.t1c) if args.t1c else Path(wm_path).parent.parent / T1C_RELATIVE
     if not t1c_path.is_file():
         raise FileNotFoundError(f"background image not found: {t1c_path} (pass --t1c)")
     t1c = np.asarray(nib.load(str(t1c_path)).get_fdata(), dtype=np.float64)
     if t1c.shape != wm.shape:
         raise ValueError(f"--t1c shape {t1c.shape} differs from the tissue maps {wm.shape}.")
-    voxel_size = tuple(float(v) for v in wm_img.header.get_zooms()[:3])
+    z = args.slice_z if args.slice_z is not None else int(round(center_of_mass(params["rt_dose"])[2]))
 
-    solver_params = solver_params_from_manifest(args.manifest)
-    treatment = treatment_params_from_manifest(args.manifest)
-    segmentation = np.rint(
-        nib.load(str(Path(args.manifest).parent / manifest["resection"]["tumor_segmentation"]))
-        .get_fdata()
-    ).astype(np.int64)
-    if not (segmentation == args.seed_label).any():
-        raise ValueError(f"seed label {args.seed_label} is absent from the tumor segmentation.")
-    seed_voxel = tuple(int(v) for v in np.rint(center_of_mass(segmentation == args.seed_label)))
-    # +0.5 so the solver's int(fraction * N) lands on the voxel.
-    seed_fractions = {
-        f"gaussian_seed_{axis}_fraction": (seed_voxel[i] + 0.5) / wm.shape[i]
-        for i, axis in enumerate("xyz")
-    }
-    z = args.slice_z if args.slice_z is not None else int(round(center_of_mass(treatment["rt_dose"])[2]))
-
-    base: dict[str, Any] = {
-        "gray_matter_pbmap": gm,
-        "white_matter_pbmap": wm,
-        "voxel_size_mm": voxel_size,
-        "verbose": False,
-        **solver_params,
-        **seed_fractions,
-    }
-    resection_time = float(treatment["resection_time"])
-    stopping_time = resection_time + float(base["time_after_resection"])
-    n_steps = int(base["n_steps"])
+    resection_time = float(params["resection_time"])
+    stopping_time = resection_time + float(params["time_after_resection"])
+    n_steps = int(params["n_steps"])
     dt = stopping_time / n_steps
     print(f"run directory: {run_dir}")
     print(f"seed voxel {seed_voxel} (label {args.seed_label} CoM), slice z={z}, {n_steps} steps (dt={dt:.4g} d)")
@@ -349,7 +331,11 @@ def main(argv: list[str] | None = None) -> int:
     # StuppFKPPSolver reproduces up to that step).
     n_pre = int(round(resection_time / dt))
     wall = time.perf_counter()
-    untreated = {key: value for key, value in base.items() if key != "time_after_resection"}
+    untreated = {
+        key: value
+        for key, value in params.items()
+        if key not in StuppFKPPSolver.TREATMENT_KEYS and key != "time_after_resection"
+    }
     pre = FKPPSolver({**untreated, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
     if not pre.success:
         raise RuntimeError(f"pre-resection solve failed: {pre.error}")
@@ -358,9 +344,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Solve 2: the treated horizon with snapshots.
     wall = time.perf_counter()
-    treated = StuppFKPPSolver(
-        {**base, **treatment, "n_time_series_snapshots": args.n_snapshots}
-    ).solve()
+    treated = StuppFKPPSolver({**params, "n_time_series_snapshots": args.n_snapshots}).solve()
     if not treated.success:
         raise RuntimeError(f"treated solve failed: {treated.error}")
     wall_treated = time.perf_counter() - wall
@@ -375,30 +359,30 @@ def main(argv: list[str] | None = None) -> int:
         times,
         (n_pre * dt, pre.final_state["cell_density"]),
         resection_time,
-        np.asarray(treatment["rt_times"], dtype=np.float64),
+        np.asarray(params["rt_times"], dtype=np.float64),
         args.n_treatment_panels,
     )
 
     header = (
-        f"D {base['white_matter_diffusivity']:g}, rho {base['rho']:g}, "
-        f"ratio {base['diffusivity_ratio']:g}, "
-        f"alpha {treatment['rt_alpha']:g}, beta {treatment['rt_beta']:g}, "
-        f"kill {treatment['chemo_kill_rate']:g} /(mg/m^2), decay {treatment['chemo_decay_rate']:g}, "
-        f"TMZ {np.min(treatment['chemo_doses']):g}-{np.max(treatment['chemo_doses']):g} mg/m^2"
+        f"D {params['white_matter_diffusivity']:g}, rho {params['rho']:g}, "
+        f"ratio {params['diffusivity_ratio']:g}, "
+        f"alpha {params['rt_alpha']:g}, beta {params['rt_beta']:g}, "
+        f"kill {params['chemo_kill_rate']:g} /(mg/m^2), decay {params['chemo_decay_rate']:g}, "
+        f"TMZ {np.min(params['chemo_doses']):g}-{np.max(params['chemo_doses']):g} mg/m^2"
     )
     render(
         run_dir / "overview",
         header,
         panels,
         t1c,
-        treatment["resection_cavity"],
+        params["resection_cavity"],
         seed_voxel,
         z,
         args.threshold,
         times,
         masses,
         [(n_pre * dt, float(pre.final_state["cell_density"].sum()))],
-        treatment,
+        params,
     )
     summary = {
         "run_name": run_name,
@@ -406,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         "manifest": str(Path(args.manifest).resolve()),
         "tissue": {"wm": wm_path, "gm": gm_path},
         "t1c": str(t1c_path),
-        "params": scalar_params({**base, **treatment}),
+        "params": scalar_params(params),
         "seed_voxel": list(seed_voxel),
         "slice_z": z,
         "n_steps": n_steps,

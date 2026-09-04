@@ -25,12 +25,14 @@ Swept parameters and default ranges (uniform):
                            the former 0.05 - 2.0 per unit concentration / 75 mg/m^2)
   chemo_decay_rate         1.0       - 20.0     1/day      (not in the file)
   rt_alpha                 0.02      - 0.3      1/Gy       (not in the file); rt_beta = 0.1 * rt_alpha
-  seed voxel               uniformly among the cavity voxels (cavity_label of the
-                           base manifest's tumor segmentation) that carry tissue
+  seed voxel               uniformly among the cavity voxels (the label of the
+                           base manifest's resection_cavity segmentation) that
+                           carry tissue
 Ranges are overridable with --range NAME MIN MAX.
 
-Everything else comes from the base manifest (--manifest): the tissue maps,
-the resection segmentation and dose map, the radiotherapy and chemotherapy
+Everything else comes from the base manifest (--manifest, a run manifest of
+fisher_kpp_jax.solvers.read_manifest that must name the tissue maps and the
+cavity segmentation): the volumes, the radiotherapy and chemotherapy
 session times, the chemotherapy session doses (mg/m^2, copied through
 unchanged) and the remaining solver parameters. The radiotherapy and
 chemotherapy sessions are shifted with the sampled resection time so the
@@ -75,7 +77,7 @@ import numpy as np
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from fisher_kpp_jax.solvers import tissue_paths_from_manifest  # noqa: E402
+from fisher_kpp_jax.solvers import read_manifest  # noqa: E402
 
 DEFAULT_MANIFEST = _ROOT / "scripts" / "stupp_manifest_example.json"
 FORWARD_SCRIPT = _ROOT / "scripts" / "run_stupp_forward.py"
@@ -140,11 +142,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def resolve_manifest_path(value: str, manifest_path: Path) -> Path:
-    path = Path(value)
-    return path if path.is_absolute() else manifest_path.parent / path
-
-
 def sample_configs(
     rng: np.random.Generator,
     n_configs: int,
@@ -175,8 +172,7 @@ def config_manifest(
     """The per-configuration manifest: the base manifest with the sampled
     values substituted, sessions shifted with the resection time and the
     time step raised to the diffusion stability bound where needed."""
-    manifest = json.loads(json.dumps(base))  # deep copy (incl. the chemo doses)
-    solver = manifest.setdefault("solver", {})
+    manifest = dict(base)
     for key in (
         "rho",
         "white_matter_diffusivity",
@@ -184,31 +180,29 @@ def config_manifest(
         "gaussian_seed_x_fraction",
         "gaussian_seed_y_fraction",
         "gaussian_seed_z_fraction",
+        "resection_time",
+        "chemo_kill_rate",
+        "chemo_decay_rate",
+        "rt_alpha",
+        "rt_beta",
     ):
-        solver[key] = config[key]
-    resolution = float(solver.get("resolution_factor", 1.0))
+        manifest[key] = config[key]
+    resolution = float(base.get("resolution_factor", 1.0))
     h = grid_spacing_mm / resolution
-    base_steps = float(solver.get("steps_per_day", 12))
-    solver.pop("dt", None)
-    solver.pop("n_steps", None)
-    solver["steps_per_day"] = int(
+    base_steps = float(base.get("steps_per_day", 12))
+    manifest.pop("dt", None)
+    manifest.pop("n_steps", None)
+    manifest["steps_per_day"] = int(
         max(base_steps, np.ceil(8.0 * config["white_matter_diffusivity"] / (h * h) + 1))
     )
-    shift = config["resection_time"] - float(base["resection"]["time"])
-    manifest["resection"]["time"] = config["resection_time"]
-    section = manifest["chemotherapy"]
-    section["times"] = [float(t) + shift for t in section["times"]]
-    # section["doses"] stays as in the base manifest (one per shifted time).
-    section["kill_rate"] = config["chemo_kill_rate"]
-    section["decay_rate"] = config["chemo_decay_rate"]
-    section = manifest["radiotherapy"]
-    section["times"] = [float(t) + shift for t in section["times"]]
-    section["alpha"] = config["rt_alpha"]
-    section["beta"] = config["rt_beta"]
+    shift = config["resection_time"] - float(base["resection_time"])
+    manifest["chemo_times"] = [float(t) + shift for t in base["chemo_times"]]
+    # chemo_doses stay as in the base manifest (one per shifted time).
+    manifest["rt_times"] = [float(t) + shift for t in base["rt_times"]]
     manifest["_sweep"] = (
         f"{config['config']}: sampled values substituted by scripts/run_stupp_sweep.py; "
         f"sessions shifted by {shift:+g} days with the resection time; "
-        f"steps_per_day {solver['steps_per_day']}."
+        f"steps_per_day {manifest['steps_per_day']}."
     )
     return manifest
 
@@ -241,43 +235,39 @@ def main(argv: list[str] | None = None) -> int:
     (sweep_dir / "logs").mkdir()
 
     manifest_path = Path(args.manifest).resolve()
-    with open(manifest_path, encoding="utf-8") as handle:
-        base = json.load(handle)
-    for section in ("resection", "radiotherapy", "chemotherapy"):
-        if section not in base:
-            raise ValueError(f"the base manifest needs a {section!r} section for the sweep.")
-    # Absolute volume paths so the per-config manifests work from configs/.
-    base["resection"]["tumor_segmentation"] = str(
-        resolve_manifest_path(base["resection"]["tumor_segmentation"], manifest_path)
-    )
-    base["radiotherapy"]["dose"] = str(resolve_manifest_path(base["radiotherapy"]["dose"], manifest_path))
-    tissue = tissue_paths_from_manifest(manifest_path)
-    if not tissue:
-        raise ValueError("the base manifest needs a 'tissue' section (wm/gm pbmaps).")
-    base["tissue"] = {key: str(path) for key, path in tissue.items()}
+    # read_manifest makes the volume paths absolute, so the per-config
+    # manifests work from configs/.
+    base = read_manifest(manifest_path)
+    missing = [
+        key
+        for key in ("white_matter_pbmap", "gray_matter_pbmap", "resection_cavity", "resection_time", "chemo_times", "rt_times")
+        if key not in base
+    ]
+    if missing:
+        raise ValueError(f"the base manifest lacks {missing}, which the sweep needs.")
 
-    wm_img = nib.load(str(tissue["wm"]))
+    wm_img = nib.load(base["white_matter_pbmap"])
     wm = np.asarray(wm_img.get_fdata(), dtype=np.float64)
-    gm = np.asarray(nib.load(str(tissue["gm"])).get_fdata(), dtype=np.float64)
+    gm = np.asarray(nib.load(base["gray_matter_pbmap"]).get_fdata(), dtype=np.float64)
     zooms = tuple(float(v) for v in wm_img.header.get_zooms()[:3])
     segmentation = np.rint(
-        nib.load(base["resection"]["tumor_segmentation"]).get_fdata()
+        nib.load(base["resection_cavity"]["segmentation"]).get_fdata()
     ).astype(np.int64)
-    cavity = segmentation == int(base["resection"]["cavity_label"])
+    cavity = segmentation == base["resection_cavity"]["label"]
     # Seeds must lie in brain matter (the solver rejects seeds without tissue).
     cavity_voxels = np.argwhere(cavity & ((wm + gm) > 0))
     if not len(cavity_voxels):
         raise ValueError("no cavity voxel with tissue to seed in.")
     t1c = args.t1c
     if t1c is None:
-        candidate = Path(tissue["wm"]).parent.parent / T1C_RELATIVE
+        candidate = Path(base["white_matter_pbmap"]).parent.parent / T1C_RELATIVE
         t1c = str(candidate) if candidate.is_file() else None
 
     rng = np.random.default_rng(args.seed)
     configs = sample_configs(rng, args.n_configs, ranges, cavity_voxels, wm.shape)
     for config in configs:
         manifest = config_manifest(base, config, min(zooms))
-        config["steps_per_day"] = manifest["solver"]["steps_per_day"]
+        config["steps_per_day"] = manifest["steps_per_day"]
         with open(sweep_dir / "configs" / f"{config['config']}.json", "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2)
             handle.write("\n")

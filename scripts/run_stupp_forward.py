@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 """Forward-solve one treated tumor growth with fisher_kpp_jax.StuppFKPPSolver.
 
-Loads the patient's WM/GM tissue probability maps, reads a JSON run manifest
-(see scripts/stupp_manifest_example.json and the loaders in
-fisher_kpp_jax.solvers: 'tissue' pbmap paths, 'solver' scalar parameters
-incl. dt, and the treatment sections -- resection cavity from a labelled
-segmentation, chemotherapy session times/doses/rates, radiotherapy fraction times
-and TOTAL-dose map with the linear-quadratic alpha/beta), runs the solver and
-writes, into its own run directory
+Reads a JSON run manifest (see scripts/stupp_manifest_example.json and
+read_manifest / params_from_manifest in fisher_kpp_jax.solvers: the
+StuppFKPPSolver parameters by name, with the tissue probability maps, the
+labelled segmentation of the resection cavity and the TOTAL-dose map as
+NIfTI paths and the time step as steps_per_day, dt or n_steps), runs the
+solver and writes, into its own run directory
 
   <output-dir>/<run-name>/
     final_cell_density.nii.gz  the final tumor cell density, affine and header
@@ -32,16 +31,11 @@ time series is requested at all (memory-light for parallel sweeps) and the
 extra short solve up to the resection (the "before resection" panel) is
 skipped.
 
-Parameter precedence, lowest to highest: the script defaults below, the
-manifest's 'tissue' / 'solver' sections, explicit CLI arguments. The horizon
-is --time-after-resection (the run ends that many days after the resection;
-default 100). The time step is resolved after the merge from the
-highest-precedence layer that sets any key of its group: --n-steps /
---steps-per-day (default 12 steps per day), with the manifest's solver keys
-of the same names in between. The script defaults: rho, white
-matter diffusivity and diffusivity ratio are the means of
-scripts/parameter_range.txt (previous inverse runs); seed position (image
-center) and pbmap paths are PLACEHOLDERS for the SAILOR subject.
+The manifest carries every parameter; explicit CLI arguments (--wm, --gm
+and the solver knobs) override the manifest entries of the same name.
+--n-steps or --steps-per-day replaces the manifest's time step entry
+altogether. The horizon is resection_time + time_after_resection (the run
+ends that many days after the resection).
 
 Run from the project root, e.g.:
   JAX_PLATFORMS=cpu python scripts/run_stupp_forward.py --output-dir runs/
@@ -75,40 +69,18 @@ import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
 
 from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
-from fisher_kpp_jax.solvers import (  # noqa: E402
-    resolve_time_step,
-    solver_params_from_manifest,
-    tissue_paths_from_manifest,
-    treatment_params_from_manifest,
-)
+from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: E402
 from run_stupp_example import render, select_panels, snapshot_steps  # noqa: E402
 
-_SAILOR_TISSUE = "/mnt/Drive4/lucas/SAILOR/processed/sub-01/ses-01/tissue_segmentation"
-DEFAULT_WM = f"{_SAILOR_TISSUE}/wm_pbmap.nii.gz"
-DEFAULT_GM = f"{_SAILOR_TISSUE}/gm_pbmap.nii.gz"
 DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
-
-# Solver defaults -- see the module docstring. Keyed by the solver
-# parameter names; the manifest 'solver' section and explicit CLI arguments
-# override them in that order.
-DEFAULT_SOLVER_PARAMS: dict[str, Any] = {
-    "rho": 0.075777,  # 1/day, mean of scripts/parameter_range.txt
-    "white_matter_diffusivity": 0.80021,  # mm^2/day, mean of parameter_range.txt
-    "diffusivity_ratio": 227.35,  # 10^mean(log10 ratio) of parameter_range.txt
-    "resolution_factor": 1.0,
-    "time_after_resection": 100.0,  # days after the resection: the horizon
-    "steps_per_day": 12,  # dt = 1/12 day; n_steps = ceil(horizon * 12)
-    "precision": "f32",
-    "gaussian_seed_x_fraction": 0.5,  # of the grid extent, per axis
-    "gaussian_seed_y_fraction": 0.5,
-    "gaussian_seed_z_fraction": 0.5,
-}
 DEFAULT_N_SNAPSHOTS = 25
 DEFAULT_N_TREATMENT_PANELS = 5
 DEFAULT_THRESHOLD = 0.01  # overlay transparency threshold (cell density)
 
-# CLI option -> solver parameter name of the pass-through knobs.
-CLI_SOLVER_KNOBS: dict[str, str] = {
+# CLI option -> manifest entry (solver parameter name) it overrides.
+CLI_OVERRIDES: dict[str, str] = {
+    "wm": "white_matter_pbmap",
+    "gm": "gray_matter_pbmap",
     "rho": "rho",
     "diffusivity": "white_matter_diffusivity",
     "resolution_factor": "resolution_factor",
@@ -127,30 +99,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--wm",
-        default=None,
-        help=f"white matter pbmap NIfTI (default: manifest 'tissue', else {DEFAULT_WM})",
+        "--wm", default=None, help="white matter pbmap NIfTI (overrides the manifest)"
     )
     parser.add_argument(
-        "--gm",
-        default=None,
-        help=f"gray matter pbmap NIfTI (default: manifest 'tissue', else {DEFAULT_GM})",
+        "--gm", default=None, help="gray matter pbmap NIfTI (overrides the manifest)"
     )
-    parser.add_argument(
-        "--manifest", default=DEFAULT_MANIFEST, help="treatment manifest JSON"
-    )
+    parser.add_argument("--manifest", default=DEFAULT_MANIFEST, help="run manifest JSON")
     parser.add_argument("--output-dir", required=True, help="parent of the run directory")
     parser.add_argument(
         "--run-name",
         default=None,
         help="run directory name (default: stupp_<UTC timestamp>_<pid>)",
     )
-    # Solver knobs default to None: unset ones fall back to the manifest
-    # 'solver' section, then to DEFAULT_SOLVER_PARAMS.
+    # Solver knobs default to None: unset ones leave the manifest entry.
     knobs = parser.add_argument_group(
-        "solver knobs",
-        "override the manifest 'solver' section; defaults: "
-        + ", ".join(f"{k}={v}" for k, v in DEFAULT_SOLVER_PARAMS.items()),
+        "solver knobs", "override the manifest entries of the same name"
     )
     knobs.add_argument("--rho", type=float, default=None, help="proliferation rate, 1/day")
     knobs.add_argument(
@@ -245,47 +208,35 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    tissue_paths = tissue_paths_from_manifest(args.manifest)
-    wm_path = args.wm or str(tissue_paths.get("wm", DEFAULT_WM))
-    gm_path = args.gm or str(tissue_paths.get("gm", DEFAULT_GM))
-    wm_img = nib.load(wm_path)
-    gm_img = nib.load(gm_path)
-    wm = np.asarray(wm_img.get_fdata(), dtype=np.float64)
-    gm = np.asarray(gm_img.get_fdata(), dtype=np.float64)
-    voxel_size = tuple(float(v) for v in wm_img.header.get_zooms()[:3])
-
-    treatment = treatment_params_from_manifest(args.manifest)
+    manifest = read_manifest(args.manifest)
     shutil.copyfile(args.manifest, run_dir / "manifest.json")
-
-    # Precedence: script defaults < manifest 'solver' < explicit CLI knobs.
-    # The time step is kept unresolved (n_steps / dt / steps_per_day) until
-    # the merge is complete: the highest-precedence layer that sets any of
-    # the three wins as a whole, and only then is it translated to n_steps
-    # with the horizon resection time + time_after_resection.
-    manifest_solver = solver_params_from_manifest(args.manifest, resolve=False)
-    cli_solver = {
-        param: getattr(args, option)
-        for option, param in CLI_SOLVER_KNOBS.items()
+    overrides = {
+        entry: getattr(args, option)
+        for option, entry in CLI_OVERRIDES.items()
         if getattr(args, option) is not None
     }
-    time_step_keys = ("n_steps", "dt", "steps_per_day")
-    merged: dict[str, Any] = {}
-    for layer in (DEFAULT_SOLVER_PARAMS, manifest_solver, cli_solver):
-        if any(key in layer for key in time_step_keys):
-            for key in time_step_keys:
-                merged.pop(key, None)
-        merged.update(layer)
-    merged = resolve_time_step(merged, treatment["resection_time"])
+    # A CLI time step replaces the manifest's, whichever form that has.
+    if "n_steps" in overrides or "steps_per_day" in overrides:
+        for key in ("n_steps", "dt", "steps_per_day"):
+            manifest.pop(key, None)
+    entries = {**manifest, **overrides}
+    for key in ("white_matter_pbmap", "gray_matter_pbmap"):
+        if key not in entries:
+            raise ValueError(f"{key} is set neither in the manifest nor on the command line.")
+    wm_path, gm_path = entries["white_matter_pbmap"], entries["gray_matter_pbmap"]
+    wm_img = nib.load(wm_path)  # affine and header of the output volume
+    voxel_size = tuple(float(v) for v in wm_img.header.get_zooms()[:3])
+
     n_snapshots = None if args.no_plot else int(args.n_snapshots)
-    params: dict[str, Any] = {
-        "voxel_size_mm": voxel_size,
-        "verbose": True,
-        **merged,
-        "gray_matter_pbmap": gm,
-        "white_matter_pbmap": wm,
-        "n_time_series_snapshots": n_snapshots,
-        **treatment,
-    }
+    params = params_from_manifest(
+        {
+            "voxel_size_mm": voxel_size,
+            "verbose": True,
+            **entries,
+            "n_time_series_snapshots": n_snapshots,
+        }
+    )
+    wm, gm = params["white_matter_pbmap"], params["gray_matter_pbmap"]
     solver = StuppFKPPSolver(params)
 
     print(f"run directory: {run_dir}")
@@ -344,12 +295,12 @@ def main(argv: list[str] | None = None) -> int:
         # up to that step.
         pre_resection = None
         pre_points = [(0.0, float(result.initial_state["cell_density"].sum()))]
-        n_pre = int(round(float(treatment["resection_time"]) / dt))
+        n_pre = int(round(float(params["resection_time"]) / dt))
         if n_pre >= 1:
             untreated = {
                 key: value
                 for key, value in params.items()
-                if key not in treatment and key != "time_after_resection"
+                if key not in StuppFKPPSolver.TREATMENT_KEYS and key != "time_after_resection"
             }
             pre = FKPPSolver(
                 {
@@ -372,14 +323,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
         else:
             background = wm + gm
-        z = int(round(center_of_mass(treatment["rt_dose"])[2]))
+        z = int(round(center_of_mass(params["rt_dose"])[2]))
         panels = select_panels(
             result.initial_state["cell_density"],
             frames,
             times,
             pre_resection,
-            float(treatment["resection_time"]),
-            np.asarray(treatment["rt_times"], dtype=np.float64),
+            float(params["resection_time"]),
+            np.asarray(params["rt_times"], dtype=np.float64),
             args.n_treatment_panels,
         )
         header = (
@@ -394,14 +345,14 @@ def main(argv: list[str] | None = None) -> int:
             header,
             panels,
             background,
-            treatment["resection_cavity"],
+            params["resection_cavity"],
             seed_voxel,
             z,
             args.threshold,
             times,
             masses,
             pre_points,
-            treatment,
+            params,
         )
 
     print(

@@ -6,10 +6,9 @@ The counterpart of scripts/run_stupp_example.py without patient data: the
 tissue maps default to reference_solves/{wm,gm}_pbmap.nii.gz and the cavity
 and dose map are derived from the simulation itself instead of segmentations
 and a planning dose. Two solves of fisher_kpp_jax.StuppFKPPSolver with the
-manifest's solver parameters and treatment schedule (session times, TMZ doses, rates)
-(scripts/stupp_manifest_example.json by default; its 'tissue', resection
-'tumor_segmentation'/'cavity_label' and radiotherapy 'dose' entries are
-ignored and may be omitted):
+manifest's parameters (scripts/stupp_manifest_example.json by default; its
+volume entries white_matter_pbmap, gray_matter_pbmap, resection_cavity and
+rt_dose are ignored and may be omitted):
 
   1. seed -> resection time with no event firing. The state just BEFORE the
      resection defines the synthetic treatment inputs: the resection cavity
@@ -63,10 +62,7 @@ import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass, distance_transform_edt  # noqa: E402
 
 from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver  # noqa: E402
-from fisher_kpp_jax.solvers import (  # noqa: E402
-    resolve_time_step,
-    solver_params_from_manifest,
-)
+from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: E402
 
 DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
 DEFAULT_WM = str(_ROOT / "reference_solves" / "wm_pbmap.nii.gz")
@@ -75,6 +71,8 @@ DEFAULT_GM = str(_ROOT / "reference_solves" / "gm_pbmap.nii.gz")
 # reference_solves grid (the reference solves' seed (140, 116, 55) sits low,
 # near the skull base).
 DEFAULT_SEED_VOXEL = (132, 103, 90)
+# Manifest entries replaced by --wm/--gm and the synthetic cavity and dose map.
+SYNTHETIC_VOLUME_KEYS = ("white_matter_pbmap", "gray_matter_pbmap", "resection_cavity", "rt_dose")
 
 CAVITY_COLOR = (210 / 255.0, 43 / 255.0, 43 / 255.0, 1)
 SEED_COLOR = (34 / 255.0, 139 / 255.0, 34 / 255.0, 1)
@@ -154,36 +152,6 @@ def scalar_params(params: dict[str, Any]) -> dict[str, Any]:
         for key, value in params.items()
         if not (isinstance(value, np.ndarray) and value.ndim > 1)
     }
-
-
-def treatment_schedule_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    """
-    The scalar treatment parameters of the manifest: resection time,
-    chemotherapy times/doses/rates and radiotherapy times/alpha/beta (all
-    three sections are required, as the solver requires every treatment;
-    the chemotherapy section needs 'doses', one per time, like the package
-    loader). The
-    volumes the sections point at (tumor segmentation, planning dose) are
-    not read - the cavity and dose map are synthesized from the
-    pre-resection solve instead.
-    """
-    missing = [name for name in ("resection", "chemotherapy", "radiotherapy") if name not in manifest]
-    if missing:
-        raise ValueError(f"the manifest is missing the treatment section(s) {missing}.")
-    params: dict[str, Any] = {"resection_time": float(manifest["resection"]["time"])}
-    section = manifest["chemotherapy"]
-    missing = [key for key in ("times", "doses", "kill_rate", "decay_rate") if key not in section]
-    if missing:
-        raise ValueError(f"manifest section 'chemotherapy' is missing key(s) {missing}.")
-    params["chemo_times"] = np.asarray(section["times"], dtype=np.float64)
-    params["chemo_doses"] = np.asarray(section["doses"], dtype=np.float64)
-    params["chemo_kill_rate"] = float(section["kill_rate"])
-    params["chemo_decay_rate"] = float(section["decay_rate"])
-    section = manifest["radiotherapy"]
-    params["rt_times"] = np.asarray(section["times"], dtype=np.float64)
-    params["rt_alpha"] = float(section["alpha"])
-    params["rt_beta"] = float(section["beta"])
-    return params
 
 
 def synthetic_treatment_volumes(
@@ -297,7 +265,7 @@ def render(
     times: np.ndarray,
     masses: np.ndarray,
     pre_points: list[tuple[float, float]],
-    treatment: dict[str, Any],
+    params: dict[str, Any],
 ) -> None:
     import matplotlib
 
@@ -342,13 +310,13 @@ def render(
     if pre_points:
         ax.plot(*zip(*pre_points), "s", color="gray", label="before resection")
     ax.axvline(
-        float(treatment["resection_time"]), color=CAVITY_COLOR, linewidth=1.5, label="resection"
+        float(params["resection_time"]), color=CAVITY_COLOR, linewidth=1.5, label="resection"
     )
     # Radiotherapy days as lines, split by whether chemotherapy is given the
     # same day; chemotherapy-only days (daily sessions, many of them) as one
     # shaded band per contiguous block of sessions.
-    rt_days = np.atleast_1d(np.asarray(treatment["rt_times"], dtype=np.float64))
-    ct_days = np.atleast_1d(np.asarray(treatment["chemo_times"], dtype=np.float64))
+    rt_days = np.atleast_1d(np.asarray(params["rt_times"], dtype=np.float64))
+    ct_days = np.atleast_1d(np.asarray(params["chemo_times"], dtype=np.float64))
     with_ct = np.isin(rt_days, ct_days)
     for days, label, color in (
         (rt_days[with_ct], "radio- + chemotherapy", "blue"),
@@ -384,8 +352,13 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    with open(args.manifest, encoding="utf-8") as handle:
-        manifest = json.load(handle)
+    # The manifest's volumes are replaced: the tissue maps by --wm/--gm, the
+    # cavity and dose map by the synthetic ones below.
+    manifest = {
+        key: value
+        for key, value in read_manifest(args.manifest).items()
+        if key not in SYNTHETIC_VOLUME_KEYS
+    }
     wm_img = nib.load(args.wm)
     wm = np.asarray(wm_img.get_fdata(), dtype=np.float64)
     gm = np.asarray(nib.load(args.gm).get_fdata(), dtype=np.float64)
@@ -394,14 +367,6 @@ def main(argv: list[str] | None = None) -> int:
     voxel_size = tuple(float(v) for v in wm_img.header.get_zooms()[:3])
     background_volume = gm
 
-    treatment = treatment_schedule_from_manifest(manifest)
-    # resolve=False + explicit resolution so a synthetic manifest may omit
-    # the patient-data keys of the resection section (tumor_segmentation,
-    # cavity_label) that resolve=True would demand.
-    solver_params = resolve_time_step(
-        solver_params_from_manifest(args.manifest, resolve=False),
-        float(treatment["resection_time"]),
-    )
     seed_voxel = tuple(int(v) for v in args.seed_voxel)
     if not all(0 <= seed_voxel[i] < wm.shape[i] for i in range(3)):
         raise ValueError(f"--seed-voxel {seed_voxel} lies outside the grid {wm.shape}.")
@@ -411,17 +376,19 @@ def main(argv: list[str] | None = None) -> int:
         for i, axis in enumerate("xyz")
     }
 
-    base: dict[str, Any] = {
-        "gray_matter_pbmap": gm,
-        "white_matter_pbmap": wm,
-        "voxel_size_mm": voxel_size,
-        "verbose": False,
-        **solver_params,
-        **seed_fractions,
-    }
-    resection_time = float(treatment["resection_time"])
-    stopping_time = resection_time + float(base["time_after_resection"])
-    n_steps = int(base["n_steps"])
+    params = params_from_manifest(
+        {
+            "voxel_size_mm": voxel_size,
+            "verbose": False,
+            **manifest,
+            "gray_matter_pbmap": gm,
+            "white_matter_pbmap": wm,
+            **seed_fractions,
+        }
+    )
+    resection_time = float(params["resection_time"])
+    stopping_time = resection_time + float(params["time_after_resection"])
+    n_steps = int(params["n_steps"])
     dt = stopping_time / n_steps
     print(f"run directory: {run_dir}")
     print(f"seed voxel {seed_voxel}, {n_steps} steps (dt={dt:.4g} d)")
@@ -430,7 +397,11 @@ def main(argv: list[str] | None = None) -> int:
     # StuppFKPPSolver reproduces up to that step).
     n_pre = int(round(resection_time / dt))
     wall = time.perf_counter()
-    untreated = {key: value for key, value in base.items() if key != "time_after_resection"}
+    untreated = {
+        key: value
+        for key, value in params.items()
+        if key not in StuppFKPPSolver.TREATMENT_KEYS and key != "time_after_resection"
+    }
     pre = FKPPSolver({**untreated, "stopping_time": n_pre * dt, "n_steps": n_pre}).solve()
     if not pre.success:
         raise RuntimeError(f"pre-resection solve failed: {pre.error}")
@@ -446,8 +417,8 @@ def main(argv: list[str] | None = None) -> int:
         args.total_dose_gy,
         voxel_size,
     )
-    treatment["resection_cavity"] = cavity
-    treatment["rt_dose"] = dose
+    params["resection_cavity"] = cavity
+    params["rt_dose"] = dose
     print(
         f"synthetic cavity (density > {args.tumor_threshold:g}): {int(cavity.sum())} voxels; "
         f"dose target (+{args.margin_mm:g} mm): {int((dose > 0).sum())} voxels "
@@ -458,9 +429,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Solve 2: the treated horizon with snapshots.
     wall = time.perf_counter()
-    treated = StuppFKPPSolver(
-        {**base, **treatment, "n_time_series_snapshots": args.n_snapshots}
-    ).solve()
+    treated = StuppFKPPSolver({**params, "n_time_series_snapshots": args.n_snapshots}).solve()
     if not treated.success:
         raise RuntimeError(f"treated solve failed: {treated.error}")
     wall_treated = time.perf_counter() - wall
@@ -475,16 +444,16 @@ def main(argv: list[str] | None = None) -> int:
         times,
         (n_pre * dt, pre.final_state["cell_density"]),
         resection_time,
-        np.asarray(treatment["rt_times"], dtype=np.float64),
+        np.asarray(params["rt_times"], dtype=np.float64),
         args.n_treatment_panels,
     )
 
     header = (
-        f"D {base['white_matter_diffusivity']:g}, rho {base['rho']:g}, "
-        f"ratio {base['diffusivity_ratio']:g}, "
-        f"alpha {treatment['rt_alpha']:g}, beta {treatment['rt_beta']:g}, "
-        f"kill {treatment['chemo_kill_rate']:g} /(mg/m^2), decay {treatment['chemo_decay_rate']:g}, "
-        f"TMZ {np.min(treatment['chemo_doses']):g}-{np.max(treatment['chemo_doses']):g} mg/m^2"
+        f"D {params['white_matter_diffusivity']:g}, rho {params['rho']:g}, "
+        f"ratio {params['diffusivity_ratio']:g}, "
+        f"alpha {params['rt_alpha']:g}, beta {params['rt_beta']:g}, "
+        f"kill {params['chemo_kill_rate']:g} /(mg/m^2), decay {params['chemo_decay_rate']:g}, "
+        f"TMZ {np.min(params['chemo_doses']):g}-{np.max(params['chemo_doses']):g} mg/m^2"
     )
     render(
         run_dir / "overview",
@@ -498,14 +467,14 @@ def main(argv: list[str] | None = None) -> int:
         times,
         masses,
         [(n_pre * dt, float(pre.final_state["cell_density"].sum()))],
-        treatment,
+        params,
     )
     summary = {
         "run_name": run_name,
         "cli_args": jsonable(vars(args)),
         "manifest": str(Path(args.manifest).resolve()),
         "tissue": {"wm": str(Path(args.wm).resolve()), "gm": str(Path(args.gm).resolve())},
-        "params": scalar_params({**base, **treatment}),
+        "params": scalar_params(params),
         "seed_voxel": list(seed_voxel),
         "slice_z": z,
         "n_steps": n_steps,
