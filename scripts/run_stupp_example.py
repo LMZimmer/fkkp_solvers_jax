@@ -16,10 +16,11 @@ manifest's seed fractions. The figure shows, on the axial slice through the
 dose map's center of mass (or --slice-z), the T1c image with the cell
 density overlaid in the style of PredictGBM's multislice plots
 (np.rot90 orientation, inferno overlay, densities below --threshold
-transparent): the seed, the state before and after resection, the snapshots
-nearest to --n-treatment-panels evenly spaced times across the radiotherapy
-block, and the end of the run; the cavity outline and the seed voxel are
-marked. A total-mass-vs-time panel with the treatment events marked sits
+transparent), three by three: the seed, the state before and one day after
+the resection; three evenly spaced times inside the radiotherapy block;
+three evenly spaced times from its end to the end of the run. Each is the
+recorded snapshot nearest to its time. The cavity outline and the seed
+voxel are marked. A total-mass-vs-time panel with the treatment events marked sits
 below. Written into <output-dir>/<run-name>/ (exist_ok=False, nothing
 outside it): overview.png, overview.pdf and run_summary.json (parameters,
 seed voxel, slice, snapshot times and masses, wall times).
@@ -57,7 +58,7 @@ from fisher_kpp_jax.solvers import params_from_manifest, read_manifest  # noqa: 
 
 DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
 # Background image: <session dir of the wm pbmap>/skull_stripped/t1c_skullstripped.nii.gz
-# unless --t1c is given (the SAILOR layout, so a patient change in the
+# unless --background-image is given (the SAILOR layout, so a patient change in the
 # manifest's tissue maps carries over).
 T1C_RELATIVE = Path("skull_stripped") / "t1c_skullstripped.nii.gz"
 
@@ -71,7 +72,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--manifest", default=DEFAULT_MANIFEST, help="run manifest JSON")
     parser.add_argument(
-        "--t1c",
+        "--background-image",
         default=None,
         help=f"background image NIfTI (default: <wm pbmap session dir>/{T1C_RELATIVE})",
     )
@@ -90,9 +91,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--n-snapshots", type=int, default=25, help="evenly spaced snapshots of the treated run"
-    )
-    parser.add_argument(
-        "--n-treatment-panels", type=int, default=5, help="panels across the radiotherapy block"
     )
     parser.add_argument(
         "--threshold", type=float, default=0.01, help="cell density below which the overlay is transparent"
@@ -133,52 +131,46 @@ def select_panels(
     initial: np.ndarray,
     frames: np.ndarray,
     times: np.ndarray,
-    pre_resection: tuple[float, np.ndarray] | None,
-    resection_time: float | None,
-    rt_times: np.ndarray | None,
-    n_treatment_panels: int,
+    pre_resection: tuple[float, np.ndarray],
+    resection_time: float,
+    rt_times: np.ndarray,
 ) -> list[tuple[str, np.ndarray]]:
     """
-    Pick the montage panels: the seed, the state before and after the
-    resection (if any), the recorded frames nearest to n_treatment_panels
-    evenly spaced times across the radiotherapy block (or across the whole
-    horizon without radiotherapy), and the last frame.
+    The nine montage panels, three per row. Apart from the first two, each
+    is the recorded frame nearest to its target time (frames repeat when
+    the snapshots are coarser than the targets):
+
+      row 1: the seed (t = 0), the state just before the resection, one day
+             after the resection;
+      row 2: three evenly spaced times inside the radiotherapy block (first
+             to last fraction, endpoints excluded);
+      row 3: three evenly spaced times from the last fraction to the end of
+             the run, the end included.
 
     Args:
         initial: Initial state (t = 0).
         frames: Recorded frames of the treated run, (n_frames, ...).
         times: Simulation time of each frame.
-        pre_resection: (time, state) just before the resection, or None.
-        resection_time: Resection time, or None.
-        rt_times: Radiotherapy fraction times, or None.
-        n_treatment_panels: Number of panels between the resection and the
-            end.
+        pre_resection: (time, state) just before the resection.
+        resection_time: Resection time.
+        rt_times: Radiotherapy fraction times.
 
     Returns:
         (title, volume) pairs.
     """
 
-    def nearest(t: float) -> int:
-        return int(np.argmin(np.abs(times - t)))
+    def nearest(label: str, t: float) -> tuple[str, np.ndarray]:
+        k = int(np.argmin(np.abs(times - t)))
+        return f"t = {times[k]:.0f} d{label}", frames[k]
 
-    panels = [("t = 0 d (seed)", initial)]
-    if pre_resection is not None:
-        panels.append((f"t = {pre_resection[0]:.0f} d, before resection", pre_resection[1]))
-    if resection_time is not None:
-        k = nearest(resection_time)
-        panels.append((f"t = {times[k]:.1f} d, after resection", frames[k]))
-    if rt_times is not None and rt_times.size:
-        span, label = (float(rt_times.min()), float(rt_times.max())), " (RT/TMZ)"
-    else:
-        span, label = (float(times[0]), float(times[-1])), ""
-    used = {nearest(resection_time)} if resection_time is not None else set()
-    for t in np.linspace(span[0], span[1], n_treatment_panels + 2)[1:-1]:
-        k = nearest(t)
-        if k in used or k == frames.shape[0] - 1:
-            continue
-        used.add(k)
-        panels.append((f"t = {times[k]:.1f} d{label}", frames[k]))
-    panels.append((f"t = {times[-1]:.0f} d (end)", frames[-1]))
+    rt_start, rt_end = float(np.min(rt_times)), float(np.max(rt_times))
+    panels = [
+        ("t = 0 d (seed)", initial),
+        (f"t = {pre_resection[0]:.0f} d (before resection)", pre_resection[1]),
+        nearest(" (after resection)", resection_time + 1.0),
+    ]
+    panels += [nearest(" (RT/TMZ)", t) for t in np.linspace(rt_start, rt_end, 5)[1:-1]]
+    panels += [nearest("", t) for t in np.linspace(rt_end, float(times[-1]), 4)[1:]]
     return panels
 
 
@@ -198,7 +190,7 @@ def render(
     outfile_stem: Path,
     header: str,
     panels: list[tuple[str, np.ndarray]],
-    t1c: np.ndarray,
+    background_volume: np.ndarray,
     cavity: np.ndarray | None,
     seed_voxel: tuple[int, int, int],
     z: int,
@@ -220,10 +212,10 @@ def render(
         n_row + 1, n_col + 1, height_ratios=[1.0] * n_row + [0.75],
         width_ratios=[1.0] * n_col + [0.05],
     )
-    background = np.rot90(t1c[:, :, z])
+    background = np.rot90(background_volume[:, :, z])
     cavity_slice = np.rot90(cavity[:, :, z]) if cavity is not None else None
     # np.rot90 maps array (i, j) to image row (ny - 1 - j), column i.
-    seed_col, seed_row = seed_voxel[0], t1c.shape[1] - 1 - seed_voxel[1]
+    seed_col, seed_row = seed_voxel[0], background_volume.shape[1] - 1 - seed_voxel[1]
     image = None
     for index, (title, volume) in enumerate(panels):
         ax = fig.add_subplot(grid[index // n_col, index % n_col])
@@ -312,12 +304,21 @@ def main(argv: list[str] | None = None) -> int:
         {"voxel_size_mm": voxel_size, "verbose": False, **manifest, **seed_fractions}
     )
     wm = params["white_matter_pbmap"]
-    t1c_path = Path(args.t1c) if args.t1c else Path(wm_path).parent.parent / T1C_RELATIVE
-    if not t1c_path.is_file():
-        raise FileNotFoundError(f"background image not found: {t1c_path} (pass --t1c)")
-    t1c = np.asarray(nib.load(str(t1c_path)).get_fdata(), dtype=np.float64)
-    if t1c.shape != wm.shape:
-        raise ValueError(f"--t1c shape {t1c.shape} differs from the tissue maps {wm.shape}.")
+    background_path = (
+        Path(args.background_image)
+        if args.background_image
+        else Path(wm_path).parent.parent / T1C_RELATIVE
+    )
+    if not background_path.is_file():
+        raise FileNotFoundError(
+            f"background image not found: {background_path} (pass --background-image)"
+        )
+    background_volume = np.asarray(nib.load(str(background_path)).get_fdata(), dtype=np.float64)
+    if background_volume.shape != wm.shape:
+        raise ValueError(
+            f"--background-image shape {background_volume.shape} differs from the tissue "
+            f"maps {wm.shape}."
+        )
     z = args.slice_z if args.slice_z is not None else int(round(center_of_mass(params["rt_dose"])[2]))
 
     resection_time = float(params["resection_time"])
@@ -360,7 +361,6 @@ def main(argv: list[str] | None = None) -> int:
         (n_pre * dt, pre.final_state["cell_density"]),
         resection_time,
         np.asarray(params["rt_times"], dtype=np.float64),
-        args.n_treatment_panels,
     )
 
     header = (
@@ -374,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
         run_dir / "overview",
         header,
         panels,
-        t1c,
+        background_volume,
         params["resection_cavity"],
         seed_voxel,
         z,
@@ -389,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
         "cli_args": jsonable(vars(args)),
         "manifest": str(Path(args.manifest).resolve()),
         "tissue": {"wm": wm_path, "gm": gm_path},
-        "t1c": str(t1c_path),
+        "background_image": str(background_path),
         "params": scalar_params(params),
         "seed_voxel": list(seed_voxel),
         "slice_z": z,

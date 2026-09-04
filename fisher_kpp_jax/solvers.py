@@ -1245,7 +1245,7 @@ def read_manifest(path: str | Path) -> dict[str, Any]:
         )
     for key in _MANIFEST_VOLUME_KEYS:
         if key in manifest:
-            manifest[key] = _manifest_volume_path(manifest[key], manifest_path, key)
+            manifest[key] = _resolve_manifest_path(manifest[key], manifest_path, key)
     if "resection_cavity" in manifest:
         cavity = manifest["resection_cavity"]
         if not isinstance(cavity, Mapping) or set(cavity) != {"segmentation", "label"}:
@@ -1254,7 +1254,7 @@ def read_manifest(path: str | Path) -> dict[str, Any]:
                 '{"segmentation": <NIfTI path>, "label": <int>}.'
             )
         manifest["resection_cavity"] = {
-            "segmentation": _manifest_volume_path(
+            "segmentation": _resolve_manifest_path(
                 cavity["segmentation"], manifest_path, "resection_cavity segmentation"
             ),
             "label": int(cavity["label"]),
@@ -1262,7 +1262,7 @@ def read_manifest(path: str | Path) -> dict[str, Any]:
     return manifest
 
 
-def _manifest_volume_path(value: Any, manifest_path: Path, what: str) -> str:
+def _resolve_manifest_path(value: Any, manifest_path: Path, what: str) -> str:
     """The absolute path of a NIfTI named in the manifest (a relative path
     counts from the manifest's directory)."""
     if not isinstance(value, str):

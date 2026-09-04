@@ -131,7 +131,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--jobs-per-gpu", type=int, default=1)
     parser.add_argument(
-        "--t1c",
+        "--background-image",
         default=None,
         help=f"overview background NIfTI (default: <wm session dir>/{T1C_RELATIVE} if present)",
     )
@@ -258,10 +258,10 @@ def main(argv: list[str] | None = None) -> int:
     cavity_voxels = np.argwhere(cavity & ((wm + gm) > 0))
     if not len(cavity_voxels):
         raise ValueError("no cavity voxel with tissue to seed in.")
-    t1c = args.t1c
-    if t1c is None:
+    background_image = args.background_image
+    if background_image is None:
         candidate = Path(base["white_matter_pbmap"]).parent.parent / T1C_RELATIVE
-        t1c = str(candidate) if candidate.is_file() else None
+        background_image = str(candidate) if candidate.is_file() else None
 
     rng = np.random.default_rng(args.seed)
     configs = sample_configs(rng, args.n_configs, ranges, cavity_voxels, wm.shape)
@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         "ranges": {name: list(bounds) for name, bounds in ranges.items()},
         "rt_beta": f"{BETA_OVER_ALPHA} * rt_alpha",
         "n_cavity_voxels": int(len(cavity_voxels)),
-        "t1c": t1c,
+        "background_image": background_image,
         "configs": configs,
     }
     (sweep_dir / "sweep.json").write_text(json.dumps(sweep_info, indent=2) + "\n")
@@ -326,8 +326,8 @@ def main(argv: list[str] | None = None) -> int:
             "--run-name",
             name,
         ]
-        if t1c is not None:
-            command += ["--t1c", t1c]
+        if background_image is not None:
+            command += ["--background-image", background_image]
         if args.no_plot:
             command.append("--no-plot")
         gpu = slots.get()

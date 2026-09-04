@@ -15,12 +15,13 @@ solver and writes, into its own run directory
                                time / stopping criterion / stopping quantity,
                                wall time
     manifest.json              verbatim copy of the manifest (provenance)
-    overview.png (+ .pdf)      unless --no-plot: the montage of
+    overview.png (+ .pdf)      unless --no-plot: the 3x3 montage of
                                scripts/run_stupp_example.py (seed, before and
-                               after resection, snapshots across the
-                               radiotherapy block, end) on the axial slice
+                               after resection; three frames inside the
+                               radiotherapy block; three from its end to the
+                               end of the run) on the axial slice
                                through the dose map's center of mass, over
-                               --t1c or the tissue maps, plus total mass vs time
+                               --background-image or the tissue maps, plus total mass vs time
                                with the treatment events marked
 
 The run directory is created with exist_ok=False and nothing is written
@@ -74,7 +75,6 @@ from run_stupp_example import render, select_panels, snapshot_steps  # noqa: E40
 
 DEFAULT_MANIFEST = str(_ROOT / "scripts" / "stupp_manifest_example.json")
 DEFAULT_N_SNAPSHOTS = 25
-DEFAULT_N_TREATMENT_PANELS = 5
 DEFAULT_THRESHOLD = 0.01  # overlay transparency threshold (cell density)
 
 # CLI option -> manifest entry (solver parameter name) it overrides.
@@ -82,7 +82,7 @@ CLI_OVERRIDES: dict[str, str] = {
     "wm": "white_matter_pbmap",
     "gm": "gray_matter_pbmap",
     "rho": "rho",
-    "diffusivity": "white_matter_diffusivity",
+    "white_matter_diffusivity": "white_matter_diffusivity",
     "resolution_factor": "resolution_factor",
     "time_after_resection": "time_after_resection",
     "n_steps": "n_steps",
@@ -117,7 +117,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     knobs.add_argument("--rho", type=float, default=None, help="proliferation rate, 1/day")
     knobs.add_argument(
-        "--diffusivity", type=float, default=None, help="white matter diffusivity, mm^2/day"
+        "--white-matter-diffusivity", type=float, default=None, help="mm^2/day"
     )
     knobs.add_argument("--resolution-factor", type=float, default=None)
     knobs.add_argument(
@@ -149,19 +149,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="evenly spaced time-series snapshots recorded for overview.png",
     )
     parser.add_argument(
-        "--n-treatment-panels",
-        type=int,
-        default=DEFAULT_N_TREATMENT_PANELS,
-        help="overview panels across the radiotherapy block",
-    )
-    parser.add_argument(
         "--threshold",
         type=float,
         default=DEFAULT_THRESHOLD,
         help="cell density below which the overlay is transparent",
     )
     parser.add_argument(
-        "--t1c",
+        "--background-image",
         default=None,
         help="background image NIfTI for overview.png (default: wm + gm pbmaps)",
     )
@@ -292,8 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         # The state just before the resection: a second, shorter, untreated
         # solve with FKPPSolver, whose dynamics StuppFKPPSolver reproduces
-        # up to that step.
-        pre_resection = None
+        # up to that step (the seed itself if the resection is at t = 0).
+        pre_resection = (0.0, result.initial_state["cell_density"])
         pre_points = [(0.0, float(result.initial_state["cell_density"].sum()))]
         n_pre = int(round(float(params["resection_time"]) / dt))
         if n_pre >= 1:
@@ -315,11 +309,11 @@ def main(argv: list[str] | None = None) -> int:
             pre_state = pre.final_state["cell_density"]
             pre_resection = (n_pre * dt, pre_state)
             pre_points.append((n_pre * dt, float(pre_state.sum())))
-        if args.t1c is not None:
-            background = np.asarray(nib.load(args.t1c).get_fdata(), dtype=np.float64)
+        if args.background_image is not None:
+            background = np.asarray(nib.load(args.background_image).get_fdata(), dtype=np.float64)
             if background.shape != wm.shape:
                 raise ValueError(
-                    f"--t1c shape {background.shape} differs from the tissue maps {wm.shape}."
+                    f"--background-image shape {background.shape} differs from the tissue maps {wm.shape}."
                 )
         else:
             background = wm + gm
@@ -331,7 +325,6 @@ def main(argv: list[str] | None = None) -> int:
             pre_resection,
             float(params["resection_time"]),
             np.asarray(params["rt_times"], dtype=np.float64),
-            args.n_treatment_panels,
         )
         header = (
             f"{run_name}: {Path(args.manifest).name}, axial slice z={z}, "

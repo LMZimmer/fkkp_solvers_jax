@@ -24,10 +24,11 @@ The seed is placed at --seed-voxel, replacing the manifest's seed fractions
 mid-height of the grid). The figure shows, on the axial slice through the
 dose map's center of mass (or --slice-z), the gm pbmap as the background
 with the cell density overlaid (np.rot90 orientation, inferno
-overlay, densities below --threshold transparent): the seed, the state
-before and after resection, the snapshots nearest to --n-treatment-panels
-evenly spaced times across the radiotherapy block, and the end of the run;
-the cavity outline and the seed voxel are marked. A total-mass-vs-time panel
+overlay, densities below --threshold transparent), three by three: the
+seed, the state before and one day after the resection; three evenly
+spaced times inside the radiotherapy block; three evenly spaced times from
+its end to the end of the run. Each is the recorded snapshot nearest to its
+time. The cavity outline and the seed voxel are marked. A total-mass-vs-time panel
 with the treatment events marked sits below. Written into
 <output-dir>/<run-name>/ (exist_ok=False, nothing outside it): overview.png,
 overview.pdf and run_summary.json (parameters, seed voxel, slice, synthetic
@@ -122,9 +123,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--n-snapshots", type=int, default=25, help="evenly spaced snapshots of the treated run"
     )
     parser.add_argument(
-        "--n-treatment-panels", type=int, default=5, help="panels across the radiotherapy block"
-    )
-    parser.add_argument(
         "--threshold", type=float, default=0.01, help="cell density below which the overlay is transparent"
     )
     return parser.parse_args(argv)
@@ -192,52 +190,46 @@ def select_panels(
     initial: np.ndarray,
     frames: np.ndarray,
     times: np.ndarray,
-    pre_resection: tuple[float, np.ndarray] | None,
-    resection_time: float | None,
-    rt_times: np.ndarray | None,
-    n_treatment_panels: int,
+    pre_resection: tuple[float, np.ndarray],
+    resection_time: float,
+    rt_times: np.ndarray,
 ) -> list[tuple[str, np.ndarray]]:
     """
-    Pick the montage panels: the seed, the state before and after the
-    resection (if any), the recorded frames nearest to n_treatment_panels
-    evenly spaced times across the radiotherapy block (or across the whole
-    horizon without radiotherapy), and the last frame.
+    The nine montage panels, three per row. Apart from the first two, each
+    is the recorded frame nearest to its target time (frames repeat when
+    the snapshots are coarser than the targets):
+
+      row 1: the seed (t = 0), the state just before the resection, one day
+             after the resection;
+      row 2: three evenly spaced times inside the radiotherapy block (first
+             to last fraction, endpoints excluded);
+      row 3: three evenly spaced times from the last fraction to the end of
+             the run, the end included.
 
     Args:
         initial: Initial state (t = 0).
         frames: Recorded frames of the treated run, (n_frames, ...).
         times: Simulation time of each frame.
-        pre_resection: (time, state) just before the resection, or None.
-        resection_time: Resection time, or None.
-        rt_times: Radiotherapy fraction times, or None.
-        n_treatment_panels: Number of panels between the resection and the
-            end.
+        pre_resection: (time, state) just before the resection.
+        resection_time: Resection time.
+        rt_times: Radiotherapy fraction times.
 
     Returns:
         (title, volume) pairs.
     """
 
-    def nearest(t: float) -> int:
-        return int(np.argmin(np.abs(times - t)))
+    def nearest(label: str, t: float) -> tuple[str, np.ndarray]:
+        k = int(np.argmin(np.abs(times - t)))
+        return f"t = {times[k]:.0f} d{label}", frames[k]
 
-    panels = [("t = 0 d (seed)", initial)]
-    if pre_resection is not None:
-        panels.append((f"t = {pre_resection[0]:.0f} d, before resection", pre_resection[1]))
-    if resection_time is not None:
-        k = nearest(resection_time)
-        panels.append((f"t = {times[k]:.1f} d, after resection", frames[k]))
-    if rt_times is not None and rt_times.size:
-        span, label = (float(rt_times.min()), float(rt_times.max())), " (RT/TMZ)"
-    else:
-        span, label = (float(times[0]), float(times[-1])), ""
-    used = {nearest(resection_time)} if resection_time is not None else set()
-    for t in np.linspace(span[0], span[1], n_treatment_panels + 2)[1:-1]:
-        k = nearest(t)
-        if k in used or k == frames.shape[0] - 1:
-            continue
-        used.add(k)
-        panels.append((f"t = {times[k]:.1f} d{label}", frames[k]))
-    panels.append((f"t = {times[-1]:.0f} d (end)", frames[-1]))
+    rt_start, rt_end = float(np.min(rt_times)), float(np.max(rt_times))
+    panels = [
+        ("t = 0 d (seed)", initial),
+        (f"t = {pre_resection[0]:.0f} d (before resection)", pre_resection[1]),
+        nearest(" (after resection)", resection_time + 1.0),
+    ]
+    panels += [nearest(" (RT/TMZ)", t) for t in np.linspace(rt_start, rt_end, 5)[1:-1]]
+    panels += [nearest("", t) for t in np.linspace(rt_end, float(times[-1]), 4)[1:]]
     return panels
 
 
@@ -445,7 +437,6 @@ def main(argv: list[str] | None = None) -> int:
         (n_pre * dt, pre.final_state["cell_density"]),
         resection_time,
         np.asarray(params["rt_times"], dtype=np.float64),
-        args.n_treatment_panels,
     )
 
     header = (
