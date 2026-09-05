@@ -25,7 +25,7 @@
   "chemo_doses": [75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 150.0, 150.0, 150.0, 150.0, 150.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0, 200.0],
   "chemo_kill_rate": 0.0062667,
   "chemo_decay_rate": 9.24,
-  "_radiotherapy": "rt_dose NIfTI in Gy, TOTAL over all fractions (per-fraction dose = rt_dose / len(rt_times)); rt_alpha in 1/Gy, rt_alpha_beta_ratio in Gy (the linear-quadratic alpha/beta ratio; the solver derives rt_beta = rt_alpha / rt_alpha_beta_ratio in 1/Gy^2, it is not a config entry).",
+  "_radiotherapy": "rt_dose NIfTI in Gy, TOTAL over all fractions (per-fraction dose = rt_dose / len(rt_times)); rt_alpha in 1/Gy, rt_alpha_beta_ratio in Gy (the linear-quadratic alpha/beta ratio; the solver derives rt_beta = rt_alpha / rt_alpha_beta_ratio in 1/Gy^2, it is not a config entry; 10 Gy is the class default, the one treatment parameter with a default).",
   "rt_times": [114.0, 115.0, 116.0, 117.0, 118.0, 121.0, 122.0, 123.0, 124.0, 125.0, 128.0, 129.0, 130.0, 131.0, 132.0, 135.0, 136.0, 137.0, 138.0, 139.0, 142.0, 143.0, 144.0, 145.0, 146.0, 149.0, 150.0, 151.0, 152.0, 153.0],
   "rt_dose": "/mnt/Drive4/lucas/SAILOR/processed/sub-15/ses-03/longitudinal/dose_warped_longitudinal.nii.gz",
   "rt_alpha": 0.06,

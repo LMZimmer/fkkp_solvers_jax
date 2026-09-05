@@ -29,14 +29,25 @@ Seed reinterpretation. The three gaussian_seed_{x,y,z}_fraction entries
 must be linear factors within [0, 1], but their sampled value u is NOT the
 fraction of the image axis the solver takes: per axis it is a coordinate
 in the bounding box of the seedable voxels, the voxels carrying the base
-config's resection_cavity label with wm + gm > 0, fraction =
+config's resection_cavity label with wm + gm >= min_tissue_fraction (the
+solver's flux threshold as resolved from the base config, so a seed never
+lands in a voxel whose faces are flux-masked), fraction =
 lo + u (hi - lo) with lo/hi the box bounds in the solver's (v + 0.5) / n
 fraction convention. The point is then projected onto the nearest
 seedable voxel (Euclidean distance in voxel units) and that voxel's
 fractions go into the config, so the Sobol' indices of the three seed
 factors are those of the seed position within the cavity box. design.csv
-records u, the projected fractions and the voxel; spec.json the box and
-the seedable voxel count.
+records u, the projected fractions and the voxel; spec.json the box, the
+seedable voxel count and the tissue threshold.
+
+The design step also reports the chemotherapy budget of the search space:
+the model's total log kill over the schedule is
+L = chemo_kill_rate * D_tot / chemo_decay_rate with D_tot the sum of the
+base config's chemo_doses (after the search space's overrides), so the
+factor ranges imply [L_min, L_max] = [kill_min D_tot / decay_max,
+kill_max D_tot / decay_min] (a fixed value stands in for a range where one
+of the two is not a factor). spec.json holds chemo_total_dose and
+chemo_log_kill_range; nothing is enforced.
 
 Design (SALib.sample.sobol: Saltelli scheme on a scrambled Sobol'
 sequence). k factors, N = 2 ** log2_n base points, N (k + 2) runs
@@ -82,7 +93,10 @@ final density, dV the voxel volume in mm^3 (NIfTI zooms), x_v the voxel
 centres in mm (index times zooms), x_seed the projected seed voxel in mm,
 Omega_tau = {v: c_v >= tau} (tau_core = 0.6, tau_edema = 0.3) and
 M = dV sum_v c_v:
-  mass, log10_mass             M and log10 M (NaN when M = 0)
+  mass, log10_mass             M and log10 max(M, 1e-3 dV): clamped at the
+                               mass floor of the mass-weighted QoIs, so an
+                               extinct run stays in the analysis censored
+                               at the floor instead of dropping its block
   V_core, V_edema              dV |Omega_tau| in mm^3
   log10_V_core, log10_V_edema  log10(V + dV)
   r95_core, r95_edema          95th percentile of |x_v - x_seed| over
@@ -96,8 +110,10 @@ M = dV sum_v c_v:
   wm_fraction                  sum_v c_v p_v / sum_v c_v with p the base
                                config's white-matter probability map
   n_core, n_edema              |Omega_tau| (voxel counts)
+  voxel_volume                 dV (mm^3)
 The four mass-weighted QoIs (centroid_drift, R_g, anisotropy, wm_fraction)
-are NaN when M < 1e-3 dV (no mass left to locate). final_time, n_steps and
+are NaN when M < 1e-3 dV (no mass left to locate); qoi_summary.json counts
+the runs at or below that floor (n_mass_floored). final_time, n_steps and
 wall_time_s are carried over from result.json.
 
 Sobol' analysis (SALib.analyze.sobol). Analysed columns: log10_mass,
@@ -124,15 +140,17 @@ Run from the project root, e.g.:
   python scripts/sensitivity_analysis.py all --output-dir /mnt/Drive4/lucas/SAILOR/sa --name sa_sub15 --gpus 1,2,3,5
   python scripts/sensitivity_analysis.py all --output-dir runs/ --name check --log2-n 2 --gpus ""   (CPU only)
 The run step is resumable: runs whose result.json reports success are
-skipped, partial run directories are deleted and redone; nothing is ever
-written outside <output-dir>/<name>/.
+skipped, partial run directories are deleted and redone; a run whose
+result.json reports a failure counts as partial and is redone on every
+run pass. Nothing is ever written outside <output-dir>/<name>/.
 
-Budget: N = 1024 and k = 13 give 15 360 runs; at about 12 s per run on
-one GPU (1 mm SAILOR grid, day-360 horizon) that is about 12.8 h on 4 GPUs
-and about 85 GB of run directories (5.6 MB each). One design point of the
-example config measured 7.4 s of process wall time (5.6 s solve, 3975
-steps) on a Quadro RTX 8000 and 2.3 MB on disk, so the figures above are
-conservative.
+Budget: one design point of the example config measured about 7.4 s of
+process wall time on one Quadro RTX 8000 (1 mm SAILOR grid, day-360
+horizon, 3 975 steps) and 2.3 MB of run directory, so N = 1024 and k = 13
+(15 360 runs) is about 7.9 h on 4 GPUs and about 35 GB. The per-run time
+scales with the crop box and the step count, so a sweep over large-D /
+large-rho points (whose stability estimate raises the step count) runs
+longer.
 """
 
 from __future__ import annotations
@@ -216,6 +234,7 @@ QOI_NAMES = [
     "wm_fraction",
     "n_core",
     "n_edema",
+    "voxel_volume",
 ]
 MASS_WEIGHTED_QOIS: tuple[str, ...] = ("centroid_drift", "R_g", "anisotropy", "wm_fraction")
 QOI_COLUMNS = ["run_name", "index", "row", "matrix", "success", *QOI_NAMES, "final_time", "n_steps", "wall_time_s"]
@@ -422,26 +441,33 @@ class SeedGeometry:
         return int(len(self.voxels))
 
 
-def seed_geometry(cavity: NDArray, wm: NDArray, gm: NDArray) -> SeedGeometry:
+def seed_geometry(
+    cavity: NDArray, wm: NDArray, gm: NDArray, min_tissue_fraction: float
+) -> SeedGeometry:
     """
-    The seedable voxels: cavity voxels carrying tissue (wm + gm > 0), the
-    voxels the solver accepts a seed in.
+    The seedable voxels: cavity voxels carrying tissue
+    (wm + gm >= min_tissue_fraction), so that a seed never lands in a
+    voxel whose faces the solver masks from the flux.
 
     Args:
         cavity: Boolean resection-cavity mask (the solver's loaded
             ``params["resection_cavity"]``).
         wm: White-matter probability map, same shape.
         gm: Gray-matter probability map, same shape.
+        min_tissue_fraction: The solver's flux threshold on wm + gm, as
+            resolved from the base config (``params["min_tissue_fraction"]``).
 
     Returns:
         The seedable voxels and their bounding box.
     """
-    seedable = np.asarray(cavity, dtype=bool) & (
-        (np.asarray(wm, dtype=np.float64) + np.asarray(gm, dtype=np.float64)) > 0
-    )
+    tissue = np.asarray(wm, dtype=np.float64) + np.asarray(gm, dtype=np.float64)
+    seedable = np.asarray(cavity, dtype=bool) & (tissue >= float(min_tissue_fraction))
     voxels = np.argwhere(seedable).astype(np.int64)
     if not len(voxels):
-        raise ValueError("no seedable voxel: no cavity voxel carries tissue (wm + gm > 0).")
+        raise ValueError(
+            "no seedable voxel: no cavity voxel carries tissue "
+            f"(wm + gm >= min_tissue_fraction = {float(min_tissue_fraction):g})."
+        )
     n = np.asarray(seedable.shape, dtype=np.float64)
     return SeedGeometry(
         shape=tuple(int(s) for s in seedable.shape),
@@ -685,6 +711,39 @@ def _jsonable(record: Any) -> Any:
 # --- design ---
 
 
+def chemo_log_kill_range(
+    base: Mapping[str, Any], space: SearchSpace
+) -> tuple[float, tuple[float, float]]:
+    """
+    The chemotherapy budget of a search space: the total dose of the
+    schedule and the range of the total log kill
+    L = chemo_kill_rate * D_tot / chemo_decay_rate over the factor ranges.
+
+    Args:
+        base: The base config.
+        space: The search space (overrides replace the base values; a
+            factor contributes its range, a fixed value stands in for a
+            range otherwise).
+
+    Returns:
+        (D_tot, (L_min, L_max)) with D_tot the sum of chemo_doses and
+        L_min = kill_min D_tot / decay_max, L_max = kill_max D_tot / decay_min.
+    """
+    doses = space.overrides.get("chemo_doses", base["chemo_doses"])
+    total_dose = float(np.sum(np.asarray(doses, dtype=np.float64)))
+
+    def bounds(key: str) -> tuple[float, float]:
+        factor = space.factors.get(key)
+        if factor is not None:
+            return factor.low, factor.high
+        value = float(space.overrides.get(key, base[key]))
+        return value, value
+
+    kill_lo, kill_hi = bounds("chemo_kill_rate")
+    decay_lo, decay_hi = bounds("chemo_decay_rate")
+    return total_dose, (kill_lo * total_dose / decay_hi, kill_hi * total_dose / decay_lo)
+
+
 def make_design(
     search_space_path: str | Path,
     config_path: str | Path,
@@ -725,13 +784,16 @@ def make_design(
     # The instance holds the loaded full-resolution volumes (and validates
     # the base config); no solve is run.
     solver = StuppFKPPSolver(base)
+    min_tissue_fraction = float(solver.params["min_tissue_fraction"])
     geometry = seed_geometry(
         solver.params["resection_cavity"],
         solver.params["white_matter_pbmap"],
         solver.params["gray_matter_pbmap"],
+        min_tissue_fraction,
     )
     samples = saltelli_design(space.names, log2_n, seed, second_order)
     table = design_table(samples, space, geometry, second_order)
+    total_dose, log_kill_range = chemo_log_kill_range(base, space)
     spec = {
         "name": name,
         "search_space_path": str(search_space_path),
@@ -753,6 +815,9 @@ def make_design(
         "seed_bbox_lo": geometry.bbox_lo.tolist(),
         "seed_bbox_hi": geometry.bbox_hi.tolist(),
         "n_seedable_voxels": geometry.n_voxels,
+        "seed_min_tissue_fraction": min_tissue_fraction,
+        "chemo_total_dose": total_dose,
+        "chemo_log_kill_range": list(log_kill_range),
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "argv": list(sys.argv),
     }
@@ -965,8 +1030,9 @@ def compute_qois(
 
     Returns:
         The QoIs by name (``QOI_NAMES``); the mass-weighted ones are NaN
-        below ``MASS_FLOOR_VOXELS`` voxel volumes of mass. Moments run
-        over the nonzero voxels only, in one pass.
+        below ``MASS_FLOOR_VOXELS`` voxel volumes of mass, and log10_mass
+        is clamped at that floor (never NaN). Moments run over the nonzero
+        voxels only, in one pass.
     """
     density = np.asarray(density, dtype=np.float64)
     wm = np.asarray(wm, dtype=np.float64)
@@ -980,7 +1046,12 @@ def compute_qois(
     x_seed = np.asarray(seed_voxel, dtype=np.float64) * zooms
     total = float(c.sum())
     mass = voxel_volume * total
-    out: dict[str, float] = {"mass": mass, "log10_mass": float(np.log10(mass)) if mass > 0 else np.nan}
+    mass_floor = MASS_FLOOR_VOXELS * voxel_volume
+    out: dict[str, float] = {
+        "mass": mass,
+        "log10_mass": float(np.log10(max(mass, mass_floor))),
+        "voxel_volume": voxel_volume,
+    }
     for label, tau in (("core", tau_core), ("edema", tau_edema)):
         selected = c >= tau
         n_selected = int(selected.sum())
@@ -1109,7 +1180,7 @@ def qoi_table(
 
 def qoi_summary(records: Sequence[Mapping[str, Any]], tau_core: float, tau_edema: float) -> dict[str, Any]:
     """Counts over the qoi records: runs, successes, empty compartments per
-    threshold, NaN mass-weighted QoIs, NaN log10_mass."""
+    threshold, NaN mass-weighted QoIs, runs at or below the mass floor."""
     successes = [r for r in records if r.get("success")]
     return {
         "n_runs": len(records),
@@ -1121,7 +1192,8 @@ def qoi_summary(records: Sequence[Mapping[str, Any]], tau_core: float, tau_edema
         "n_empty_edema": sum(1 for r in successes if r["n_edema"] == 0),
         "n_nan_mass_weighted": sum(1 for r in successes if not np.isfinite(r["centroid_drift"])),
         "n_nan_anisotropy": sum(1 for r in successes if not np.isfinite(r["anisotropy"])),
-        "n_nan_log10_mass": sum(1 for r in successes if not np.isfinite(r["log10_mass"])),
+        "mass_floor_voxels": MASS_FLOOR_VOXELS,
+        "n_mass_floored": sum(1 for r in successes if r["mass"] <= MASS_FLOOR_VOXELS * r["voxel_volume"]),
     }
 
 
@@ -1559,7 +1631,12 @@ def design_command(args: argparse.Namespace) -> Path:
     print(
         f"seedable voxels: {spec['n_seedable_voxels']} in the box "
         f"{[round(v, 4) for v in spec['seed_bbox_lo']]} .. {[round(v, 4) for v in spec['seed_bbox_hi']]} "
-        f"(fractions of the grid {spec['grid_shape']})"
+        f"(fractions of the grid {spec['grid_shape']}; wm + gm >= {spec['seed_min_tissue_fraction']:g})"
+    )
+    low, high = spec["chemo_log_kill_range"]
+    print(
+        f"chemotherapy: total dose {spec['chemo_total_dose']:g} mg/m^2, total log kill "
+        f"kill * dose / decay in [{low:.3g}, {high:.3g}] over the factor ranges"
     )
     return sweep_dir
 

@@ -304,8 +304,11 @@ def test_design_bookkeeping(phantom_base):
                 assert differing == {factor}
             assert ab[factor] == float(record[factor])
     assert n_seed_changes > 0
-    # Projected seeds: seedable voxels, the config holds their fractions.
-    seedable = phantom_base["cavity"] & ((phantom_base["wm"] + phantom_base["gm"]) > 0)
+    # Projected seeds: seedable voxels (cavity with wm + gm >= the solver's
+    # min_tissue_fraction), the config holds their fractions.
+    threshold = spec["seed_min_tissue_fraction"]
+    assert threshold == StuppFKPPSolver(base).params["min_tissue_fraction"] == 0.1
+    seedable = phantom_base["cavity"] & ((phantom_base["wm"] + phantom_base["gm"]) >= threshold)
     n = np.asarray(seedable.shape, dtype=np.float64)
     assert spec["n_seedable_voxels"] == int(seedable.sum()) == 64
     for record in design:
@@ -316,7 +319,7 @@ def test_design_bookkeeping(phantom_base):
         for name in names:
             if name not in SEED_KEYS:
                 assert spec["factors"][name]["min"] <= float(record[name]) <= spec["factors"][name]["max"]
-    geometry = sa.seed_geometry(phantom_base["cavity"], phantom_base["wm"], phantom_base["gm"])
+    geometry = sa.seed_geometry(phantom_base["cavity"], phantom_base["wm"], phantom_base["gm"], threshold)
     np.testing.assert_allclose(geometry.bbox_lo, spec["seed_bbox_lo"])
     np.testing.assert_allclose(geometry.bbox_hi, spec["seed_bbox_hi"])
     for voxel in geometry.voxels[[0, 17, 63]]:
@@ -327,10 +330,46 @@ def test_design_bookkeeping(phantom_base):
     # A point outside the seedable set projects onto its nearest voxel.
     _, projected = sa.project_seeds([[-0.4, 0.5, 0.5]], geometry)
     assert seedable[tuple(projected[0])] and projected[0][0] == geometry.voxels[:, 0].min()
+    # The threshold decides what is seedable: a faint-tissue cavity voxel
+    # is out at 0.1 and in at 0.
+    faint_wm = phantom_base["wm"].copy()
+    faint_wm[tuple(geometry.voxels[0])] = 0.05
+    assert sa.seed_geometry(phantom_base["cavity"], faint_wm, np.zeros_like(faint_wm), 0.1).n_voxels == 63
+    assert sa.seed_geometry(phantom_base["cavity"], faint_wm, np.zeros_like(faint_wm), 0.0).n_voxels == 64
+    with pytest.raises(ValueError, match="no seedable voxel"):
+        sa.seed_geometry(phantom_base["cavity"], faint_wm, np.zeros_like(faint_wm), 2.0)
+    # The chemotherapy budget of the shipped ranges on the phantom schedule.
+    assert spec["chemo_total_dose"] == 225.0
+    np.testing.assert_allclose(spec["chemo_log_kill_range"], [1.1e-3 * 225 / 20, 5.6e-3 * 225 / 5])
     # Every config is a complete StuppFKPPSolver run.
     for path in sorted((sweep_dir / "configs").iterdir()):
         solver = StuppFKPPSolver(read_config(path))
         assert solver.config[SOLVER_KEY] == "StuppFKPPSolver"
+
+
+def test_chemo_log_kill_range():
+    """The shipped ranges with the example config's 8 900 mg/m^2 schedule
+    bound the total log kill kill * D_tot / decay to [0.5, 10] within 5 %;
+    an override or a fixed value stands in for a factor range."""
+    example = read_config(SCRIPT.parent / "stupp_config_example.json", solver=StuppFKPPSolver)
+    space = sa.load_search_space(SHIPPED_SEARCH_SPACE, CONFIG_KEYS)
+    total_dose, (low, high) = sa.chemo_log_kill_range(example, space)
+    assert total_dose == 8900.0
+    np.testing.assert_allclose([low, high], [0.5, 10.0], rtol=0.05)
+    kill, decay = space.factors["chemo_kill_rate"], space.factors["chemo_decay_rate"]
+    assert (low, high) == (kill.low * 8900 / decay.high, kill.high * 8900 / decay.low)
+    fixed = sa.load_search_space(
+        _seed_entries(
+            chemo_kill_rate=2e-3,
+            chemo_doses=[100.0, 100.0],
+            chemo_decay_rate={"min": 5.0, "max": 20.0, "scale": "log"},
+        ),
+        CONFIG_KEYS,
+    )
+    assert sa.chemo_log_kill_range(example, fixed) == (200.0, (2e-3 * 200 / 20, 2e-3 * 200 / 5))
+    base_only = sa.load_search_space(_seed_entries(), CONFIG_KEYS)
+    expected = example["chemo_kill_rate"] * 8900 / example["chemo_decay_rate"]
+    assert sa.chemo_log_kill_range(example, base_only) == (8900.0, (expected, expected))
 
 
 # --- (5) QoIs on synthetic fields ---
@@ -401,11 +440,37 @@ def test_qois_on_gaussians():
     assert qoi["V_edema"] > 0 and qoi["r95_edema"] > 0 and qoi["log10_V_core"] == 0.0
     # Zero field: nothing to locate.
     qoi = sa.compute_qois(np.zeros(shape), (1.0, 1.0, 1.0), (32, 32, 32), wm)
-    assert qoi["mass"] == 0 and np.isnan(qoi["log10_mass"])
+    assert qoi["mass"] == 0 and qoi["log10_mass"] == np.log10(sa.MASS_FLOOR_VOXELS)
+    assert qoi["voxel_volume"] == 1.0
     assert all(np.isnan(qoi[key]) for key in (*sa.MASS_WEIGHTED_QOIS, "log10_anisotropy"))
     assert qoi["V_core"] == qoi["V_edema"] == qoi["r95_core"] == qoi["r95_edema"] == 0
     with pytest.raises(ValueError, match="shape"):
         sa.compute_qois(field, (1.0, 1.0, 1.0), (32, 32, 32), wm[:32])
+
+
+def test_log10_mass_floor():
+    """log10_mass = log10 max(M, 1e-3 dV): a zero field and an extinct
+    field (M = 1e-30) sit at the floor, a field above it is unchanged; the
+    floor scales with the voxel volume."""
+    shape, zooms = (16, 16, 16), (1.0, 1.5, 2.0)
+    voxel_volume = 3.0
+    wm = np.ones(shape)
+    floor = np.log10(sa.MASS_FLOOR_VOXELS * voxel_volume)
+    zero = sa.compute_qois(np.zeros(shape), zooms, (8, 8, 8), wm)
+    assert zero["log10_mass"] == floor and zero["mass"] == 0
+    tiny = np.zeros(shape)
+    tiny[8, 8, 8] = 1e-30 / voxel_volume
+    extinct = sa.compute_qois(tiny, zooms, (8, 8, 8), wm)
+    np.testing.assert_allclose(extinct["mass"], 1e-30)
+    assert extinct["log10_mass"] == floor and np.isnan(extinct["R_g"])
+    above = np.zeros(shape)
+    above[8, 8, 8] = 0.5
+    qoi = sa.compute_qois(above, zooms, (8, 8, 8), wm)
+    np.testing.assert_allclose(qoi["log10_mass"], np.log10(0.5 * voxel_volume))
+    assert np.isfinite(qoi["R_g"])
+    records = [{"success": True, **zero}, {"success": True, **extinct}, {"success": True, **qoi}]
+    summary = sa.qoi_summary(records, 0.6, 0.3)
+    assert summary["n_mass_floored"] == 2 and summary["n_nan_mass_weighted"] == 2
 
 
 # --- (6) end to end on the phantom ---
@@ -458,6 +523,7 @@ def test_end_to_end_on_phantom(phantom_base):
     assert all(float(r["r95_core"]) == 0 for r in qoi if r["n_core"] == "0")
     summary = json.loads((sweep_dir / "qoi_summary.json").read_text())
     assert summary["n_success"] == 32 and summary["n_nan_mass_weighted"] == 0
+    assert summary["n_mass_floored"] == 0 and spec["chemo_total_dose"] == 225.0
     results = sa.analyze_sweep(sweep_dir, n_bootstrap=20, seed=0)
     assert set(results) == set(sa.ANALYSED_QOIS)
     sobol = _read_csv(sweep_dir / "sobol.csv")
