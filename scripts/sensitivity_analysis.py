@@ -78,7 +78,9 @@ Output layout:
                          exit_code, wall_time_s, error, final_time, n_steps
     qoi.csv              one line per run: run_name, index, row, matrix,
                          success, the QoIs, final_time, n_steps, wall_time_s
-    qoi_summary.json     counts: runs, successes, empty compartments, NaNs
+    qoi_summary.json     run counts (successes, empty compartments, NaNs,
+                         extinct runs) and per analysed QoI the run/block
+                         accounting of the Sobol' analysis
     sobol.csv            one line per (qoi, factor): S1, S1_conf, ST, ST_conf,
                          S1_half, ST_half, n_blocks_used
     sobol_summary.json   N, k, factor order, SALib version and per QoI the
@@ -113,8 +115,22 @@ M = dV sum_v c_v:
   voxel_volume                 dV (mm^3)
 The four mass-weighted QoIs (centroid_drift, R_g, anisotropy, wm_fraction)
 are NaN when M < 1e-3 dV (no mass left to locate); qoi_summary.json counts
-the runs at or below that floor (n_mass_floored). final_time, n_steps and
+the runs at or below that floor (n_runs_extinct). final_time, n_steps and
 wall_time_s are carried over from result.json.
+
+Run/block accounting. qoi_summary.json (per_qoi) and sobol_summary.json
+(qois) carry, per analysed QoI, the same fields computed by one function
+(``response_accounting``): n_runs_total, n_runs_failed (no successful
+result), n_runs_nan (successful but non-finite), n_blocks_total,
+n_blocks_dropped, n_blocks_used and dropped_blocks. Counts prefixed
+n_runs_ are runs, counts prefixed n_blocks_ are Saltelli blocks of
+block_size runs; a block is dropped from a QoI's analysis when any of its
+runs is failed or non-finite for that QoI, so
+ceil(n_runs_nan / block_size) <= n_blocks_dropped <= n_runs_nan +
+n_runs_failed. Extinct runs have a finite, floored log10_mass and
+non-finite mass-weighted QoIs, so they drop blocks for centroid_drift,
+R_g, log10_anisotropy and wm_fraction only. Both the qoi and the analyze
+command print the same accounting line per QoI.
 
 Sobol' analysis (SALib.analyze.sobol). Analysed columns: log10_mass,
 V_core, V_edema, log10_V_core, log10_V_edema, r95_core, r95_edema,
@@ -1178,22 +1194,108 @@ def qoi_table(
     return records
 
 
-def qoi_summary(records: Sequence[Mapping[str, Any]], tau_core: float, tau_edema: float) -> dict[str, Any]:
-    """Counts over the qoi records: runs, successes, empty compartments per
-    threshold, NaN mass-weighted QoIs, runs at or below the mass floor."""
-    successes = [r for r in records if r.get("success")]
+ACCOUNTING_NOTE = (
+    "Counts prefixed n_runs_ are runs (the unprefixed global counts are runs as "
+    "well); counts prefixed n_blocks_ are Saltelli blocks of block_size runs. A "
+    "block is dropped from a QoI's Sobol' analysis when any of its runs is failed "
+    "or non-finite for that QoI, so ceil(n_runs_nan / block_size) <= "
+    "n_blocks_dropped <= n_runs_nan + n_runs_failed. Extinct runs (mass at or "
+    "below mass_floor) have a finite, floored log10_mass and non-finite "
+    "mass-weighted QoIs, so they drop blocks for centroid_drift, R_g, "
+    "log10_anisotropy and wm_fraction only."
+)
+
+
+def _is_success(record: Mapping[str, Any]) -> bool:
+    """The success flag of a qoi record, as a bool or as the CSV string."""
+    value = record.get("success")
+    return value is True or value == "True"
+
+
+def qoi_values(records: Sequence[Mapping[str, Any]], qoi: str) -> dict[int, float]:
+    """The values of one QoI column of the successful runs, by design
+    index (NaN where the value is missing or non-finite)."""
+    return {int(r["index"]): as_float(r.get(qoi)) for r in records if _is_success(r)}
+
+
+def _dropped_blocks(values: Mapping[int, float], n_blocks: int, size: int) -> list[int]:
+    """The blocks with any missing or non-finite value: THE rule of the
+    response assembly and of the accounting."""
+    return [
+        block
+        for block in range(n_blocks)
+        if not all(np.isfinite(values.get(index, np.nan)) for index in range(block * size, (block + 1) * size))
+    ]
+
+
+def response_accounting(
+    records: Sequence[Mapping[str, Any]], qoi: str, n_blocks: int, size: int
+) -> dict[str, Any]:
+    """
+    The run/block accounting of one analysed QoI column.
+
+    Args:
+        records: The qoi.csv records (parsed or as CSV strings).
+        qoi: The column.
+        n_blocks: N, the number of blocks of the design.
+        size: Rows per block (``block_size``).
+
+    Returns:
+        n_runs_total, n_runs_failed (no successful result), n_runs_nan
+        (successful but non-finite), n_blocks_total, n_blocks_dropped,
+        n_blocks_used and dropped_blocks, by the rule ``assemble_response``
+        applies: a block is dropped iff any of its runs is missing, failed
+        or non-finite for the QoI.
+    """
+    n_runs_total = n_blocks * size
+    values = {index: value for index, value in qoi_values(records, qoi).items() if index < n_runs_total}
+    dropped = _dropped_blocks(values, n_blocks, size)
     return {
+        "n_runs_total": n_runs_total,
+        "n_runs_failed": n_runs_total - len(values),
+        "n_runs_nan": sum(1 for value in values.values() if not np.isfinite(value)),
+        "n_blocks_total": n_blocks,
+        "n_blocks_dropped": len(dropped),
+        "n_blocks_used": n_blocks - len(dropped),
+        "dropped_blocks": dropped,
+    }
+
+
+def accounting_line(qoi: str, accounting: Mapping[str, Any]) -> str:
+    """The console line of one QoI's accounting."""
+    return (
+        f"  {qoi}: {accounting['n_runs_nan']} NaN runs, {accounting['n_runs_failed']} failed runs "
+        f"-> {accounting['n_blocks_dropped']}/{accounting['n_blocks_total']} blocks dropped"
+    )
+
+
+def qoi_summary(
+    records: Sequence[Mapping[str, Any]], tau_core: float, tau_edema: float, n_blocks: int, size: int
+) -> dict[str, Any]:
+    """
+    The qoi_summary.json record: the global run counts (successes, empty
+    compartments per threshold, NaN mass-weighted QoIs, extinct runs at or
+    below the mass floor) and, per analysed QoI, ``response_accounting``.
+    """
+    successes = [r for r in records if _is_success(r)]
+    return {
+        "_note": ACCOUNTING_NOTE,
         "n_runs": len(records),
         "n_success": len(successes),
         "n_failed": len(records) - len(successes),
+        "block_size": size,
+        "n_blocks_total": n_blocks,
         "tau_core": tau_core,
         "tau_edema": tau_edema,
-        "n_empty_core": sum(1 for r in successes if r["n_core"] == 0),
-        "n_empty_edema": sum(1 for r in successes if r["n_edema"] == 0),
-        "n_nan_mass_weighted": sum(1 for r in successes if not np.isfinite(r["centroid_drift"])),
-        "n_nan_anisotropy": sum(1 for r in successes if not np.isfinite(r["anisotropy"])),
+        "n_empty_core": sum(1 for r in successes if as_float(r["n_core"]) == 0),
+        "n_empty_edema": sum(1 for r in successes if as_float(r["n_edema"]) == 0),
+        "n_nan_mass_weighted": sum(1 for r in successes if not np.isfinite(as_float(r["centroid_drift"]))),
+        "n_nan_anisotropy": sum(1 for r in successes if not np.isfinite(as_float(r["anisotropy"]))),
         "mass_floor_voxels": MASS_FLOOR_VOXELS,
-        "n_mass_floored": sum(1 for r in successes if r["mass"] <= MASS_FLOOR_VOXELS * r["voxel_volume"]),
+        "n_runs_extinct": sum(
+            1 for r in successes if as_float(r["mass"]) <= MASS_FLOOR_VOXELS * as_float(r["voxel_volume"])
+        ),
+        "per_qoi": {qoi: response_accounting(records, qoi, n_blocks, size) for qoi in ANALYSED_QOIS},
     }
 
 
@@ -1216,19 +1318,12 @@ def assemble_response(
         (Y, kept, dropped): the response of the kept blocks, concatenated
         in order, and the kept and dropped block indices.
     """
-    kept: list[int] = []
-    dropped: list[int] = []
-    chunks: list[NDArray] = []
-    for block in range(n_blocks):
-        y = np.array(
-            [values.get(index, np.nan) for index in range(block * size, (block + 1) * size)],
-            dtype=np.float64,
-        )
-        if np.all(np.isfinite(y)):
-            kept.append(block)
-            chunks.append(y)
-        else:
-            dropped.append(block)
+    dropped = _dropped_blocks(values, n_blocks, size)
+    kept = [block for block in range(n_blocks) if block not in set(dropped)]
+    chunks = [
+        np.array([values[index] for index in range(block * size, (block + 1) * size)], dtype=np.float64)
+        for block in kept
+    ]
     response = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float64)
     return response, kept, dropped
 
@@ -1328,18 +1423,26 @@ def analyze_sweep(
     qoi_records = read_csv(sweep_dir / "qoi.csv")
     results: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
-    summary: dict[str, Any] = {key: spec[key] for key in ("N", "k", "factor_names", "second_order", "salib_version")}
-    summary.update(n_bootstrap=int(n_bootstrap), seed=int(seed), analysed_qois=list(ANALYSED_QOIS), qois={})
+    n_blocks, size = int(spec["N"]), int(spec["block_size"])
+    summary: dict[str, Any] = {"_note": ACCOUNTING_NOTE}
+    summary.update({key: spec[key] for key in ("N", "k", "factor_names", "second_order", "salib_version")})
+    summary.update(
+        block_size=size, n_blocks_total=n_blocks, n_bootstrap=int(n_bootstrap), seed=int(seed),
+        analysed_qois=list(ANALYSED_QOIS), qois={},
+    )
     for qoi in ANALYSED_QOIS:
-        values = {int(r["index"]): as_float(r.get(qoi)) for r in qoi_records if r.get("success") == "True"}
-        result = analyze_response(values, names, int(spec["N"]), bool(spec["second_order"]), n_bootstrap, seed)
+        accounting = response_accounting(qoi_records, qoi, n_blocks, size)
+        print(accounting_line(qoi, accounting), flush=True)
+        values = qoi_values(qoi_records, qoi)
+        result = analyze_response(values, names, n_blocks, bool(spec["second_order"]), n_bootstrap, seed)
         if result is None:
             print(f"  {qoi}: fewer than two complete blocks, skipped", flush=True)
-            summary["qois"][qoi] = {"n_blocks_used": 0, "skipped": True}
+            summary["qois"][qoi] = {**accounting, "skipped": True}
             continue
+        assert result["dropped_blocks"] == accounting["dropped_blocks"]  # one rule, two callers
         results[qoi] = result
         rows.extend(sobol_rows(qoi, names, result))
-        summary["qois"][qoi] = qoi_summary_entry(names, result)
+        summary["qois"][qoi] = qoi_summary_entry(names, result, accounting)
         ranking = ", ".join(summary["qois"][qoi]["ranking_ST"][:3])
         print(f"  {qoi}: {result['n_blocks_used']} blocks, sum S1 = {summary['qois'][qoi]['sum_S1']:.2f}, top ST: {ranking}", flush=True)
     write_csv(sweep_dir / "sobol.csv", rows, SOBOL_COLUMNS)
@@ -1386,15 +1489,16 @@ def second_order_rows(names: Sequence[str], results: Mapping[str, Mapping[str, A
     return rows
 
 
-def qoi_summary_entry(names: Sequence[str], result: Mapping[str, Any]) -> dict[str, Any]:
-    """The sobol_summary.json entry of one QoI."""
+def qoi_summary_entry(
+    names: Sequence[str], result: Mapping[str, Any], accounting: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The sobol_summary.json entry of one QoI: the accounting of
+    ``response_accounting`` copied as is, then the indices."""
     st, st_conf = result["ST"], result["ST_conf"]
     order = np.argsort(-st)
     finite_half = np.isfinite(result["ST_half"])
     return {
-        "n_blocks_used": int(result["n_blocks_used"]),
-        "n_blocks_dropped": len(result["dropped_blocks"]),
-        "dropped_blocks": list(result["dropped_blocks"]),
+        **accounting,
         "n_blocks_half": int(result["n_blocks_half"]),
         "sum_S1": float(np.sum(result["S1"])),
         "S1": {name: float(result["S1"][i]) for i, name in enumerate(names)},
@@ -1643,16 +1747,20 @@ def design_command(args: argparse.Namespace) -> Path:
 
 def qoi_command(sweep_dir: Path, tau_core: float, tau_edema: float, workers: int) -> None:
     """The qoi subcommand: qoi.csv and qoi_summary.json."""
+    spec = read_json(sweep_dir / "spec.json")
     records = qoi_table(sweep_dir, tau_core, tau_edema, workers)
     write_csv(sweep_dir / "qoi.csv", records, QOI_COLUMNS)
-    summary = qoi_summary(records, tau_core, tau_edema)
+    summary = qoi_summary(records, tau_core, tau_edema, int(spec["N"]), int(spec["block_size"]))
     write_json(sweep_dir / "qoi_summary.json", summary)
     print(
         f"qoi.csv: {summary['n_success']}/{summary['n_runs']} successful runs; empty core "
         f"{summary['n_empty_core']}, empty edema {summary['n_empty_edema']}, NaN mass-weighted "
-        f"{summary['n_nan_mass_weighted']}, NaN anisotropy {summary['n_nan_anisotropy']}",
+        f"{summary['n_nan_mass_weighted']}, NaN anisotropy {summary['n_nan_anisotropy']}, extinct "
+        f"{summary['n_runs_extinct']}",
         flush=True,
     )
+    for qoi, accounting in summary["per_qoi"].items():
+        print(accounting_line(qoi, accounting), flush=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

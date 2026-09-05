@@ -4,7 +4,7 @@
   "_volumes": "resection_cavity ({\"segmentation\": <NIfTI path>, \"label\": <int>}) and rt_dose (Gy, TOTAL over all fractions) are null: no example segmentation and dose map ship with the repository yet, so this config does not run until they are given.",
   "_clock": "Times are days: t=0 is the tumor seed, the simulated growth before surgery is resection_time, the total simulated time is resection_time + time_after_resection.",
   "_schedule": "seed (day 0) --> resection (day 100) --> recovery (days 100-114) --> radiotherapy: 30 fractions on consecutive weekdays over 6 weeks (days 114-153, Monday = day 114); concomitant TMZ 75 mg/m^2 daily INCLUDING weekends over the same 6 weeks (days 114-155, 42 sessions) --> 4-week break --> adjuvant TMZ on days 1-5 of six 28-day cycles starting 4 weeks after the last fraction (day 181): days 181-185, 209-213, 237-241, 265-269, 293-297, 321-325; 150 mg/m^2 in cycle 1, 200 mg/m^2 in cycles 2-6 (72 sessions in total) --> growth to day 360 (35 days after the last dose).",
-  "_treatment": "chemo_kill_rate (1/day per mg/m^2), chemo_decay_rate (1/day) and rt_alpha (1/Gy) are PLACEHOLDERS awaiting review. rt_alpha_beta_ratio is the linear-quadratic alpha/beta ratio in Gy (rt_beta = rt_alpha / rt_alpha_beta_ratio in 1/Gy^2 is derived by the solver and is not a config entry); 10 Gy is the class default.",
+  "_treatment": "chemo_kill_rate (1/day per mg/m^2; 2.5e-3 is the geometric centre of the sensitivity search space's range, a total log kill of 2.4 over the schedule at chemo_decay_rate 9.24), chemo_decay_rate (1/day) and rt_alpha (1/Gy) are PLACEHOLDERS awaiting review. rt_alpha_beta_ratio is the linear-quadratic alpha/beta ratio in Gy (rt_beta = rt_alpha / rt_alpha_beta_ratio in 1/Gy^2 is derived by the solver and is not a config entry); 10 Gy is the class default.",
   "white_matter_pbmap": "../../reference_solves/wm_pbmap.nii.gz",
   "gray_matter_pbmap": "../../reference_solves/gm_pbmap.nii.gz",
   "white_matter_diffusivity": 0.80021,
@@ -164,7 +164,7 @@
     200.0,
     200.0
   ],
-  "chemo_kill_rate": 0.0062667,
+  "chemo_kill_rate": 2.5e-3,
   "chemo_decay_rate": 9.24,
   "rt_times": [
     114.0,

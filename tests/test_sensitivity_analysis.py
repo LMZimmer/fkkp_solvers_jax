@@ -468,9 +468,111 @@ def test_log10_mass_floor():
     qoi = sa.compute_qois(above, zooms, (8, 8, 8), wm)
     np.testing.assert_allclose(qoi["log10_mass"], np.log10(0.5 * voxel_volume))
     assert np.isfinite(qoi["R_g"])
-    records = [{"success": True, **zero}, {"success": True, **extinct}, {"success": True, **qoi}]
-    summary = sa.qoi_summary(records, 0.6, 0.3)
-    assert summary["n_mass_floored"] == 2 and summary["n_nan_mass_weighted"] == 2
+    records = [
+        {"success": True, "index": i, **values} for i, values in enumerate((zero, extinct, qoi))
+    ]
+    summary = sa.qoi_summary(records, 0.6, 0.3, n_blocks=1, size=3)
+    assert summary["n_runs_extinct"] == 2 and summary["n_nan_mass_weighted"] == 2
+    assert summary["per_qoi"]["log10_mass"]["n_blocks_dropped"] == 0
+    assert summary["per_qoi"]["R_g"] == {
+        "n_runs_total": 3, "n_runs_failed": 0, "n_runs_nan": 2, "n_blocks_total": 1,
+        "n_blocks_dropped": 1, "n_blocks_used": 0, "dropped_blocks": [0],
+    }
+
+
+# --- accounting ---
+
+ACCOUNTING_FIELDS = (
+    "n_runs_total", "n_runs_failed", "n_runs_nan", "n_blocks_total", "n_blocks_dropped",
+    "n_blocks_used", "dropped_blocks",
+)
+
+
+def _check_accounting_agreement(qoi_summary: dict, sobol_summary: dict, qoi_records: list[dict]) -> None:
+    """qoi_summary.json's per_qoi accounting equals sobol_summary.json's
+    field by field, the _note's inequalities hold, and n_runs_extinct is
+    the count of runs at or below the mass floor."""
+    assert qoi_summary["_note"] == sobol_summary["_note"] == sa.ACCOUNTING_NOTE
+    size = qoi_summary["block_size"]
+    assert size == sobol_summary["block_size"]
+    assert qoi_summary["n_blocks_total"] == sobol_summary["n_blocks_total"]
+    for qoi in sa.ANALYSED_QOIS:
+        a, b = qoi_summary["per_qoi"][qoi], sobol_summary["qois"][qoi]
+        for field in ACCOUNTING_FIELDS:
+            assert a[field] == b[field], (qoi, field)
+        assert a["n_blocks_total"] * size == a["n_runs_total"]
+        assert a["n_blocks_used"] + a["n_blocks_dropped"] == a["n_blocks_total"]
+        assert len(a["dropped_blocks"]) == a["n_blocks_dropped"]
+        assert -(-a["n_runs_nan"] // size) <= a["n_blocks_dropped"] <= a["n_runs_nan"] + a["n_runs_failed"]
+    floor = qoi_summary["mass_floor_voxels"]
+    extinct = sum(
+        1 for r in qoi_records
+        if r["success"] == "True" and float(r["mass"]) <= floor * float(r["voxel_volume"])
+    )
+    assert qoi_summary["n_runs_extinct"] == extinct
+
+
+def test_accounting_on_poisoned_sweep(tmp_path):
+    """A synthetic qoi.csv (N = 8 blocks of 4 runs, two factors) with one
+    NaN run in block 0, two in block 1, a failed run in block 2 and an
+    extinct (floored) run in block 3: qoi and analyze agree field by
+    field, the four mass-weighted QoIs drop exactly blocks 0-3, log10_mass
+    drops only the failed run's block, and the console lines agree."""
+    names, n_blocks, size = ["f1", "f2"], 8, 4
+    sweep_dir = tmp_path / "poisoned"
+    sweep_dir.mkdir()
+    rng = np.random.default_rng(0)
+    records = []
+    design = []
+    labels = sa.matrix_labels(names, False)
+    for index in range(n_blocks * size):
+        block, position = divmod(index, size)
+        f1, f2 = rng.random(2)
+        design.append({"run_name": sa.run_name(block, labels[position]), "index": index, "row": block,
+                       "matrix": labels[position], "f1": f1, "f2": f2})
+        mass = 500.0 * (1 + f1) * (1 + 0.1 * f2)
+        record = {"run_name": design[-1]["run_name"], "index": index, "row": block, "matrix": labels[position],
+                  "success": True, "mass": mass, "log10_mass": np.log10(mass), "V_core": 30 * f1, "V_edema": 60 * f1,
+                  "log10_V_core": np.log10(30 * f1 + 1), "log10_V_edema": np.log10(60 * f1 + 1),
+                  "r95_core": 5 * f2, "r95_edema": 8 * f2, "centroid_drift": f1 + f2, "R_g": 3 + f1,
+                  "anisotropy": 1 + f2, "log10_anisotropy": np.log10(1 + f2), "wm_fraction": 0.5 * f1,
+                  "n_core": 30 * f1, "n_edema": 60 * f1, "voxel_volume": 1.0,
+                  "final_time": 10.0, "n_steps": 100, "wall_time_s": 1.0}
+        records.append(record)
+    for index in (1, 4, 6):  # NaN mass-weighted QoIs: one in block 0, two in block 1
+        for key in (*sa.MASS_WEIGHTED_QOIS, "log10_anisotropy"):
+            records[index][key] = np.nan
+    records[9] = {**records[9], "success": False}  # block 2: a failed run
+    for key in sa.QOI_NAMES + ["final_time", "n_steps", "wall_time_s"]:
+        records[9][key] = np.nan
+    records[14]["mass"] = 1e-30  # block 3: extinct, floored log10_mass, NaN mass-weighted
+    records[14]["log10_mass"] = np.log10(sa.MASS_FLOOR_VOXELS)
+    for key in (*sa.MASS_WEIGHTED_QOIS, "log10_anisotropy"):
+        records[14][key] = np.nan
+    sa.write_csv(sweep_dir / "qoi.csv", records, sa.QOI_COLUMNS)
+    sa.write_csv(sweep_dir / "design.csv", design)
+    sa.write_json(sweep_dir / "spec.json", {
+        "N": n_blocks, "k": 2, "factor_names": names, "second_order": False, "block_size": size,
+        "salib_version": "test", "factors": {n: {"min": 0.0, "max": 1.0, "scale": "linear"} for n in names},
+    })
+    qoi_records = sa.read_csv(sweep_dir / "qoi.csv")
+    summary = sa.qoi_summary(qoi_records, 0.6, 0.3, n_blocks, size)
+    sa.write_json(sweep_dir / "qoi_summary.json", summary)
+    sa.analyze_sweep(sweep_dir, n_bootstrap=10, seed=0)
+    sobol_summary = json.loads((sweep_dir / "sobol_summary.json").read_text())
+    _check_accounting_agreement(summary, sobol_summary, qoi_records)
+    assert summary["n_runs_extinct"] == 1 and summary["n_failed"] == 1 and summary["n_nan_mass_weighted"] == 4
+    for qoi in ("centroid_drift", "R_g", "log10_anisotropy", "wm_fraction"):
+        assert summary["per_qoi"][qoi] == {
+            "n_runs_total": 32, "n_runs_failed": 1, "n_runs_nan": 4, "n_blocks_total": 8,
+            "n_blocks_dropped": 4, "n_blocks_used": 4, "dropped_blocks": [0, 1, 2, 3],
+        }, qoi
+    for qoi in ("log10_mass", "V_core", "r95_edema"):
+        assert summary["per_qoi"][qoi]["dropped_blocks"] == [2] and summary["per_qoi"][qoi]["n_runs_nan"] == 0
+    assert sa.accounting_line("R_g", summary["per_qoi"]["R_g"]) == "  R_g: 4 NaN runs, 1 failed runs -> 4/8 blocks dropped"
+    sobol = _read_csv(sweep_dir / "sobol.csv")
+    assert {r["n_blocks_used"] for r in sobol if r["qoi"] == "R_g"} == {"4"}
+    assert {r["n_blocks_used"] for r in sobol if r["qoi"] == "log10_mass"} == {"7"}
 
 
 # --- (6) end to end on the phantom ---
@@ -523,7 +625,8 @@ def test_end_to_end_on_phantom(phantom_base):
     assert all(float(r["r95_core"]) == 0 for r in qoi if r["n_core"] == "0")
     summary = json.loads((sweep_dir / "qoi_summary.json").read_text())
     assert summary["n_success"] == 32 and summary["n_nan_mass_weighted"] == 0
-    assert summary["n_mass_floored"] == 0 and spec["chemo_total_dose"] == 225.0
+    assert summary["n_runs_extinct"] == 0 and spec["chemo_total_dose"] == 225.0
+    assert set(summary["per_qoi"]) == set(sa.ANALYSED_QOIS) and summary["block_size"] == 8
     results = sa.analyze_sweep(sweep_dir, n_bootstrap=20, seed=0)
     assert set(results) == set(sa.ANALYSED_QOIS)
     sobol = _read_csv(sweep_dir / "sobol.csv")
@@ -533,6 +636,7 @@ def test_end_to_end_on_phantom(phantom_base):
     sobol_summary = json.loads((sweep_dir / "sobol_summary.json").read_text())
     assert sobol_summary["N"] == 4 and set(sobol_summary["qois"]) == set(sa.ANALYSED_QOIS)
     assert sobol_summary["qois"]["log10_mass"]["dropped_blocks"] == []
+    _check_accounting_agreement(summary, sobol_summary, qoi)
     figures = sweep_dir / "figures"
     for stem in ("heatmap_ST", "heatmap_S1", "bars_log10_mass", "scatter_R_g"):
         assert (figures / f"{stem}.png").is_file() and (figures / f"{stem}.pdf").is_file()
