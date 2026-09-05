@@ -2,7 +2,10 @@
 ``BaseFKPPSolver`` implements the pipeline (validate parameters, load the
 volumes, downsample the tissue fields (on host), crop to the bounding box,
 time stepping (on device), embed and upsample the results), holds the
-config of the run and saves results with their config.
+config of the run and saves results with their config (``Result.save``:
+``config.json``, ``result.json`` and the state volumes). A saved run is
+reproduced by ``SolverClass(read_config(path))``, the caller choosing the
+class; the config's ``"solver"`` entry is checked against it.
 """
 
 from __future__ import annotations
@@ -554,7 +557,7 @@ class BaseFKPPSolver(ABC):
             and volumes recorded as their path (or the entry they were
             given as) or as ``VOLUME_IN_MEMORY`` when given as arrays.
             Derived values are not in it (``DERIVED_KEYS``), so it
-            reproduces the run through ``solver_from_config``.
+            reproduces the run through ``SolverClass(config)``.
         affine: Voxel-to-world affine, from the NIfTI header of the
             reference volume (``_REFERENCE_VOLUME_KEY``) if that was given
             as a path, else of any volume given as a path, else a diagonal

@@ -971,8 +971,9 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         return int(np.ceil(n_timesteps)), dt
 
 
-# Treatment parameters of StuppFKPPSolver, all required (see the class
-# docstring for the values that switch a treatment off).
+# Treatment parameters of StuppFKPPSolver, all required but
+# rt_alpha_beta_ratio, which has a default (see the class docstring for the
+# values that switch a treatment off).
 _STUPP_TREATMENT_KEYS: frozenset[str] = frozenset(
     {
         "resection_time",
@@ -983,8 +984,8 @@ _STUPP_TREATMENT_KEYS: frozenset[str] = frozenset(
         "chemo_decay_rate",
         "rt_times",
         "rt_dose",  # TOTAL dose over all fractions, 3D array in Gy
-        "rt_alpha",
-        "rt_beta",
+        "rt_alpha",  # 1/Gy
+        "rt_alpha_beta_ratio",  # Gy, the linear-quadratic alpha/beta ratio
     }
 )
 
@@ -1007,16 +1008,17 @@ class StuppFKPPSolver(BaseFKPPSolver):
     rounded to the nearest integer first). Both may also be given as
     arrays.
 
-    Every treatment parameter is required; a treatment is switched off by
-    its values, not by omitting it: an all-False resection_cavity leaves
-    the dynamics untouched (the post-resection faces then equal the
-    pre-resection ones), an empty chemo_times, chemo_kill_rate = 0 or
-    all-zero chemo_doses removes the chemotherapy kill (chemo_decay_rate
-    must stay > 0), and a zero rt_dose (or rt_alpha = rt_beta = 0) makes
-    the radiotherapy impulse the identity. With all three neutral the
-    solver reproduces ``FKPPSolver`` up to floating-point rounding (the
-    treatment terms are still evaluated, so the compiled arithmetic is
-    not identical).
+    Every treatment parameter is required (rt_alpha_beta_ratio excepted,
+    which defaults to 10 Gy); a treatment is switched off by its values,
+    not by omitting it: an all-False resection_cavity leaves the dynamics
+    untouched (the post-resection faces then equal the pre-resection
+    ones), an empty chemo_times, chemo_kill_rate = 0 or all-zero
+    chemo_doses removes the chemotherapy kill (chemo_decay_rate must stay
+    > 0), and a zero rt_dose (or rt_alpha = 0, which zeroes the derived
+    rt_beta with it) makes the radiotherapy impulse the identity. With all
+    three neutral the solver reproduces ``FKPPSolver`` up to
+    floating-point rounding (the treatment terms are still evaluated, so
+    the compiled arithmetic is not identical).
 
     Continuous model (explicit Euler at the pre-step state; growth and
     diffusion only)::
@@ -1042,9 +1044,14 @@ class StuppFKPPSolver(BaseFKPPSolver):
          is transferable across time steps.
       2. RT impulse: u <- u exp(-E(x) n_hits) with the linear-quadratic
          log kill E(x) = rt_alpha d(x) + rt_beta d(x)^2 and n_hits the
-         number of rt_times in (t0, t1]. Per-fraction dose convention:
-         rt_dose holds the TOTAL dose over all fractions, so
-         d(x) = rt_dose / len(rt_times) (computed once on the host).
+         number of rt_times in (t0, t1]. The parameters are rt_alpha
+         (1/Gy) and the alpha/beta ratio rt_alpha_beta_ratio (Gy);
+         rt_beta = rt_alpha / rt_alpha_beta_ratio (1/Gy^2) is computed on
+         the host where E(x) is built and is neither a parameter nor a
+         config entry (as diffusivity_ratio stands in for a gray-matter
+         diffusivity). Per-fraction dose convention: rt_dose holds the
+         TOTAL dose over all fractions, so d(x) = rt_dose / len(rt_times)
+         (computed once on the host).
       3. Resection: u <- 0 inside resection_cavity for every step with
          t1 >= resection_time, and from the same step on the face
          diffusivities switch to a post-resection set in which every face
@@ -1056,6 +1063,14 @@ class StuppFKPPSolver(BaseFKPPSolver):
     # dict without them and time_after_resection, plus stopping_time, is
     # the untreated FKPPSolver run).
     TREATMENT_KEYS: ClassVar[frozenset[str]] = _STUPP_TREATMENT_KEYS
+    _DEFAULTS: ClassVar[dict[str, Any]] = {
+        **{key: value for key, value in _COMMON_DEFAULTS.items() if key != "stopping_time"},
+        # Cells with wm + gm below this carry no flux (CSF/background).
+        "min_tissue_fraction": 0.1,
+        # Linear-quadratic alpha/beta ratio in Gy; rt_beta = rt_alpha / it
+        # is derived on the host. The one treatment parameter with a default.
+        "rt_alpha_beta_ratio": 10.0,
+    }
     _REQUIRED: ClassVar[frozenset[str]] = frozenset(
         {
             "white_matter_diffusivity",
@@ -1068,13 +1083,8 @@ class StuppFKPPSolver(BaseFKPPSolver):
             "resolution_factor",
             "time_after_resection",  # days; the horizon is resection_time + it
         }
-        | TREATMENT_KEYS
+        | (TREATMENT_KEYS - frozenset(_DEFAULTS))
     )
-    _DEFAULTS: ClassVar[dict[str, Any]] = {
-        **{key: value for key, value in _COMMON_DEFAULTS.items() if key != "stopping_time"},
-        # Cells with wm + gm below this carry no flux (CSF/background).
-        "min_tissue_fraction": 0.1,
-    }
     _VOLUME_KEYS: ClassVar[frozenset[str]] = _TISSUE_VOLUME_KEYS | {"rt_dose", "resection_cavity"}
     _REFERENCE_VOLUME_KEY: ClassVar[str] = "white_matter_pbmap"
 
@@ -1157,7 +1167,7 @@ class StuppFKPPSolver(BaseFKPPSolver):
         if not np.all(np.isfinite(dose)) or np.any(dose < 0):
             raise ValueError(f"{name}: rt_dose must be finite and nonnegative.")
         _validate_nonnegative_scalar(params, "rt_alpha", name)
-        _validate_nonnegative_scalar(params, "rt_beta", name)
+        _validate_positive_scalar(params, "rt_alpha_beta_ratio", name)
 
     def _prepare_input_fields(
         self,
@@ -1216,6 +1226,10 @@ class StuppFKPPSolver(BaseFKPPSolver):
         dose_per_fraction = jnp.asarray(
             self._rt_dose_lowres[box] / rt_times.size, dtype=self._dtype
         )
+        # The quadratic coefficient from the alpha/beta ratio, on the host;
+        # rt_beta is derived here and is not a parameter.
+        rt_alpha = float(params["rt_alpha"])
+        rt_beta = rt_alpha / float(params["rt_alpha_beta_ratio"])
         return {
             "face_diffusivities": faces,
             "rho": self._dynamic_scalar(params["rho"]),
@@ -1231,9 +1245,7 @@ class StuppFKPPSolver(BaseFKPPSolver):
             "chemo_kill_rate": self._dynamic_scalar(params["chemo_kill_rate"]),
             "chemo_decay_rate": self._dynamic_scalar(params["chemo_decay_rate"]),
             "rt_times": jnp.asarray(rt_times, dtype=self._dtype),
-            "rt_log_kill": lq_log_kill(
-                dose_per_fraction, float(params["rt_alpha"]), float(params["rt_beta"])
-            ),
+            "rt_log_kill": lq_log_kill(dose_per_fraction, rt_alpha, rt_beta),
         }
 
     def _time_step_count(self) -> tuple[int, float]:

@@ -62,7 +62,7 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
 
-from fisher_kpp_jax import StuppFKPPSolver, read_config, solver_from_config  # noqa: E402
+from fisher_kpp_jax import StuppFKPPSolver, read_config  # noqa: E402
 from fisher_kpp_jax.util import montage_days, render, select_panels  # noqa: E402
 
 DEFAULT_CONFIG = str(_ROOT / "scripts" / "stupp_config_example.json")
@@ -112,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
 
     config = read_config(args.config)
     config["verbose"] = True
-    solver = solver_from_config(config)
+    solver = StuppFKPPSolver(config)
     if not isinstance(solver, StuppFKPPSolver):
         raise ValueError(f"{args.config} names {type(solver).__name__}, not StuppFKPPSolver.")
     panel_days = None
@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
             solver.params["rt_times"],
             float(solver.params["stopping_time"]),
         )
-        solver = solver_from_config({**config, "snapshot_times": panel_days})
+        solver = StuppFKPPSolver({**config, "snapshot_times": panel_days})
     params = solver.params
     wm, gm = params["white_matter_pbmap"], params["gray_matter_pbmap"]
 

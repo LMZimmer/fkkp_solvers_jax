@@ -8,11 +8,13 @@ one mapping or as keyword arguments, ``Solver(params)`` or
 arrays or NIfTI paths, in which case the voxel size and affine come from
 the header. Every solver holds its ``config`` (the parameters as given,
 defaults filled in, volumes as paths), ``read_config`` / ``write_config``
-move configs to and from JSON, ``solver_from_config`` builds the solver a
-config names and ``Solver.get_default_config()`` returns the pre-written
-default config of a class. ``solve(store_result=True, outdir=...)`` (or
-``solver.save(outdir)``, ``Result.save``) writes the config, a result
-record and the result volumes into a directory.
+move configs to and from JSON and ``Solver.get_default_config()`` returns
+the pre-written default config of a class. ``solve(store_result=True,
+outdir=...)`` (or ``solver.save(outdir)``, ``Result.save``) writes the
+config, a result record and the result volumes into a directory, and
+``SolverClass(read_config(path))`` reproduces the saved run: the caller
+names the class, and a ``"solver"`` entry in the config is checked against
+it, never used to pick one.
 
 Common solver options: ``precision: "f32" | "f64"`` (default "f32")
 selects the device state dtype; the time step is given as at most one of
@@ -38,7 +40,6 @@ from .config import (
     VOLUME_IN_MEMORY,
     read_config,
     solver_class,
-    solver_from_config,
     write_config,
 )
 from .solvers import (
@@ -71,6 +72,5 @@ __all__ = [
     "TwoCompartmentWithNutrientFKPPSolver",
     "read_config",
     "solver_class",
-    "solver_from_config",
     "write_config",
 ]

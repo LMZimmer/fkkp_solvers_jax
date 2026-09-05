@@ -30,7 +30,6 @@ from fisher_kpp_jax import (
     StuppFKPPSolver,
     operators,
     read_config,
-    solver_from_config,
     write_config,
 )
 
@@ -64,7 +63,7 @@ def neutral_treatment_params(shape: tuple[int, int, int], **overrides) -> dict:
         rt_times=np.array([3.3, 5.3, 7.3]),
         rt_dose=np.zeros(shape),
         rt_alpha=0.1,
-        rt_beta=0.01,
+        rt_alpha_beta_ratio=10.0,  # Gy: rt_beta = 0.01 1/Gy^2
     )
     params.update(overrides)
     return params
@@ -106,7 +105,7 @@ def treatment_params(shape: tuple[int, int, int], **overrides) -> dict:
         rt_times=np.array([3.3, 5.3, 7.3]),
         rt_dose=np.full(shape, 6.0),
         rt_alpha=0.1,
-        rt_beta=0.01,
+        rt_alpha_beta_ratio=10.0,  # Gy: rt_beta = 0.01 1/Gy^2
     )
     params.update(overrides)
     return params
@@ -156,7 +155,8 @@ def test_rt_impulse_is_exact(tissue_phantom):
     number of fractions inside the horizon and E the per-fraction
     linear-quadratic log kill (d = total dose / number of fractions)."""
     gm, wm = tissue_phantom
-    total_dose, alpha, beta = 6.0, 0.1, 0.01
+    total_dose, alpha, ratio = 6.0, 0.1, 8.0
+    beta = alpha / ratio  # what the solver derives from the alpha/beta ratio
     rt_times = np.array([2.5, 4.5, 6.5, 8.5, 12.0])  # 4 inside the horizon
     params = base_params(
         gm,
@@ -165,7 +165,7 @@ def test_rt_impulse_is_exact(tissue_phantom):
         rt_times=rt_times,
         rt_dose=np.full(gm.shape, total_dose),
         rt_alpha=alpha,
-        rt_beta=beta,
+        rt_alpha_beta_ratio=ratio,
     )
     solver = StuppFKPPSolver(params)
     result = solver.solve()
@@ -186,6 +186,54 @@ def test_rt_impulse_is_exact(tissue_phantom):
     np.testing.assert_allclose(
         untreated.final_stopping_quantity, initial_mass, rtol=1e-12
     )
+
+
+def test_rt_beta_derived_from_alpha_beta_ratio(tissue_phantom):
+    """rt_alpha = 0.06 1/Gy with rt_alpha_beta_ratio = 10 Gy reproduces the
+    former parameterisation rt_alpha = 0.06, rt_beta = 0.006 1/Gy^2: with
+    rho = 0, D = 0 and resolution_factor = 1 the final field is the seed
+    times exp(-n_hits E(x)) voxel by voxel, E(x) = 0.06 d(x) + 0.006 d(x)^2
+    for a spatially varying dose. rt_beta is neither a parameter nor a
+    config entry nor a derived value, and rt_alpha = 0 alone makes the
+    impulse the identity."""
+    gm, wm = tissue_phantom
+    rng = np.random.default_rng(7)
+    total_dose = rng.random(gm.shape) * 60.0
+    rt_times = np.array([2.5, 4.5, 6.5, 8.5, 12.0])  # 4 inside the horizon
+    params = base_params(
+        gm,
+        wm,
+        rho=0.0,
+        white_matter_diffusivity=0.0,
+        resolution_factor=1.0,
+        rt_times=rt_times,
+        rt_dose=total_dose,
+        rt_alpha=0.06,
+        rt_alpha_beta_ratio=10.0,
+    )
+    solver = StuppFKPPSolver(params)
+    assert "rt_beta" not in solver.params and "rt_beta" not in solver.config
+    assert solver.config["rt_alpha_beta_ratio"] == 10.0
+    result = solver.solve()
+    assert result.success, result.error
+    assert "rt_beta" not in result.derived
+    dose_per_fraction = total_dose / rt_times.size
+    log_kill = 0.06 * dose_per_fraction + 0.006 * dose_per_fraction**2  # the old rt_beta
+    np.testing.assert_allclose(
+        result.final_state["cell_density"],
+        result.initial_state["cell_density"] * np.exp(-4 * log_kill),
+        rtol=1e-10,
+        atol=0,
+    )
+    assert result.final_stopping_quantity < lowres_seed_mass(solver)
+    # rt_alpha = 0 zeroes rt_beta with it: the impulse is the identity.
+    no_alpha = StuppFKPPSolver({**params, "rt_alpha": 0.0}).solve()
+    no_dose = StuppFKPPSolver({**params, "rt_dose": np.zeros(gm.shape)}).solve()
+    assert no_alpha.success and no_dose.success
+    np.testing.assert_array_equal(
+        no_alpha.final_state["cell_density"], no_dose.final_state["cell_density"]
+    )
+    np.testing.assert_allclose(no_alpha.final_stopping_quantity, lowres_seed_mass(solver), rtol=1e-12)
 
 
 def _ct_only_params(gm, wm, n_steps: int, doses: np.ndarray, **overrides) -> dict:
@@ -385,7 +433,7 @@ def test_no_retrace_on_treatment_value_change(tissue_phantom):
             "rt_times": np.array([2.2, 4.2, 6.2]),
             "rt_dose": np.full(gm.shape, 9.0),
             "rt_alpha": 0.2,
-            "rt_beta": 0.02,
+            "rt_alpha_beta_ratio": 8.0,
         }
     ).solve()
     assert operators.SCAN_TRACE_COUNT == before
@@ -419,11 +467,21 @@ def test_validation_errors(tissue_phantom):
 
     build(**full)  # the complete set is accepted
     # Every treatment parameter is required; None is not a way to disable one.
-    for key in ("resection_cavity", "chemo_decay_rate", "rt_beta"):
+    for key in ("resection_cavity", "chemo_decay_rate", "rt_alpha"):
         with pytest.raises(KeyError, match=key):
             StuppFKPPSolver({k: v for k, v in base_params(gm, wm).items() if k != key})
         with pytest.raises(ValueError, match=key):
             build(**{**full, key: None})
+    # ...except the alpha/beta ratio, which defaults to 10 Gy and must be a
+    # positive finite scalar (it divides rt_alpha).
+    without_ratio = {k: v for k, v in base_params(gm, wm, **full).items() if k != "rt_alpha_beta_ratio"}
+    assert StuppFKPPSolver(without_ratio).params["rt_alpha_beta_ratio"] == 10.0
+    for bad in (None, 0.0, -8.0, np.inf, np.nan, [8.0]):
+        with pytest.raises(ValueError, match="rt_alpha_beta_ratio"):
+            build(**{**full, "rt_alpha_beta_ratio": bad})
+    # rt_beta is not a parameter any more.
+    with pytest.raises(ValueError, match=r"unknown parameter\(s\): \['rt_beta'\]"):
+        build(**{**full, "rt_beta": 0.01})
     # Wrong shapes / kinds.
     with pytest.raises(ValueError, match="resection_cavity"):
         build(**{**full, "resection_cavity": np.zeros((4, 4, 4), dtype=bool)})
@@ -619,12 +677,12 @@ def test_config_drives_solver(config_dir, tissue_phantom):
         "rt_times": [3.3, 5.3],
         "rt_dose": "dose24.nii.gz",
         "rt_alpha": 0.1,
-        "rt_beta": 0.01,
+        "rt_alpha_beta_ratio": 10.0,
         "dt": 0.05,
     }
     entries = read_config(_write_config(tmp_path, config))
-    solver = solver_from_config(entries)
-    assert isinstance(solver, StuppFKPPSolver)
+    solver = StuppFKPPSolver(entries)
+    assert solver.config[SOLVER_KEY] == "StuppFKPPSolver"
     assert solver.resolve_time_stepping() == (200, 0.05)
     assert solver.params["stopping_time"] == HORIZON and "stopping_time" not in solver.config
     assert solver.config["dt"] == 0.05 and solver.config["n_steps"] is None
@@ -640,7 +698,25 @@ def test_config_drives_solver(config_dir, tissue_phantom):
     # the wrong length, a missing required parameter.
     mismatched = read_config(_write_config(tmp_path, {**config, "chemo_doses": [75.0]}))
     with pytest.raises(ValueError, match="chemo_doses"):
-        solver_from_config(mismatched)
+        StuppFKPPSolver(mismatched)
     incomplete = read_config(_write_config(tmp_path, {**config, "rt_alpha": None}))
     with pytest.raises(ValueError, match="rt_alpha"):
-        solver_from_config(incomplete)
+        StuppFKPPSolver(incomplete)
+
+
+def test_read_config_rejects_rt_beta(config_dir):
+    """rt_beta is not a parameter: a config carrying it (the former
+    parameterisation) is rejected by read_config as an unknown key, with
+    or without the alpha/beta ratio beside it."""
+    tmp_path, _, _ = config_dir
+    stupp = {SOLVER_KEY: "StuppFKPPSolver", "rt_alpha": 0.06}
+    with pytest.raises(ValueError, match=r"unknown key\(s\) \['rt_beta'\]"):
+        read_config(_write_config(tmp_path, {**stupp, "rt_beta": 0.006}))
+    with pytest.raises(ValueError, match=r"unknown key\(s\) \['rt_beta'\]"):
+        read_config(
+            _write_config(tmp_path, {**stupp, "rt_alpha_beta_ratio": 10.0, "rt_beta": 0.006})
+        )
+    assert read_config(_write_config(tmp_path, {**stupp, "rt_alpha_beta_ratio": 10.0})) == {
+        **stupp,
+        "rt_alpha_beta_ratio": 10.0,
+    }

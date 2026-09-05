@@ -4,9 +4,16 @@ A config is a dict keyed by solver parameter name plus the entry
 ``"solver"`` naming the solver class. Every solver holds one as
 ``solver.config`` (built at construction from the given parameters, the
 class defaults filled in), ``Result.save`` writes it next to the results
-and ``read_config`` loads it back, so ``solver_from_config(read_config(p))``
-reproduces a run. Compared with the parameters the solver validates, a
-config differs in three ways:
+and ``read_config`` loads it back, so ``SolverClass(read_config(path))``
+reproduces a saved run. The caller always chooses the class: a config is
+passed to it as ``SolverClass(config)`` or ``SolverClass(**config)``, and
+its ``"solver"`` entry, if present, is checked against the class (a
+mismatch raises) but never used to pick one. ``read_config`` resolves the
+class from the file's ``"solver"`` entry (or from its ``solver`` argument)
+only to check the keys and resolve the volume entries, which is what the
+solver registry (``register_solver`` / ``solver_class``) exists for.
+Compared with the parameters the solver validates, a config differs in
+three ways:
 
 - Volumes (tissue maps, tensors, treatment maps) are NIfTI paths, absolute
   or relative to the config file; ``read_config`` makes them absolute and
@@ -78,19 +85,6 @@ def _resolve_solver(
     return cls
 
 
-def solver_from_config(config: Mapping[str, Any]) -> BaseFKPPSolver:
-    """
-    Construct the solver a config names.
-
-    Args:
-        config: A config with a "solver" entry (see ``read_config``).
-
-    Returns:
-        ``SolverClass(config)`` for the class the "solver" entry names.
-    """
-    return _resolve_solver(None, config, "config")(config)
-
-
 def jsonable(value: Any) -> Any:
     """Convert numpy scalars/arrays, paths, non-finite floats and nested
     containers to JSON-serializable values (inf becomes "inf")."""
@@ -129,8 +123,8 @@ def read_config(
     entry resolved by the class (NIfTI paths made absolute, a relative path
     counting from the config's directory). The volumes stay paths, so the
     entries can be edited, completed or written back with ``write_config``
-    before ``solver_from_config`` loads them; a missing volume file is
-    reported when it is loaded.
+    before the solver class loads them (``SolverClass(config)``); a missing
+    volume file is reported when it is loaded.
 
     Args:
         path: Path of the JSON config.

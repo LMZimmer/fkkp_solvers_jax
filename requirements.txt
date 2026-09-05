@@ -1,5 +1,7 @@
-# Runtime dependencies of fisher_kpp_jax (exact versions installed in the
-# `fkkp_solver` conda env, Python 3.14.6).
+# Dependencies of fisher_kpp_jax, its scripts and its tests, in one file
+# (exact versions installed in the `fkkp_solver` conda env, Python 3.14.6).
+#
+# --- Runtime dependencies of fisher_kpp_jax ---
 #
 # GPU status: jax/jaxlib 0.11.0 (CUDA 12 wheels) verified working on
 # Quadro RTX 8000 (Turing, sm_75, compute capability 7.5) — jax.devices()
@@ -7,14 +9,27 @@
 # sm_75 support is needed at this version.
 jax[cuda12]==0.11.0
 jaxlib==0.11.0
-nibabel==5.4.2  # NIfTI I/O of solvers.params_from_manifest
+loguru==0.7.3  # logging of the solvers (warnings on time steps, event times)
+nibabel==5.4.2  # NIfTI I/O of the volume parameters given as paths
 numpy==2.5.2
 scipy==1.18.0
 
-# Test-only tooling.
+# --- Scripts-only dependencies (imported inside scripts/, NOT dependencies
+# --- of fisher_kpp_jax) ---
+#
+# matplotlib: scripts/run_stupp_forward.py (the overview.png montage),
+# scripts/analyze_sweep_sensitivity.py and scripts/sensitivity_analysis.py
+# (the figures). SALib: scripts/sensitivity_analysis.py (the Saltelli design
+# of SALib.sample.sobol and the Sobol' indices of SALib.analyze.sobol; needs
+# >= 1.5 for that module layout).
+matplotlib==3.11.1
+SALib==1.5.2
+
+# --- Test-only tooling ---
 pytest==9.1.1
 
-# The reference package (./fisher_kpp) has an extra import-time dependency of
-# its own; it was installed into the env only so the comparison tests can run
-# and is deliberately not a dependency of fisher_kpp_jax — see
-# requirements-test.txt.
+# torch is installed only so the reference package ./fisher_kpp can be
+# imported for the comparison tests; it is NOT a dependency of
+# fisher_kpp_jax (the reference package has that extra import-time
+# dependency of its own).
+torch==2.13.0+cpu  # --index-url https://download.pytorch.org/whl/cpu

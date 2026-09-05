@@ -263,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
     header = (
         f"D {params['white_matter_diffusivity']:g}, rho {params['rho']:g}, "
         f"ratio {params['diffusivity_ratio']:g}, "
-        f"alpha {params['rt_alpha']:g}, beta {params['rt_beta']:g}, "
+        f"alpha {params['rt_alpha']:g} /Gy, a/b {params['rt_alpha_beta_ratio']:g} Gy, "
         f"kill {params['chemo_kill_rate']:g} /(mg/m^2), decay {params['chemo_decay_rate']:g}, "
         f"TMZ {np.min(params['chemo_doses']):g}-{np.max(params['chemo_doses']):g} mg/m^2"
     )

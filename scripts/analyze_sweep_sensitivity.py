@@ -6,8 +6,11 @@ how the quantity of interest -- the FINAL TUMOR MASS, column 'final_mass',
 i.e. the run's final_stopping_quantity under stopping_mode="mass"
 (voxel_volume * sum of the cell density) -- responds to the seven sampled
 factors: rho, white_matter_diffusivity, diffusivity_ratio, resection_time,
-chemo_kill_rate, chemo_decay_rate, rt_alpha. rt_beta is skipped (it is
-0.1 * rt_alpha, perfectly collinear); the seed voxel is not a scalar factor,
+chemo_kill_rate, chemo_decay_rate, rt_alpha. The quadratic radiosensitivity
+is skipped (the analysed sweep sampled it as 0.1 * rt_alpha, perfectly
+collinear; sweeps since the rt_alpha_beta_ratio refactor carry the
+alpha/beta ratio column instead, which is not analysed either); the seed
+voxel is not a scalar factor,
 but the WM probability at the seed voxel (read from the sweep's WM pbmap) is
 included as one scalar covariate when that map is readable. A dummy factor of
 uniform noise is appended as a null baseline for every method.

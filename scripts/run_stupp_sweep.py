@@ -25,8 +25,9 @@ Swept parameters and default ranges (uniform):
                            the former 0.05 - 2.0 per unit concentration / 75 mg/m^2)
   chemo_decay_rate         1.0       - 20.0     1/day      (not in the file)
   rt_alpha                 0.02      - 0.3      1/Gy       (not in the file)
-  rt_beta                  0.002     - 0.03     1/Gy^2     (not in the file; the
-                           former 0.1 * rt_alpha band, now sampled independently)
+  rt_alpha_beta_ratio      4.0       - 12.0     Gy         (the linear-quadratic
+                           alpha/beta ratio, rt_beta = rt_alpha / it; clinical
+                           GBM estimates, Pedicini et al. 2014)
   gaussian_seed_mass       100       - 500                 (not in the file; peak
                            density mass / (4 pi t)^(3/2) = 0.2 - 1.0 at the default
                            seed diffusion time t = 5, above the seed floor 0.1)
@@ -100,7 +101,7 @@ DEFAULT_RANGES: dict[str, tuple[float, float]] = {
     "chemo_kill_rate": (0.05 / 75, 2.0 / 75),  # 1/day per mg/m^2
     "chemo_decay_rate": (1.0, 20.0),
     "rt_alpha": (0.02, 0.3),
-    "rt_beta": (0.002, 0.03),  # 1/Gy^2
+    "rt_alpha_beta_ratio": (4.0, 12.0),  # Gy
     "gaussian_seed_mass": (100.0, 500.0),
     "gaussian_seed_scale": (0.5, 2.0),
 }
@@ -190,7 +191,7 @@ def config_entries(base: dict[str, Any], config: dict[str, Any]) -> dict[str, An
         "chemo_kill_rate",
         "chemo_decay_rate",
         "rt_alpha",
-        "rt_beta",
+        "rt_alpha_beta_ratio",
         "gaussian_seed_mass",
         "gaussian_seed_scale",
     ):

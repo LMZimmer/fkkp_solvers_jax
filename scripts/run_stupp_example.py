@@ -50,7 +50,7 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
 
-from fisher_kpp_jax import read_config, solver_from_config  # noqa: E402
+from fisher_kpp_jax import StuppFKPPSolver, read_config  # noqa: E402
 from fisher_kpp_jax.config import jsonable  # noqa: E402
 from fisher_kpp_jax.util import montage_days, render, select_panels  # noqa: E402
 
@@ -117,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         for i, axis in enumerate("xyz")
     }
     config.update(seed_fractions, verbose=False)
-    solver = solver_from_config(config)
+    solver = StuppFKPPSolver(config)
     params = solver.params
     wm = params["white_matter_pbmap"]
     background_path = (
@@ -144,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     # The montage frames plus evenly spaced days sampling the mass curve;
     # the solver is built again with them requested.
     config["snapshot_times"] = [*panel_days, *np.linspace(0.0, stopping_time, args.n_snapshots)]
-    solver = solver_from_config(config)
+    solver = StuppFKPPSolver(config)
     params = solver.params
     print(f"run directory: {run_dir}")
     print(f"seed voxel {seed_voxel} (label {args.seed_label} CoM), slice z={z}, {n_steps} steps (dt={dt:.4g} d)")
@@ -164,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     header = (
         f"D {params['white_matter_diffusivity']:g}, rho {params['rho']:g}, "
         f"ratio {params['diffusivity_ratio']:g}, "
-        f"alpha {params['rt_alpha']:g}, beta {params['rt_beta']:g}, "
+        f"alpha {params['rt_alpha']:g} /Gy, a/b {params['rt_alpha_beta_ratio']:g} Gy, "
         f"kill {params['chemo_kill_rate']:g} /(mg/m^2), decay {params['chemo_decay_rate']:g}, "
         f"TMZ {np.min(params['chemo_doses']):g}-{np.max(params['chemo_doses']):g} mg/m^2"
     )

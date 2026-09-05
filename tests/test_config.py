@@ -5,7 +5,7 @@ Short f64 solves on the 24^3 tissue phantom checking (a) the default
 configs shipped in fisher_kpp_jax/configs/, (b) the ways to construct a
 solver (one mapping, keyword arguments, a config naming the solver), (c)
 the config a solver records and the JSON round trip (read_config /
-write_config / solver_from_config), (d) the three time-step forms and the
+write_config / SolverClass(config)), (d) the three time-step forms and the
 raise to the stability estimate, (e) volumes given as NIfTI paths (voxel
 size and affine from the header, the in-memory marker) and (f)
 Result.save / solve(store_result=True).
@@ -31,7 +31,6 @@ from fisher_kpp_jax import (
     TwoCompartmentWithNutrientFKPPSolver,
     read_config,
     solver_class,
-    solver_from_config,
     write_config,
 )
 from fisher_kpp_jax.base import DEFAULT_CONFIG_DIR, n_steps_from_dt
@@ -130,7 +129,7 @@ def test_default_config_runs(cls):
     horizon are reduced here to keep the test short. The voxel size comes
     from the NIfTI header and is reported as derived."""
     config = cls.get_default_config()
-    solver = solver_from_config({**config, "resolution_factor": 0.2, "stopping_time": 1.0})
+    solver = cls({**config, "resolution_factor": 0.2, "stopping_time": 1.0})
     assert solver.params["voxel_size_mm"] == (1.0, 1.0, 1.0)
     assert solver.config["voxel_size_mm"] is None
     assert not np.allclose(solver.affine, np.eye(4))  # the maps' header affine
@@ -150,7 +149,7 @@ def test_blank_default_config_fails_at_construction(cls, key):
     config = cls.get_default_config()
     assert config[key] is None
     with pytest.raises(ValueError, match=key):
-        solver_from_config(config)
+        cls(config)
 
 
 # --- construction and the recorded config ---
@@ -158,22 +157,27 @@ def test_blank_default_config_fails_at_construction(cls, key):
 
 def test_solver_construction_forms(tissue_phantom):
     """One mapping, keyword arguments and a config with the "solver" entry
-    build the same solver; the entry is checked against the class."""
+    build the same solver. The caller chooses the class: a config without
+    the entry constructs fine, and the entry, if present, is only checked
+    against the class (any mismatch raises, an unregistered name
+    included)."""
     gm, wm = tissue_phantom
     params = fk_params(gm, wm)
+    assert SOLVER_KEY not in params
     reference = FKPPSolver(params)
+    assert reference.config[SOLVER_KEY] == "FKPPSolver"
     named = {**params, SOLVER_KEY: "FKPPSolver"}
-    for solver in (FKPPSolver(**params), FKPPSolver(named), FKPPSolver(**named), solver_from_config(named)):
+    for solver in (FKPPSolver(**params), FKPPSolver(named), FKPPSolver(**named)):
         assert solver.config == reference.config
         assert solver.params.keys() == reference.params.keys()
     with pytest.raises(TypeError, match="not both"):
         FKPPSolver(params, rho=0.1)
     with pytest.raises(ValueError, match="names solver 'FKPPSolver'"):
         TwoCompartmentWithNutrientFKPPSolver(named)
-    with pytest.raises(ValueError, match="unknown solver"):
-        solver_from_config({**params, SOLVER_KEY: "Nope"})
-    with pytest.raises(ValueError, match="no 'solver' entry"):
-        solver_from_config(params)
+    with pytest.raises(ValueError, match="names solver 'FKPPSolver'"):
+        TwoCompartmentWithNutrientFKPPSolver(**named)
+    with pytest.raises(ValueError, match="names solver 'Nope'"):
+        FKPPSolver({**params, SOLVER_KEY: "Nope"})
 
 
 def test_config_records_given_values(tissue_phantom):
@@ -354,7 +358,7 @@ def test_read_write_config(tmp_path, tissue_phantom, phantom_paths):
     with pytest.raises(ValueError, match="white_matter_pbmap must be a NIfTI path"):
         read_config(tmp_path / "bad_volume.json")
     # Round trip through a solver: every parameter, defaults filled in.
-    solver = solver_from_config(config)
+    solver = FKPPSolver(config)
     written = write_config(solver.config, tmp_path / "written.json")
     assert read_config(written) == solver.config
     assert set(solver.config) == FKPPSolver.config_keys() | {SOLVER_KEY}
@@ -362,6 +366,40 @@ def test_read_write_config(tmp_path, tissue_phantom, phantom_paths):
     write_config({**config, "white_matter_pbmap": VOLUME_IN_MEMORY}, tmp_path / "memory.json")
     with pytest.raises(ValueError, match="in-memory"):
         read_config(tmp_path / "memory.json")
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [FKPPSolver, TwoCompartmentWithNutrientFKPPSolver],
+    ids=["FKPPSolver", "TwoCompartmentWithNutrientFKPPSolver"],
+)
+def test_config_round_trip_reproduces_run(tmp_path, tissue_phantom, phantom_paths, cls):
+    """write_config(SolverClass(cfg).config) -> read_config -> SolverClass(...)
+    reproduces a phantom run: the reloaded config equals the recorded one
+    (the class defaults filled in, the volume paths absolute) and the
+    solve gives the identical final field. The written file names the
+    solver, so read_config needs no solver argument."""
+    gm, wm = tissue_phantom
+    config = fk_params(gm, wm, **phantom_paths, n_steps=200)
+    if cls is TwoCompartmentWithNutrientFKPPSolver:
+        config.update(
+            necrosis_rate=0.05,
+            nutrient_threshold=0.3,
+            nutrient_diffusivity=0.5,
+            nutrient_consumption_rate=0.02,
+        )
+    reference = cls(config)
+    written = write_config(reference.config, tmp_path / "round_trip.json")
+    reloaded = read_config(written)
+    assert reloaded[SOLVER_KEY] == cls.__name__ and reloaded == reference.config
+    solver = cls(reloaded)
+    assert solver.config == reference.config
+    expected = reference.solve()
+    result = solver.solve()
+    assert expected.success and result.success, (expected.error, result.error)
+    assert result.n_steps == expected.n_steps and result.final_time == expected.final_time
+    for key, volume in expected.final_state.items():
+        np.testing.assert_array_equal(result.final_state[key], volume)
 
 
 # --- saving results ---
@@ -401,7 +439,7 @@ def test_save_and_reload(tmp_path, tissue_phantom, phantom_paths):
     np.testing.assert_allclose(
         image.get_fdata(), result.final_state["cell_density"], rtol=0, atol=1e-6
     )
-    reloaded = solver_from_config(read_config(out / "config.json"))
+    reloaded = FKPPSolver(read_config(out / "config.json"))
     assert reloaded.config == solver.config
     np.testing.assert_array_equal(
         reloaded.solve().final_state["cell_density"], result.final_state["cell_density"]
