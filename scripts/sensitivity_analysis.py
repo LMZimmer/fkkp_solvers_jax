@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Variance-based (Sobol') sensitivity analysis of the Stupp-protocol forward
-model, fisher_kpp_jax.StuppFKPPSolver.
+model, fisher_kpp_jax.StuppFKPPSolver, on atlas tissue maps.
 
 A Saltelli design over the factors of a search-space file is run through
 the solver (one process per run, one run directory each), quantities of
@@ -8,37 +8,78 @@ interest (QoIs) are read off the saved final cell densities afterwards,
 and SALib's Sobol' estimators give the first-order (S1) and total-order
 (ST) indices of every QoI with bootstrap confidence intervals.
 
+Every run is two solves. The resection cavity and the radiotherapy dose
+map are not inputs but follow from the tumor the run has grown by the
+time of surgery. A growth stage (fisher_kpp_jax.FKPPSolver with the same
+dynamics, seed, grid and time step, stopping_time = resection_time) gives
+the cell density at resection_time; the cavity is the region where that
+density is at or above --cavity-threshold (0.6) and the dose map is the
+cavity grown by --rt-margin-mm (15 mm, Euclidean distance between voxel
+centres in mm) carrying --rt-dose-per-fraction (2 Gy) times the number
+of rt_times, 60 Gy for the 30 fractions of the base schedule, as the
+solver's TOTAL dose. The treated stage (StuppFKPPSolver) then runs the
+whole horizon from the same seed with those two maps. No treatment fires
+before resection (chemo_times and rt_times are shifted with
+resection_time, see below), and the treated stage is stepped on the
+growth stage's grid of times: the growth stage resolves its step dt
+(the base config's steps_per_day / dt, or the solver's stability
+estimate, whose fixed 100-step term makes the estimate depend on the
+horizon) and n_growth steps; the treated stage then gets n_steps =
+n_growth + ceil(time_after_resection / dt) with the horizon rounded up
+to a multiple of dt (time_after_resection grows by less than one step),
+so its dt equals the growth stage's to floating-point precision and its
+step n_growth ends exactly where the growth stage ended. Its config
+states resection_time as the midpoint of that step, (n_growth - 1/2) dt,
+so that the solver's t1 >= resection_time test fires at step n_growth
+whatever the rounding of the state dtype; the sampled resection_time
+(the one the schedule was shifted with) is kept in treatment.json. The
+two step functions differ only by the treatment terms, so the treated
+stage passes through the growth stage's final state up to floating-point
+rounding before it resects it. Both maps are written into the run
+directory as NIfTIs and the treated stage's config.json references them,
+so StuppFKPPSolver(read_config(...)) reproduces the run. A run whose
+density has not reached the threshold by resection_time gets an all-False
+cavity and a zero dose map (nothing visible to resect or irradiate; the
+run continues with chemotherapy only) and is counted in qoi_summary.json
+as n_runs_empty_cavity.
+
 Search-space file (JSON, --search-space; default
 fisher_kpp_jax/search_spaces/stupp_fkpp_search_space.json). It reads like
 a config: "solver" names StuppFKPPSolver (checked against the class the
 script uses), keys starting with '_' are comments and are dropped, every
-other key must be a StuppFKPPSolver parameter and is either
+other key must be a StuppFKPPSolver parameter other than the derived
+resection_cavity and rt_dose, and is either
   - a plain JSON value: a fixed override written into every run config, or
   - {"min": a, "max": b, "scale": "linear" | "log"}: a factor, sampled on
     the unit cube (u in [0, 1)) and transformed to a + u (b - a) for
     "linear" or 10 ** (log10 a + u (log10 b - log10 a)) for "log".
 Everything not listed comes from the base config (--config, default
-scripts/stupp_config_example.json, read with fisher_kpp_jax.read_config so
-every run config carries absolute volume paths). chemo_times and rt_times
-are shifted by resection_time - base resection_time, so the treatment
-block keeps its offset after surgery; the base config's time step is
-copied through (the solver raises a coarse step to its stability estimate
-itself).
+fisher_kpp_jax/configs/StuppFKPPSolver.json, which runs on the atlas
+tissue maps of reference_solves/; read with fisher_kpp_jax.read_config so
+every run config carries absolute volume paths). The base config's
+resection_cavity and rt_dose must be null, since they are derived per
+run. chemo_times and rt_times are shifted by resection_time - base
+resection_time, so the treatment block keeps its offset after surgery;
+the base config's time step is copied through (the solver raises a
+coarse step to its stability estimate itself).
 
 Seed reinterpretation. The three gaussian_seed_{x,y,z}_fraction entries
 must be linear factors within [0, 1], but their sampled value u is NOT the
-fraction of the image axis the solver takes: per axis it is a coordinate
-in the bounding box of the seedable voxels, the voxels carrying the base
-config's resection_cavity label with wm + gm >= min_tissue_fraction (the
+fraction of the image axis the solver takes. The seed may lie in any
+seedable voxel, the voxels with wm + gm >= min_tissue_fraction (the
 solver's flux threshold as resolved from the base config, so a seed never
-lands in a voxel whose faces are flux-masked), fraction =
-lo + u (hi - lo) with lo/hi the box bounds in the solver's (v + 0.5) / n
-fraction convention. The point is then projected onto the nearest
-seedable voxel (Euclidean distance in voxel units) and that voxel's
-fractions go into the config, so the Sobol' indices of the three seed
-factors are those of the seed position within the cavity box. design.csv
-records u, the projected fractions and the voxel; spec.json the box, the
-seedable voxel count and the tissue threshold.
+lands in a voxel whose faces are flux-masked), and u is mapped onto them
+axis by axis in nested ranges: u_x picks a slab i uniformly over the
+range of slabs holding seedable voxels, u_y a row j uniformly over the
+range of seedable rows of that slab, u_z a voxel k uniformly over the
+range of seedable voxels of that column, each index snapped to the
+nearest seedable one when the slab, row or voxel picked is not seedable
+(a hole such as a ventricle). The voxel's fractions (v + 0.5) / n go into
+the config, so the Sobol' indices of the three seed factors are those of
+the seed position across the tissue, u_y and u_z being positions
+relative to the extent of the tissue at the chosen x and (x, y).
+design.csv records u, the fractions and the voxel; spec.json the box of
+the seedable voxels, their count and the tissue threshold.
 
 The design step also reports the chemotherapy budget of the search space:
 the model's total log kill over the schedule is
@@ -64,23 +105,32 @@ Output layout:
     search_space.json    copy of the search-space file used
     base_config.json     the base config as read (absolute volume paths)
     spec.json            search space, base config path, seed, N, k, factor
-                         order, SALib version, seed box, seedable voxel count
+                         order, SALib version, seed box, seedable voxel
+                         count, the treatment derivation settings
     design.csv           one line per run: run_name, index (position in the
                          SALib array), row (block), matrix (A, B, AB:<factor>),
                          u_<factor> and <factor> (the transformed value; seed
                          factors: the projected fractions) for every factor,
                          seed_voxel_i/j/k
-    configs/<run>.json   the run configs
+    configs/<run>.json   the run configs (resection_cavity and rt_dose null)
     logs/<run>.log       stdout/stderr of the runs
-    runs/<run>/          Result.save output (config.json, result.json,
-                         initial_/final_cell_density.nii.gz)
+    runs/<run>/          the treated stage's Result.save output (config.json
+                         with the derived maps' paths and the aligned time
+                         stepping, result.json,
+                         initial_/final_cell_density.nii.gz), the derived
+                         maps resection_cavity.nii.gz (uint8, label 1) and
+                         rt_dose.nii.gz (Gy, total) with their record
+                         treatment.json (settings, voxel counts, volumes,
+                         the time stepping of both stages), and growth/
+                         with the growth stage's Result.save output
     run_status.csv       appended as runs finish: run_name, success,
                          exit_code, wall_time_s, error, final_time, n_steps
     qoi.csv              one line per run: run_name, index, row, matrix,
-                         success, the QoIs, final_time, n_steps, wall_time_s
+                         success, the QoIs, final_time, n_steps, wall_time_s,
+                         cavity_volume_mm3, dose_volume_mm3
     qoi_summary.json     run counts (successes, empty compartments, NaNs,
-                         extinct runs) and per analysed QoI the run/block
-                         accounting of the Sobol' analysis
+                         extinct runs, empty cavities) and per analysed QoI
+                         the run/block accounting of the Sobol' analysis
     sobol.csv            one line per (qoi, factor): S1, S1_conf, ST, ST_conf,
                          S1_half, ST_half, n_blocks_used
     sobol_summary.json   N, k, factor order, SALib version and per QoI the
@@ -116,7 +166,8 @@ M = dV sum_v c_v:
 The four mass-weighted QoIs (centroid_drift, R_g, anisotropy, wm_fraction)
 are NaN when M < 1e-3 dV (no mass left to locate); qoi_summary.json counts
 the runs at or below that floor (n_runs_extinct). final_time, n_steps and
-wall_time_s are carried over from result.json.
+wall_time_s are carried over from result.json, cavity_volume_mm3 and
+dose_volume_mm3 (the derived maps, not analysed) from treatment.json.
 
 Run/block accounting. qoi_summary.json (per_qoi) and sobol_summary.json
 (qois) carry, per analysed QoI, the same fields computed by one function
@@ -149,24 +200,28 @@ reaches the analysis (which then writes sobol_S2.csv as well). SALib
 treats seed 0 as "unseeded", so the bootstrap is seeded with --seed + 1.
 
 Run from the project root, e.g.:
-  python scripts/sensitivity_analysis.py design --output-dir /mnt/Drive4/lucas/SAILOR/sa --name sa_sub15
-  python scripts/sensitivity_analysis.py run --sweep-dir /mnt/Drive4/lucas/SAILOR/sa/sa_sub15 --gpus 1,2,3,5
-  python scripts/sensitivity_analysis.py qoi --sweep-dir /mnt/Drive4/lucas/SAILOR/sa/sa_sub15
-  python scripts/sensitivity_analysis.py analyze --sweep-dir /mnt/Drive4/lucas/SAILOR/sa/sa_sub15
-  python scripts/sensitivity_analysis.py all --output-dir /mnt/Drive4/lucas/SAILOR/sa --name sa_sub15 --gpus 1,2,3,5
+  python scripts/sensitivity_analysis.py design --output-dir /mnt/Drive4/lucas/SAILOR/sa --name sa_atlas
+  python scripts/sensitivity_analysis.py run --sweep-dir /mnt/Drive4/lucas/SAILOR/sa/sa_atlas --gpus 1,2,3,5
+  python scripts/sensitivity_analysis.py qoi --sweep-dir /mnt/Drive4/lucas/SAILOR/sa/sa_atlas
+  python scripts/sensitivity_analysis.py analyze --sweep-dir /mnt/Drive4/lucas/SAILOR/sa/sa_atlas
+  python scripts/sensitivity_analysis.py all --output-dir /mnt/Drive4/lucas/SAILOR/sa --name sa_atlas --gpus 1,2,3,5
   python scripts/sensitivity_analysis.py all --output-dir runs/ --name check --log2-n 2 --gpus ""   (CPU only)
 The run step is resumable: runs whose result.json reports success are
 skipped, partial run directories are deleted and redone; a run whose
-result.json reports a failure counts as partial and is redone on every
-run pass. Nothing is ever written outside <output-dir>/<name>/.
+result.json reports a failure, or whose growth stage failed, counts as
+partial and is redone on every run pass. The treatment derivation
+settings of a design are stored in spec.json and handed to every run, so
+a resumed sweep derives its maps as the first pass did. Nothing is ever
+written outside <output-dir>/<name>/.
 
-Budget: one design point of the example config measured about 7.4 s of
-process wall time on one Quadro RTX 8000 (1 mm SAILOR grid, day-360
-horizon, 3 975 steps) and 2.3 MB of run directory, so N = 1024 and k = 13
-(15 360 runs) is about 7.9 h on 4 GPUs and about 35 GB. The per-run time
-scales with the crop box and the step count, so a sweep over large-D /
-large-rho points (whose stability estimate raises the step count) runs
-longer.
+Budget: one design point of the atlas base config measured about 7 s
+of process wall time on one Quadro RTX 8000 (1 mm atlas grid, day-360
+horizon, two solves compiled separately) and 6 MB of run directory
+(both stages' densities and the two maps), so N = 1024 and k = 13
+(15 360 runs) is about 8 h on 4 GPUs and about 90 GB. The per-run
+time scales with the crop box and the step count, so a sweep over
+large-D / large-rho points (whose stability estimate raises the step
+count) runs longer.
 """
 
 from __future__ import annotations
@@ -204,12 +259,14 @@ sys.path.insert(0, str(_ROOT))
 import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from numpy.typing import NDArray  # noqa: E402
-from scipy.spatial import cKDTree  # noqa: E402
+from scipy.ndimage import distance_transform_edt  # noqa: E402
 
 SOLVER_NAME = "StuppFKPPSolver"
+# The solver of the growth stage (seed to resection_time, no treatment).
+GROWTH_SOLVER_NAME = "FKPPSolver"
 SOLVER_KEY = "solver"
 DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_fkpp_search_space.json"
-DEFAULT_CONFIG = _ROOT / "scripts" / "stupp_config_example.json"
+DEFAULT_CONFIG = _ROOT / "fisher_kpp_jax" / "configs" / "StuppFKPPSolver.json"
 DEFAULT_GPUS = "1,2,3,5"
 DEFAULT_LOG2_N = 10
 DEFAULT_DESIGN_SEED = 1
@@ -220,15 +277,30 @@ TAU_EDEMA = 0.3
 # Below this many voxel volumes of mass the mass-weighted QoIs are NaN.
 MASS_FLOOR_VOXELS = 1e-3
 
+# Treatment derivation from the growth stage's density at resection_time
+# (the defaults of --cavity-threshold, --rt-margin-mm and
+# --rt-dose-per-fraction).
+CAVITY_THRESHOLD = 0.6  # a voxel at or above this density is resected
+RT_MARGIN_MM = 15.0  # the dose region is the cavity grown by this margin
+RT_DOSE_PER_FRACTION_GY = 2.0  # the map holds this times len(rt_times)
+# The volumes derived per run: null in the base config, not in the search
+# space.
+DERIVED_VOLUME_KEYS: tuple[str, ...] = ("resection_cavity", "rt_dose")
+# Files of a run directory besides the treated stage's Result.save output.
+GROWTH_DIR = "growth"  # the growth stage's Result.save output
+CAVITY_FILE = "resection_cavity.nii.gz"  # uint8 mask, CAVITY_LABEL inside
+DOSE_FILE = "rt_dose.nii.gz"  # float32, Gy, total over all fractions
+TREATMENT_FILE = "treatment.json"  # the derivation record
+CAVITY_LABEL = 1
+
 SEED_KEYS: tuple[str, ...] = tuple(f"gaussian_seed_{axis}_fraction" for axis in "xyz")
 # Event times shifted with the sampled resection time.
 SHIFTED_TIME_KEYS: tuple[str, ...] = ("chemo_times", "rt_times")
-# Base config entries the design needs (the volumes for the seed geometry,
-# the times for the shift).
+# Base config entries the design needs (the tissue maps for the seed
+# geometry, the times for the shift and the dose total).
 BASE_KEYS_NEEDED: tuple[str, ...] = (
     "white_matter_pbmap",
     "gray_matter_pbmap",
-    "resection_cavity",
     "resection_time",
     *SHIFTED_TIME_KEYS,
 )
@@ -253,7 +325,9 @@ QOI_NAMES = [
     "voxel_volume",
 ]
 MASS_WEIGHTED_QOIS: tuple[str, ...] = ("centroid_drift", "R_g", "anisotropy", "wm_fraction")
-QOI_COLUMNS = ["run_name", "index", "row", "matrix", "success", *QOI_NAMES, "final_time", "n_steps", "wall_time_s"]
+# Columns carried over from result.json and treatment.json (not analysed).
+CARRIED_COLUMNS = ["final_time", "n_steps", "wall_time_s", "cavity_volume_mm3", "dose_volume_mm3"]
+QOI_COLUMNS = ["run_name", "index", "row", "matrix", "success", *QOI_NAMES, *CARRIED_COLUMNS]
 ANALYSED_QOIS = [
     "log10_mass",
     "V_core",
@@ -280,9 +354,10 @@ COLOR_TEXT = "#0b0b0b"
 
 
 @dataclass(frozen=True)
-class Factor:
+class SearchSpaceParameter:
     """
-    A swept parameter: its physical range and the sampling scale.
+    A swept parameter of the search space, a factor of the design: its
+    physical range and the sampling scale.
 
     Attributes:
         name: The StuppFKPPSolver parameter name.
@@ -307,13 +382,13 @@ class SearchSpace:
     A loaded search-space file.
 
     Attributes:
-        factors: The factors by name, in file order (the factor order of
-            the design).
+        factors: The swept parameters by name, in file order (the factor
+            order of the design).
         overrides: Fixed values written into every run config, by name.
         source: The file's entries as read, comments included.
     """
 
-    factors: dict[str, Factor]
+    factors: dict[str, SearchSpaceParameter]
     overrides: dict[str, Any]
     source: dict[str, Any]
 
@@ -348,8 +423,8 @@ def transform_factor(
     raise ValueError(f"scale must be 'linear' or 'log', got {scale!r}.")
 
 
-def _parse_factor(name: str, entry: Mapping[str, Any], where: str) -> Factor:
-    """A factor from a {"min", "max", "scale"} search-space entry."""
+def _parse_parameter(name: str, entry: Mapping[str, Any], where: str) -> SearchSpaceParameter:
+    """A swept parameter from a {"min", "max", "scale"} search-space entry."""
     if set(entry) != {"min", "max", "scale"}:
         raise ValueError(
             f'{where}: {name} must be {{"min": <float>, "max": <float>, "scale": '
@@ -363,7 +438,7 @@ def _parse_factor(name: str, entry: Mapping[str, Any], where: str) -> Factor:
         raise ValueError(f"{where}: {name}: min < max must be finite, got {low!r}, {high!r}.")
     if scale == "log" and low <= 0:
         raise ValueError(f"{where}: {name}: a log-scaled range needs min > 0, got {low!r}.")
-    return Factor(name, low, high, scale)
+    return SearchSpaceParameter(name, low, high, scale)
 
 
 def load_search_space(
@@ -377,13 +452,14 @@ def load_search_space(
     Args:
         source: Path of the JSON file, or its entries as a mapping.
         config_keys: The solver's parameter names (``config_keys()``);
-            every non-comment key must be one of them or "solver".
+            every non-comment key must be one of them or "solver", and
+            none may be a derived volume (``DERIVED_VOLUME_KEYS``).
         solver_name: The class name a "solver" entry must equal.
 
     Returns:
-        The search space: factors in file order, fixed overrides, the
-        source entries. The three seed fractions must be linear factors
-        within [0, 1].
+        The search space: the swept parameters in file order, fixed
+        overrides, the source entries. The three seed fractions must be
+        linear factors within [0, 1].
     """
     if isinstance(source, Mapping):
         entries: Any = dict(source)
@@ -397,7 +473,7 @@ def load_search_space(
     if not isinstance(entries, Mapping):
         raise ValueError(f"{where}: must be a JSON object.")
     known = frozenset(config_keys)
-    factors: dict[str, Factor] = {}
+    factors: dict[str, SearchSpaceParameter] = {}
     overrides: dict[str, Any] = {}
     for key, value in entries.items():
         if key.startswith("_"):
@@ -411,8 +487,13 @@ def load_search_space(
                 f"{where}: unknown key {key!r}; every key must be a {solver_name} "
                 f"parameter or {SOLVER_KEY!r}."
             )
+        if key in DERIVED_VOLUME_KEYS:
+            raise ValueError(
+                f"{where}: {key} is derived per run from the growth stage's density "
+                "and cannot be swept or overridden."
+            )
         if isinstance(value, Mapping) and set(value) & {"min", "max", "scale"}:
-            factors[key] = _parse_factor(key, value, where)
+            factors[key] = _parse_parameter(key, value, where)
         else:
             overrides[key] = value
     for key in SEED_KEYS:
@@ -420,7 +501,7 @@ def load_search_space(
         if factor is None:
             raise ValueError(
                 f"{where}: {key} must be a linear factor within [0, 1] (its value is "
-                f"reinterpreted inside the cavity box), got {entries.get(key)!r}."
+                f"reinterpreted over the seedable tissue), got {entries.get(key)!r}."
             )
         if factor.scale != "linear" or factor.low < 0 or factor.high > 1:
             raise ValueError(
@@ -436,10 +517,12 @@ def load_search_space(
 @dataclass(frozen=True)
 class SeedGeometry:
     """
-    The seedable voxels of a base config and their bounding box.
+    The seedable voxels of a base config: the mask ``project_seeds`` maps
+    the seed factors onto, and its bounding box.
 
     Attributes:
         shape: The full-resolution grid shape.
+        mask: The seedable voxels, a boolean array of that shape.
         voxels: The seedable voxel indices, (n, 3) int64.
         bbox_lo: Lower box bound per axis, in the (v + 0.5) / n fraction
             convention.
@@ -447,6 +530,7 @@ class SeedGeometry:
     """
 
     shape: tuple[int, int, int]
+    mask: NDArray
     voxels: NDArray
     bbox_lo: NDArray
     bbox_hi: NDArray
@@ -457,18 +541,14 @@ class SeedGeometry:
         return int(len(self.voxels))
 
 
-def seed_geometry(
-    cavity: NDArray, wm: NDArray, gm: NDArray, min_tissue_fraction: float
-) -> SeedGeometry:
+def seed_geometry(wm: NDArray, gm: NDArray, min_tissue_fraction: float) -> SeedGeometry:
     """
-    The seedable voxels: cavity voxels carrying tissue
+    The seedable voxels: every voxel carrying tissue
     (wm + gm >= min_tissue_fraction), so that a seed never lands in a
     voxel whose faces the solver masks from the flux.
 
     Args:
-        cavity: Boolean resection-cavity mask (the solver's loaded
-            ``params["resection_cavity"]``).
-        wm: White-matter probability map, same shape.
+        wm: White-matter probability map.
         gm: Gray-matter probability map, same shape.
         min_tissue_fraction: The solver's flux threshold on wm + gm, as
             resolved from the base config (``params["min_tissue_fraction"]``).
@@ -476,45 +556,73 @@ def seed_geometry(
     Returns:
         The seedable voxels and their bounding box.
     """
-    tissue = np.asarray(wm, dtype=np.float64) + np.asarray(gm, dtype=np.float64)
-    seedable = np.asarray(cavity, dtype=bool) & (tissue >= float(min_tissue_fraction))
+    wm = np.asarray(wm, dtype=np.float64)
+    gm = np.asarray(gm, dtype=np.float64)
+    if wm.ndim != 3 or wm.shape != gm.shape:
+        raise ValueError(f"the tissue maps must be 3D and alike, got {wm.shape} and {gm.shape}.")
+    seedable = (wm + gm) >= float(min_tissue_fraction)
     voxels = np.argwhere(seedable).astype(np.int64)
     if not len(voxels):
         raise ValueError(
-            "no seedable voxel: no cavity voxel carries tissue "
+            "no seedable voxel: no voxel carries tissue "
             f"(wm + gm >= min_tissue_fraction = {float(min_tissue_fraction):g})."
         )
     n = np.asarray(seedable.shape, dtype=np.float64)
     return SeedGeometry(
         shape=tuple(int(s) for s in seedable.shape),
+        mask=seedable,
         voxels=voxels,
         bbox_lo=(voxels.min(axis=0) + 0.5) / n,
         bbox_hi=(voxels.max(axis=0) + 0.5) / n,
     )
 
 
+def _pick_index(u: float, indices: NDArray) -> int:
+    """
+    The index chosen by a unit-interval coordinate over a sorted, nonempty
+    index array: uniform over the integer range [indices[0], indices[-1]]
+    (u in [0, 1) falls into one of its hi - lo + 1 equal bins), snapped to
+    the nearest listed index (the lower one on a tie) when the bin's index
+    is not listed.
+    """
+    lo, hi = int(indices[0]), int(indices[-1])
+    target = min(lo + int(np.floor(float(u) * (hi - lo + 1))), hi)
+    position = int(np.searchsorted(indices, target))
+    candidates = indices[max(position - 1, 0) : position + 1]
+    return int(candidates[np.argmin(np.abs(candidates - target))])
+
+
 def project_seeds(u: NDArray, geometry: SeedGeometry) -> tuple[NDArray, NDArray]:
     """
-    Reinterpret unit-cube seed coordinates inside the seedable box and
-    project them onto the nearest seedable voxel.
+    Map unit-cube seed coordinates onto seedable voxels in nested ranges:
+    u_x picks the slab i over the range of slabs holding seedable voxels,
+    u_y the row j over the range of seedable rows of that slab, u_z the
+    voxel k over the range of seedable voxels of that column, each
+    snapped to the nearest seedable index (``_pick_index``).
 
     Args:
         u: Coordinates in [0, 1], (n, 3) (or (3,) for one point).
-        geometry: The seedable voxels and their box.
+        geometry: The seedable voxels.
 
     Returns:
-        (fractions, voxels): the projected voxels' fractions in the
-        (v + 0.5) / n convention, (n, 3) float64, and the voxels, (n, 3)
-        int64. A point that lies on a seedable voxel projects onto itself.
+        (fractions, voxels): the voxels' fractions in the (v + 0.5) / n
+        convention, (n, 3) float64, and the voxels, (n, 3) int64, every
+        one seedable.
     """
     u = np.atleast_2d(np.asarray(u, dtype=np.float64))
     if u.shape[1:] != (3,):
         raise ValueError(f"seed coordinates must be (n, 3), got {u.shape}.")
+    if not np.all(np.isfinite(u)) or np.any(u < 0) or np.any(u > 1):
+        raise ValueError("seed coordinates must lie in [0, 1].")
+    mask = geometry.mask
+    slabs = np.flatnonzero(mask.any(axis=(1, 2)))
+    voxels = np.empty((len(u), 3), dtype=np.int64)
+    for row, (u_x, u_y, u_z) in enumerate(u):
+        i = _pick_index(u_x, slabs)
+        j = _pick_index(u_y, np.flatnonzero(mask[i].any(axis=1)))
+        k = _pick_index(u_z, np.flatnonzero(mask[i, j]))
+        voxels[row] = (i, j, k)
     n = np.asarray(geometry.shape, dtype=np.float64)
-    fractions = geometry.bbox_lo + u * (geometry.bbox_hi - geometry.bbox_lo)
-    points = fractions * n - 0.5  # continuous voxel coordinates
-    _, nearest = cKDTree(geometry.voxels).query(points)
-    voxels = geometry.voxels[np.asarray(nearest, dtype=np.int64)]
     return (voxels + 0.5) / n, voxels
 
 
@@ -583,7 +691,7 @@ def design_table(
     Args:
         samples: The SALib sample, (n_runs, k) in [0, 1) in factor order.
         space: The search space (its factor order is the column order).
-        geometry: The seedable voxels the seed coordinates are projected in.
+        geometry: The seedable voxels the seed coordinates are mapped onto.
         second_order: Whether the sample holds the B_A rows.
 
     Returns:
@@ -639,15 +747,17 @@ def run_config(
             fractions).
 
     Returns:
-        The run config, with a '_design' comment entry.
+        The run config, with a '_design' comment entry; resection_cavity
+        and rt_dose stay null (``run_one`` derives them).
     """
     config: dict[str, Any] = {
         SOLVER_KEY: base.get(SOLVER_KEY, SOLVER_NAME),
         "_design": (
             "scripts/sensitivity_analysis.py: the base config with the search space's "
             "overrides and the sampled factor values substituted, chemo_times and "
-            "rt_times shifted with resection_time; see design.csv and spec.json in "
-            "the parent directory."
+            "rt_times shifted with resection_time; resection_cavity and rt_dose are "
+            "derived by the run from its growth stage (see treatment in spec.json); "
+            "see design.csv and spec.json in the parent directory."
         ),
     }
     config.update({key: value for key, value in base.items() if key != SOLVER_KEY})
@@ -760,6 +870,46 @@ def chemo_log_kill_range(
     return total_dose, (kill_lo * total_dose / decay_hi, kill_hi * total_dose / decay_lo)
 
 
+def treatment_settings(
+    cavity_threshold: float = CAVITY_THRESHOLD,
+    rt_margin_mm: float = RT_MARGIN_MM,
+    rt_dose_per_fraction: float = RT_DOSE_PER_FRACTION_GY,
+) -> dict[str, float]:
+    """
+    The checked treatment derivation settings, as stored in spec.json
+    under "treatment" and handed to every run.
+
+    Args:
+        cavity_threshold: Density at or above which a voxel at
+            resection_time is resected, in (0, 1].
+        rt_margin_mm: Margin around the cavity of the dose region, >= 0.
+        rt_dose_per_fraction: Dose per fraction in Gy, >= 0; the map holds
+            it times the number of rt_times.
+
+    Returns:
+        {"cavity_threshold", "rt_margin_mm", "rt_dose_per_fraction_gy"}.
+    """
+    threshold, margin, dose = float(cavity_threshold), float(rt_margin_mm), float(rt_dose_per_fraction)
+    if not (0 < threshold <= 1):
+        raise ValueError(f"cavity_threshold must lie in (0, 1], got {threshold!r}.")
+    if not (np.isfinite(margin) and margin >= 0):
+        raise ValueError(f"rt_margin_mm must be a finite nonnegative number, got {margin!r}.")
+    if not (np.isfinite(dose) and dose >= 0):
+        raise ValueError(f"rt_dose_per_fraction must be a finite nonnegative number, got {dose!r}.")
+    return {"cavity_threshold": threshold, "rt_margin_mm": margin, "rt_dose_per_fraction_gy": dose}
+
+
+def spec_treatment_settings(spec: Mapping[str, Any]) -> dict[str, float]:
+    """The treatment derivation settings of a spec.json record
+    (``treatment_settings``; the defaults for a spec without them)."""
+    treatment = spec.get("treatment") or {}
+    return treatment_settings(
+        treatment.get("cavity_threshold", CAVITY_THRESHOLD),
+        treatment.get("rt_margin_mm", RT_MARGIN_MM),
+        treatment.get("rt_dose_per_fraction_gy", RT_DOSE_PER_FRACTION_GY),
+    )
+
+
 def make_design(
     search_space_path: str | Path,
     config_path: str | Path,
@@ -768,6 +918,9 @@ def make_design(
     log2_n: int = DEFAULT_LOG2_N,
     seed: int = DEFAULT_DESIGN_SEED,
     second_order: bool = False,
+    cavity_threshold: float = CAVITY_THRESHOLD,
+    rt_margin_mm: float = RT_MARGIN_MM,
+    rt_dose_per_fraction: float = RT_DOSE_PER_FRACTION_GY,
 ) -> Path:
     """
     Sample the Saltelli design and write the sweep directory (everything
@@ -775,17 +928,21 @@ def make_design(
 
     Args:
         search_space_path: The search-space JSON.
-        config_path: The base config JSON.
+        config_path: The base config JSON (resection_cavity and rt_dose
+            null).
         output_dir: Parent of the sweep directory.
         name: The sweep directory name.
         log2_n: N = 2 ** log2_n base points.
         seed: Seed of the Sobol' sequence.
         second_order: Whether the B_A rows are sampled.
+        cavity_threshold: See ``treatment_settings``.
+        rt_margin_mm: See ``treatment_settings``.
+        rt_dose_per_fraction: See ``treatment_settings``.
 
     Returns:
         The sweep directory <output_dir>/<name>.
     """
-    from fisher_kpp_jax import StuppFKPPSolver, read_config
+    from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, read_config
 
     sweep_dir = Path(output_dir) / name
     if sweep_dir.exists():
@@ -796,20 +953,28 @@ def make_design(
     missing = [key for key in BASE_KEYS_NEEDED if base.get(key) is None]
     if missing:
         raise ValueError(f"the base config {config_path} lacks {missing}, which the design needs.")
+    given = [key for key in DERIVED_VOLUME_KEYS if base.get(key) is not None]
+    if given:
+        raise ValueError(
+            f"the base config {config_path} sets {given}, which every run derives from its "
+            "growth stage; set them to null."
+        )
     space = load_search_space(search_space_path, StuppFKPPSolver.config_keys())
-    # The instance holds the loaded full-resolution volumes (and validates
-    # the base config); no solve is run.
-    solver = StuppFKPPSolver(base)
-    min_tissue_fraction = float(solver.params["min_tissue_fraction"])
-    geometry = seed_geometry(
-        solver.params["resection_cavity"],
-        solver.params["white_matter_pbmap"],
-        solver.params["gray_matter_pbmap"],
-        min_tissue_fraction,
-    )
+    treatment = treatment_settings(cavity_threshold, rt_margin_mm, rt_dose_per_fraction)
+    # The growth stage of the base config: the instance holds the loaded
+    # full-resolution tissue maps and the resolved flux threshold (and
+    # validates the entries the growth stage uses); no solve is run.
+    growth = FKPPSolver(growth_config(base))
+    wm, gm = growth.params["white_matter_pbmap"], growth.params["gray_matter_pbmap"]
+    min_tissue_fraction = float(growth.params["min_tissue_fraction"])
+    # The treated stage's entries (schedule, kill rates, dose model) are
+    # validated with an empty cavity and a zero dose map.
+    StuppFKPPSolver({**base, "resection_cavity": np.zeros(wm.shape, dtype=bool), "rt_dose": np.zeros(wm.shape)})
+    geometry = seed_geometry(wm, gm, min_tissue_fraction)
     samples = saltelli_design(space.names, log2_n, seed, second_order)
     table = design_table(samples, space, geometry, second_order)
     total_dose, log_kill_range = chemo_log_kill_range(base, space)
+    n_fractions = len(space.overrides.get("rt_times", base["rt_times"]))
     spec = {
         "name": name,
         "search_space_path": str(search_space_path),
@@ -834,6 +999,12 @@ def make_design(
         "seed_min_tissue_fraction": min_tissue_fraction,
         "chemo_total_dose": total_dose,
         "chemo_log_kill_range": list(log_kill_range),
+        "growth_solver": GROWTH_SOLVER_NAME,
+        "treatment": {
+            **treatment,
+            "n_fractions": n_fractions,
+            "rt_total_dose_gy": treatment["rt_dose_per_fraction_gy"] * n_fractions,
+        },
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "argv": list(sys.argv),
     }
@@ -879,7 +1050,9 @@ def run_is_done(run_dir: Path) -> bool:
         return False
 
 
-def run_subprocess(sweep_dir: Path, name: str, gpu: str | None) -> dict[str, Any]:
+def run_subprocess(
+    sweep_dir: Path, name: str, gpu: str | None, treatment: Mapping[str, float]
+) -> dict[str, Any]:
     """
     Run one design point in its own process (``run-one``) and read its
     result record back.
@@ -888,10 +1061,14 @@ def run_subprocess(sweep_dir: Path, name: str, gpu: str | None) -> dict[str, Any
         sweep_dir: The sweep directory.
         name: The run name.
         gpu: The CUDA device id of the slot, None for the CPU.
+        treatment: The treatment derivation settings
+            (``treatment_settings``).
 
     Returns:
-        A run_status.csv record.
+        A run_status.csv record. A run that failed in its growth stage
+        reports that stage's error, prefixed "growth stage:".
     """
+    run_dir = sweep_dir / "runs" / name
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -899,7 +1076,13 @@ def run_subprocess(sweep_dir: Path, name: str, gpu: str | None) -> dict[str, Any
         "--config",
         str(sweep_dir / "configs" / f"{name}.json"),
         "--run-dir",
-        str(sweep_dir / "runs" / name),
+        str(run_dir),
+        "--cavity-threshold",
+        str(treatment["cavity_threshold"]),
+        "--rt-margin-mm",
+        str(treatment["rt_margin_mm"]),
+        "--rt-dose-per-fraction",
+        str(treatment["rt_dose_per_fraction_gy"]),
     ]
     env = dict(os.environ)
     env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -919,7 +1102,8 @@ def run_subprocess(sweep_dir: Path, name: str, gpu: str | None) -> dict[str, Any
         "final_time": None,
         "n_steps": None,
     }
-    record_path = sweep_dir / "runs" / name / "result.json"
+    record_path = run_dir / "result.json"
+    growth_path = run_dir / GROWTH_DIR / "result.json"
     if record_path.is_file():
         result = read_json(record_path)
         record.update(
@@ -928,13 +1112,18 @@ def run_subprocess(sweep_dir: Path, name: str, gpu: str | None) -> dict[str, Any
             final_time=result.get("final_time"),
             n_steps=result.get("n_steps"),
         )
+    elif growth_path.is_file():
+        growth = read_json(growth_path)
+        if not growth.get("success"):
+            record["error"] = f"growth stage: {growth.get('error') or 'failed'}"
     return record
 
 
 def run_sweep(sweep_dir: str | Path, gpus: Sequence[str], jobs_per_gpu: int = 1) -> dict[str, int]:
     """
     Run every design point that is not done yet, one subprocess per run,
-    on the given GPU slots (a thread per slot pulling from a queue).
+    on the given GPU slots (a thread per slot pulling from a queue). The
+    treatment derivation settings come from the sweep's spec.json.
 
     Args:
         sweep_dir: The sweep directory of ``make_design``.
@@ -946,6 +1135,7 @@ def run_sweep(sweep_dir: str | Path, gpus: Sequence[str], jobs_per_gpu: int = 1)
         Counts: skipped (already successful), ok, failed.
     """
     sweep_dir = Path(sweep_dir)
+    treatment = spec_treatment_settings(read_json(sweep_dir / "spec.json"))
     pending: list[str] = []
     counts = {"skipped": 0, "ok": 0, "failed": 0}
     for record in read_csv(sweep_dir / "design.csv"):
@@ -979,7 +1169,7 @@ def run_sweep(sweep_dir: str | Path, gpus: Sequence[str], jobs_per_gpu: int = 1)
                     name = queue.get_nowait()
                 except Empty:
                     return
-                record = run_subprocess(sweep_dir, name, gpu)
+                record = run_subprocess(sweep_dir, name, gpu, treatment)
                 with lock:
                     writer.writerow({key: _csv_cell(record.get(key)) for key in STATUS_COLUMNS})
                     handle.flush()
@@ -1001,24 +1191,199 @@ def run_sweep(sweep_dir: str | Path, gpus: Sequence[str], jobs_per_gpu: int = 1)
     return counts
 
 
-def run_one(config_path: str | Path, run_dir: str | Path) -> int:
+def growth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """
-    Solve one run config and save the Result into run_dir
-    (``solve(store_result=True, outdir=run_dir)``).
+    The growth stage's config of a run config: the FKPPSolver entries of
+    the StuppFKPPSolver config (tissue maps, dynamics, seed, grid, time
+    step, stopping settings) with stopping_time = resection_time, so the
+    stage ends at the moment of surgery.
+
+    Args:
+        config: A StuppFKPPSolver config (``read_config``).
 
     Returns:
-        0 on success, 1 if the solver reports a failure.
+        The FKPPSolver config, "solver" entry included.
     """
-    from fisher_kpp_jax import StuppFKPPSolver, read_config
+    from fisher_kpp_jax import FKPPSolver
 
-    solver = StuppFKPPSolver(read_config(config_path, solver=StuppFKPPSolver))
-    result = solver.solve(store_result=True, outdir=run_dir)
+    keys = FKPPSolver.config_keys() - {"stopping_time"}
+    growth: dict[str, Any] = {SOLVER_KEY: GROWTH_SOLVER_NAME}
+    growth.update({key: value for key, value in config.items() if key in keys})
+    growth["stopping_time"] = float(config["resection_time"])
+    return growth
+
+
+def treatment_maps(
+    density: NDArray,
+    zooms: Sequence[float],
+    cavity_threshold: float,
+    rt_margin_mm: float,
+    rt_total_dose_gy: float,
+) -> tuple[NDArray, NDArray]:
+    """
+    The resection cavity and the total dose map of a cell density at
+    resection_time.
+
+    Args:
+        density: The cell density on the full-resolution grid.
+        zooms: Voxel size per axis in mm.
+        cavity_threshold: The cavity is density >= it.
+        rt_margin_mm: The dose region is the cavity grown by this margin:
+            every voxel whose centre lies within it of a cavity voxel's
+            centre (Euclidean distance in mm).
+        rt_total_dose_gy: The dose of the region, the solver's TOTAL dose
+            over all fractions.
+
+    Returns:
+        (cavity, dose): a boolean mask and a float32 map in Gy of the
+        density's shape; both empty (all False, all zero) when no voxel
+        reaches the threshold.
+    """
+    density = np.asarray(density, dtype=np.float64)
+    if density.ndim != 3:
+        raise ValueError(f"the density must be 3D, got shape {density.shape}.")
+    cavity = density >= float(cavity_threshold)
+    dose = np.zeros(density.shape, dtype=np.float32)
+    if cavity.any():
+        distance = distance_transform_edt(~cavity, sampling=np.asarray(zooms, dtype=np.float64))
+        dose[distance <= float(rt_margin_mm)] = rt_total_dose_gy
+    return cavity, dose
+
+
+def align_treated_config(config: Mapping[str, Any], n_growth: int, dt: float) -> dict[str, Any]:
+    """
+    The treated stage's config stepped on the growth stage's grid of
+    times: n_steps = n_growth + ceil(time_after_resection / dt), the
+    horizon rounded up to (n_steps) dt, resection_time stated as the
+    midpoint of step n_growth so that step fires the resection (see the
+    module docstring).
+
+    Args:
+        config: The run config (resection_cavity and rt_dose set).
+        n_growth: The growth stage's step count.
+        dt: The growth stage's step, days.
+
+    Returns:
+        The config with resection_time, time_after_resection and n_steps
+        replaced and dt / steps_per_day unset.
+    """
+    n_growth, dt = int(n_growth), float(dt)
+    if n_growth < 1 or not (np.isfinite(dt) and dt > 0):
+        raise ValueError(f"the growth stage must have run: n_steps={n_growth}, dt={dt}.")
+    n_after = int(np.ceil(float(config["time_after_resection"]) / dt - 1e-9))
+    aligned = dict(config)
+    aligned["resection_time"] = (n_growth - 0.5) * dt
+    aligned["time_after_resection"] = (n_after + 0.5) * dt
+    aligned["n_steps"] = n_growth + n_after
+    aligned["dt"] = None
+    aligned["steps_per_day"] = None
+    return aligned
+
+
+def _print_stage(stage: str, result: Any) -> None:
+    """The console line of one stage's Result."""
     status = "ok" if result.success else f"FAILED: {result.error}"
     print(
-        f"{status} (final_time={result.final_time:g}, n_steps={result.n_steps}, "
+        f"{stage}: {status} (final_time={result.final_time:g}, n_steps={result.n_steps}, "
         f"wall={result.wall_time_s:.1f} s)",
         flush=True,
     )
+
+
+def run_one(
+    config_path: str | Path,
+    run_dir: str | Path,
+    cavity_threshold: float = CAVITY_THRESHOLD,
+    rt_margin_mm: float = RT_MARGIN_MM,
+    rt_dose_per_fraction: float = RT_DOSE_PER_FRACTION_GY,
+) -> int:
+    """
+    Solve one run config into run_dir in two stages: the growth stage
+    (``growth_config``, saved into run_dir/growth), the treatment maps
+    derived from its final density (``treatment_maps``, saved as
+    resection_cavity.nii.gz, rt_dose.nii.gz and treatment.json) and the
+    treated stage with those maps on the growth stage's time steps
+    (``align_treated_config``; ``solve(store_result=True,
+    outdir=run_dir)``, whose config.json references the maps).
+
+    Args:
+        config_path: The run config (resection_cavity and rt_dose null).
+        run_dir: The run directory.
+        cavity_threshold: See ``treatment_settings``.
+        rt_margin_mm: See ``treatment_settings``.
+        rt_dose_per_fraction: See ``treatment_settings``.
+
+    Returns:
+        0 on success, 1 if either stage reports a failure.
+    """
+    from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, read_config
+
+    treatment = treatment_settings(cavity_threshold, rt_margin_mm, rt_dose_per_fraction)
+    run_dir = Path(run_dir).resolve()
+    config = read_config(config_path, solver=StuppFKPPSolver)
+    given = [key for key in DERIVED_VOLUME_KEYS if config.get(key) is not None]
+    if given:
+        raise ValueError(f"run config {config_path} sets {given}, which the run derives; set them to null.")
+    growth_solver = FKPPSolver(growth_config(config))
+    growth = growth_solver.solve(store_result=True, outdir=run_dir / GROWTH_DIR)
+    _print_stage("growth stage", growth)
+    if not growth.success:
+        return 1
+    density = np.asarray(growth.final_state["cell_density"], dtype=np.float64)
+    zooms = tuple(float(v) for v in growth_solver.params["voxel_size_mm"])
+    n_fractions = len(config["rt_times"])
+    total_dose = treatment["rt_dose_per_fraction_gy"] * n_fractions
+    cavity, dose = treatment_maps(
+        density, zooms, treatment["cavity_threshold"], treatment["rt_margin_mm"], total_dose
+    )
+    affine = np.eye(4) if growth.affine is None else np.asarray(growth.affine, dtype=np.float64)
+    nib.save(nib.Nifti1Image(cavity.astype(np.uint8) * CAVITY_LABEL, affine), str(run_dir / CAVITY_FILE))
+    nib.save(nib.Nifti1Image(dose, affine), str(run_dir / DOSE_FILE))
+    voxel_volume = float(np.prod(zooms))
+    n_cavity, n_dose = int(cavity.sum()), int(np.count_nonzero(dose))
+    record = {
+        **treatment,
+        "n_fractions": n_fractions,
+        "rt_total_dose_gy": total_dose,
+        "resection_time": float(config["resection_time"]),
+        "growth_final_time": growth.final_time,
+        "growth_n_steps": growth.n_steps,
+        "growth_dt": growth.dt,
+        "max_density_at_resection": float(density.max()),
+        "voxel_volume_mm3": voxel_volume,
+        "n_cavity_voxels": n_cavity,
+        "n_dose_voxels": n_dose,
+        "cavity_volume_mm3": voxel_volume * n_cavity,
+        "dose_volume_mm3": voxel_volume * n_dose,
+        "cavity_file": CAVITY_FILE,
+        "dose_file": DOSE_FILE,
+    }
+    write_json(run_dir / TREATMENT_FILE, record)
+    print(
+        f"treatment: cavity {n_cavity} voxels (density >= {treatment['cavity_threshold']:g}, max "
+        f"{record['max_density_at_resection']:.3f}), dose region {n_dose} voxels at {total_dose:g} Gy",
+        flush=True,
+    )
+    config["resection_cavity"] = {"segmentation": str(run_dir / CAVITY_FILE), "label": CAVITY_LABEL}
+    config["rt_dose"] = str(run_dir / DOSE_FILE)
+    treated = align_treated_config(config, growth.n_steps, growth.dt)
+    result = StuppFKPPSolver(treated).solve(store_result=True, outdir=run_dir)
+    _print_stage("treated stage", result)
+    record.update(
+        resection_step=int(growth.n_steps),
+        resection_time_config=treated["resection_time"],
+        time_after_resection_config=treated["time_after_resection"],
+        growth_dt=growth.dt,
+        treated_dt=result.dt,
+        treated_n_steps=result.n_steps,
+    )
+    write_json(run_dir / TREATMENT_FILE, record)
+    if result.dt is not None and abs(result.dt - growth.dt) > 1e-9 * growth.dt:
+        print(
+            f"WARNING: the treated stage's step {result.dt:g} differs from the growth stage's "
+            f"{growth.dt:g} (the solver raised it to its stability estimate).",
+            flush=True,
+        )
     return 0 if result.success else 1
 
 
@@ -1115,9 +1480,10 @@ def qoi_record(
 ) -> dict[str, Any]:
     """
     The qoi.csv record of one run: the design bookkeeping, the result
-    record's final_time / n_steps / wall_time_s and, for a successful run,
-    the QoIs of its final field. The field's shape and zooms must match
-    the base config's white-matter map.
+    record's final_time / n_steps / wall_time_s, the derived maps' volumes
+    from treatment.json and, for a successful run, the QoIs of its final
+    field. The field's shape and zooms must match the base config's
+    white-matter map.
     """
     name = design_record["run_name"]
     run_dir = sweep_dir / "runs" / name
@@ -1135,6 +1501,12 @@ def qoi_record(
     record.update(
         final_time=result.get("final_time"), n_steps=result.get("n_steps"), wall_time_s=result.get("wall_time_s")
     )
+    treatment_path = run_dir / TREATMENT_FILE
+    if treatment_path.is_file():
+        treatment = read_json(treatment_path)
+        record.update(
+            cavity_volume_mm3=treatment.get("cavity_volume_mm3"), dose_volume_mm3=treatment.get("dose_volume_mm3")
+        )
     field_path = run_dir / "final_cell_density.nii.gz"
     if not result.get("success") or not field_path.is_file():
         return record
@@ -1275,7 +1647,8 @@ def qoi_summary(
     """
     The qoi_summary.json record: the global run counts (successes, empty
     compartments per threshold, NaN mass-weighted QoIs, extinct runs at or
-    below the mass floor) and, per analysed QoI, ``response_accounting``.
+    below the mass floor, runs whose derived cavity is empty) and, per
+    analysed QoI, ``response_accounting``.
     """
     successes = [r for r in records if _is_success(r)]
     return {
@@ -1295,6 +1668,7 @@ def qoi_summary(
         "n_runs_extinct": sum(
             1 for r in successes if as_float(r["mass"]) <= MASS_FLOOR_VOXELS * as_float(r["voxel_volume"])
         ),
+        "n_runs_empty_cavity": sum(1 for r in successes if as_float(r.get("cavity_volume_mm3")) == 0),
         "per_qoi": {qoi: response_accounting(records, qoi, n_blocks, size) for qoi in ANALYSED_QOIS},
     }
 
@@ -1668,6 +2042,25 @@ def _add_design_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log2-n", type=int, default=DEFAULT_LOG2_N, help="N = 2 ** log2_n base points")
     parser.add_argument("--seed", type=int, default=DEFAULT_DESIGN_SEED, help="seed of the Sobol' sequence")
     parser.add_argument("--second-order", action="store_true", help="sample the B_A rows too (N (2k + 2) runs)")
+    _add_treatment_args(parser)
+
+
+def _add_treatment_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--cavity-threshold",
+        type=float,
+        default=CAVITY_THRESHOLD,
+        help="cell density at or above which a voxel at resection_time is resected",
+    )
+    parser.add_argument(
+        "--rt-margin-mm", type=float, default=RT_MARGIN_MM, help="margin around the cavity of the dose region, mm"
+    )
+    parser.add_argument(
+        "--rt-dose-per-fraction",
+        type=float,
+        default=RT_DOSE_PER_FRACTION_GY,
+        help="dose per fraction in Gy; the dose map holds it times len(rt_times)",
+    )
 
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
@@ -1693,9 +2086,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run the design points (resumable)")
     run.add_argument("--sweep-dir", required=True)
     _add_run_args(run)
-    one = commands.add_parser("run-one", help="solve one run config into a run directory")
+    one = commands.add_parser("run-one", help="solve one run config into a run directory (both stages)")
     one.add_argument("--config", required=True)
     one.add_argument("--run-dir", required=True)
+    _add_treatment_args(one)
     qoi = commands.add_parser("qoi", help="compute the QoIs of the finished runs")
     qoi.add_argument("--sweep-dir", required=True)
     _add_qoi_args(qoi)
@@ -1717,7 +2111,16 @@ def design_command(args: argparse.Namespace) -> Path:
     os.environ["JAX_PLATFORMS"] = "cpu"
     try:
         sweep_dir = make_design(
-            args.search_space, args.config, args.output_dir, args.name, args.log2_n, args.seed, args.second_order
+            args.search_space,
+            args.config,
+            args.output_dir,
+            args.name,
+            args.log2_n,
+            args.seed,
+            args.second_order,
+            args.cavity_threshold,
+            args.rt_margin_mm,
+            args.rt_dose_per_fraction,
         )
     finally:
         if previous is None:
@@ -1742,6 +2145,12 @@ def design_command(args: argparse.Namespace) -> Path:
         f"chemotherapy: total dose {spec['chemo_total_dose']:g} mg/m^2, total log kill "
         f"kill * dose / decay in [{low:.3g}, {high:.3g}] over the factor ranges"
     )
+    treatment = spec["treatment"]
+    print(
+        f"treatment maps per run from the {spec['growth_solver']} growth stage at resection_time: cavity = "
+        f"density >= {treatment['cavity_threshold']:g}, dose region = cavity + {treatment['rt_margin_mm']:g} mm at "
+        f"{treatment['rt_total_dose_gy']:g} Gy ({treatment['n_fractions']} x {treatment['rt_dose_per_fraction_gy']:g} Gy)"
+    )
     return sweep_dir
 
 
@@ -1756,7 +2165,7 @@ def qoi_command(sweep_dir: Path, tau_core: float, tau_edema: float, workers: int
         f"qoi.csv: {summary['n_success']}/{summary['n_runs']} successful runs; empty core "
         f"{summary['n_empty_core']}, empty edema {summary['n_empty_edema']}, NaN mass-weighted "
         f"{summary['n_nan_mass_weighted']}, NaN anisotropy {summary['n_nan_anisotropy']}, extinct "
-        f"{summary['n_runs_extinct']}",
+        f"{summary['n_runs_extinct']}, empty cavity {summary['n_runs_empty_cavity']}",
         flush=True,
     )
     for qoi, accounting in summary["per_qoi"].items():
@@ -1767,7 +2176,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "run-one":
         try:
-            return run_one(args.config, args.run_dir)
+            return run_one(
+                args.config, args.run_dir, args.cavity_threshold, args.rt_margin_mm, args.rt_dose_per_fraction
+            )
         except Exception:  # noqa: BLE001 - the log gets the traceback, the parent the exit code
             traceback.print_exc()
             return 1

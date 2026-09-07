@@ -7,10 +7,12 @@ end to end), (2) SALib's Saltelli row order as the script assumes it,
 verified against the installed version, (3) the factor transforms and the
 search-space checks, (4) the design bookkeeping on the 24^3 phantom with
 the shipped search space (every AB run differs from its block's A run only
-through its factor, projected seeds lie on seedable voxels, every config
-constructs a StuppFKPPSolver), (5) the QoIs on synthetic Gaussian fields
-against closed forms and (6) the whole pipeline on the phantom on the CPU
-(design, run, qoi, analyze) with a small search space.
+through its factor, seeds lie on seedable tissue voxels, every config
+constructs a StuppFKPPSolver once the derived maps are given) and the
+nested-range seed mapping, (5) the growth stage config, the treatment
+maps and one two-stage run on the phantom, (6) the QoIs on synthetic
+Gaussian fields against closed forms and (7) the whole pipeline on the
+phantom on the CPU (design, run, qoi, analyze) with a small search space.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import nibabel as nib
 import numpy as np
 import pytest
 
-from fisher_kpp_jax import SOLVER_KEY, StuppFKPPSolver, read_config
+from fisher_kpp_jax import SOLVER_KEY, FKPPSolver, StuppFKPPSolver, read_config
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "sensitivity_analysis.py"
 SHIPPED_SEARCH_SPACE = (
@@ -48,7 +50,8 @@ sa = _load_script()
 
 CONFIG_KEYS = StuppFKPPSolver.config_keys()
 SEED_KEYS = tuple(f"gaussian_seed_{axis}_fraction" for axis in "xyz")
-CAVITY_LABEL = 4
+# The phantom's flux threshold: seedable = wm + gm >= it.
+MIN_TISSUE_FRACTION = 0.1
 
 
 def _seed_entries(**overrides) -> dict:
@@ -65,32 +68,16 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def _cube_cavity(shape: tuple[int, int, int]) -> np.ndarray:
-    """A 4^3 cube inside the phantom's white-matter core, off the centre."""
-    cavity = np.zeros(shape, dtype=bool)
-    c = shape[0] // 2
-    cavity[c - 1 : c + 3, c - 2 : c + 2, c - 2 : c + 2] = True
-    return cavity
-
-
 @pytest.fixture
 def phantom_base(tmp_path: Path, tissue_phantom) -> dict:
-    """A phantom base config on disk: WM/GM maps, a labelled segmentation
-    with the cube cavity as label 4 and a uniform total dose, plus the
-    config JSON (a short treated run, the step count fixed so that every
-    design point shares one compiled scan)."""
+    """A phantom base config on disk: WM/GM maps plus the config JSON (a
+    short treated run with resection_cavity and rt_dose null, as the
+    script derives them; 12 days of growth take the seed's density past
+    the 0.6 cavity threshold)."""
     gm, wm = tissue_phantom
-    segmentation = np.zeros(gm.shape, dtype=np.int16)
-    segmentation[_cube_cavity(gm.shape)] = CAVITY_LABEL
-    segmentation[0, 0, 0] = 3
     volumes = tmp_path / "volumes"
     volumes.mkdir()
-    for name, data in (
-        ("wm", wm),
-        ("gm", gm),
-        ("seg", segmentation),
-        ("dose", np.full(gm.shape, 6.0, dtype=np.float32)),
-    ):
+    for name, data in (("wm", wm), ("gm", gm)):
         nib.save(nib.Nifti1Image(np.asarray(data), np.eye(4)), str(volumes / f"{name}.nii.gz"))
     config = {
         SOLVER_KEY: "StuppFKPPSolver",
@@ -104,22 +91,24 @@ def phantom_base(tmp_path: Path, tissue_phantom) -> dict:
         "gaussian_seed_z_fraction": 0.5,
         "resolution_factor": 1.0,
         "precision": "f32",
-        "n_steps": 400,
-        "resection_time": 2.0,
-        "time_after_resection": 40.0,
-        "resection_cavity": {"segmentation": "volumes/seg.nii.gz", "label": CAVITY_LABEL},
-        "chemo_times": [3.3, 5.3],
+        "steps_per_day": 110,
+        "min_tissue_fraction": MIN_TISSUE_FRACTION,
+        "resection_time": 12.0,
+        "time_after_resection": 30.0,
+        "resection_cavity": None,
+        "chemo_times": [14.0, 16.0],
         "chemo_doses": [75.0, 150.0],
         "chemo_kill_rate": 0.1 / 75,
         "chemo_decay_rate": 0.5,
-        "rt_times": [3.3, 5.3],
-        "rt_dose": "volumes/dose.nii.gz",
+        "rt_times": [14.0, 16.0],
+        "rt_dose": None,
         "rt_alpha": 0.1,
         "rt_alpha_beta_ratio": 10.0,
     }
     path = tmp_path / "base.json"
     path.write_text(json.dumps(config, indent=1))
-    return {"path": path, "gm": gm, "wm": wm, "cavity": _cube_cavity(gm.shape), "tmp_path": tmp_path}
+    seedable = (gm + wm) >= MIN_TISSUE_FRACTION
+    return {"path": path, "gm": gm, "wm": wm, "seedable": seedable, "tmp_path": tmp_path}
 
 
 # --- (1) Ishigami ---
@@ -197,8 +186,8 @@ def test_salib_row_order(second_order):
 def test_transforms():
     np.testing.assert_allclose(sa.transform_factor([0.0, 0.5, 1.0], 0.01, 100.0, "log"), [0.01, 1.0, 100.0])
     np.testing.assert_allclose(sa.transform_factor([0.0, 0.5, 1.0], 30.0, 200.0, "linear"), [30.0, 115.0, 200.0])
-    factor = sa.Factor("rho", 0.0089228, 0.3449, "log")
-    np.testing.assert_allclose(factor.transform(0.5), np.sqrt(0.0089228 * 0.3449))
+    parameter = sa.SearchSpaceParameter("rho", 0.0089228, 0.3449, "log")
+    np.testing.assert_allclose(parameter.transform(0.5), np.sqrt(0.0089228 * 0.3449))
     assert sa.transform_factor(np.zeros((2, 3)), 1.0, 2.0, "linear").shape == (2, 3)
     with pytest.raises(ValueError, match="scale"):
         sa.transform_factor(0.5, 1.0, 2.0, "sqrt")
@@ -206,13 +195,14 @@ def test_transforms():
 
 def test_load_search_space():
     """The shipped file loads with 13 factors in file order and no
-    override; a mapping loads too; unknown keys, a bad scale, a
-    mismatching solver, seed entries off [0, 1] or missing each raise."""
+    override; a mapping loads too; unknown keys, a derived volume, a bad
+    scale, a mismatching solver, seed entries off [0, 1] or missing each
+    raise."""
     space = sa.load_search_space(SHIPPED_SEARCH_SPACE, CONFIG_KEYS)
     assert len(space.names) == 13 and space.overrides == {}
     assert space.names[:3] == ["rho", "white_matter_diffusivity", "diffusivity_ratio"]
     assert space.names[-3:] == list(SEED_KEYS)
-    assert space.factors["rho"] == sa.Factor("rho", 0.0089228, 0.3449, "log")
+    assert space.factors["rho"] == sa.SearchSpaceParameter("rho", 0.0089228, 0.3449, "log")
     assert space.factors["rt_alpha_beta_ratio"].scale == "linear"
     assert "_note" in space.source and "_note" not in space.factors
     entries = _seed_entries(solver="StuppFKPPSolver", rho={"min": 0.1, "max": 0.2, "scale": "log"}, verbose=True)
@@ -222,6 +212,10 @@ def test_load_search_space():
         sa.load_search_space(_seed_entries(D={"min": 0.1, "max": 0.2, "scale": "log"}), CONFIG_KEYS)
     with pytest.raises(ValueError, match="unknown key 'rt_beta'"):
         sa.load_search_space(_seed_entries(rt_beta=0.006), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="rt_dose is derived per run"):
+        sa.load_search_space(_seed_entries(rt_dose="dose.nii.gz"), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="resection_cavity is derived per run"):
+        sa.load_search_space(_seed_entries(resection_cavity={"segmentation": "s.nii.gz", "label": 1}), CONFIG_KEYS)
     with pytest.raises(ValueError, match="scale"):
         sa.load_search_space(_seed_entries(rho={"min": 0.1, "max": 0.2, "scale": "sqrt"}), CONFIG_KEYS)
     with pytest.raises(ValueError, match="min < max"):
@@ -257,9 +251,11 @@ def test_design_bookkeeping(phantom_base):
     with one A, one B and one AB per factor in every block; every AB
     config differs from its block's A config only through its factor (the
     seed fractions for a seed factor, the shifted event times for
-    resection_time); every projected seed is a seedable voxel; a point on
-    a seedable voxel projects onto itself; every config reads and
-    constructs a solver. The design is never overwritten."""
+    resection_time); every seed is a seedable tissue voxel whose fractions
+    the config holds; the derived volumes stay null in the run configs
+    and every config constructs a solver once they are given; a base
+    config that sets them, or lacks the tissue maps, is refused; the
+    design is never overwritten."""
     tmp_path = phantom_base["tmp_path"]
     sweep_dir = sa.make_design(SHIPPED_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "design", log2_n=2, seed=3)
     assert sweep_dir == tmp_path / "sa" / "design"
@@ -270,9 +266,15 @@ def test_design_bookkeeping(phantom_base):
     k, n_blocks = spec["k"], spec["N"]
     assert (k, n_blocks, spec["n_runs"], spec["block_size"]) == (13, 4, 60, 15)
     assert spec["salib_version"] and spec["seed"] == 3 and not spec["second_order"]
+    assert spec["growth_solver"] == "FKPPSolver"
+    assert spec["treatment"] == {
+        "cavity_threshold": 0.6, "rt_margin_mm": 15.0, "rt_dose_per_fraction_gy": 2.0,
+        "n_fractions": 2, "rt_total_dose_gy": 4.0,
+    }
     assert (sweep_dir / "search_space.json").read_text() == SHIPPED_SEARCH_SPACE.read_text()
     base = read_config(sweep_dir / "base_config.json")
     assert Path(base["white_matter_pbmap"]).is_absolute()
+    assert base["resection_cavity"] is None and base["rt_dose"] is None
     design = _read_csv(sweep_dir / "design.csv")
     assert len(design) == n_blocks * (k + 2)
     n_seed_changes = 0
@@ -282,6 +284,7 @@ def test_design_bookkeeping(phantom_base):
         block = [r for r in design if int(r["row"]) == j]
         assert [r["matrix"] for r in block] == ["A", *(f"AB:{name}" for name in names), "B"]
         a = _config_entries(sweep_dir / "configs" / f"{block[0]['run_name']}.json")
+        assert a["resection_cavity"] is None and a["rt_dose"] is None
         assert block[0]["run_name"] == f"r{j:04d}_A" and block[-1]["run_name"] == f"r{j:04d}_B"
         for record in block[1:-1]:
             factor = record["matrix"].split(":")[1]
@@ -291,8 +294,8 @@ def test_design_bookkeeping(phantom_base):
             u_differing = {name for name in names if record[f"u_{name}"] != block[0][f"u_{name}"]}
             assert u_differing == {factor}
             if factor in SEED_KEYS:
-                # The projection may land on the A run's voxel (a 4-voxel-wide
-                # cavity), so only the seed fractions may differ.
+                # The mapping may land on the A run's voxel, so only the
+                # seed fractions may differ.
                 assert differing <= set(SEED_KEYS)
                 n_seed_changes += bool(differing)
             elif factor == "resection_time":
@@ -304,13 +307,16 @@ def test_design_bookkeeping(phantom_base):
                 assert differing == {factor}
             assert ab[factor] == float(record[factor])
     assert n_seed_changes > 0
-    # Projected seeds: seedable voxels (cavity with wm + gm >= the solver's
+    # Seeds: seedable tissue voxels (wm + gm >= the solver's
     # min_tissue_fraction), the config holds their fractions.
     threshold = spec["seed_min_tissue_fraction"]
-    assert threshold == StuppFKPPSolver(base).params["min_tissue_fraction"] == 0.1
-    seedable = phantom_base["cavity"] & ((phantom_base["wm"] + phantom_base["gm"]) >= threshold)
+    assert threshold == FKPPSolver(sa.growth_config(base)).params["min_tissue_fraction"] == MIN_TISSUE_FRACTION
+    seedable = phantom_base["seedable"]
     n = np.asarray(seedable.shape, dtype=np.float64)
-    assert spec["n_seedable_voxels"] == int(seedable.sum()) == 64
+    assert spec["n_seedable_voxels"] == int(seedable.sum()) == 3112
+    voxels = np.argwhere(seedable)
+    np.testing.assert_allclose(spec["seed_bbox_lo"], (voxels.min(axis=0) + 0.5) / n)
+    np.testing.assert_allclose(spec["seed_bbox_hi"], (voxels.max(axis=0) + 0.5) / n)
     for record in design:
         voxel = np.array([int(record[f"seed_voxel_{ijk}"]) for ijk in "ijk"])
         assert seedable[tuple(voxel)]
@@ -319,34 +325,227 @@ def test_design_bookkeeping(phantom_base):
         for name in names:
             if name not in SEED_KEYS:
                 assert spec["factors"][name]["min"] <= float(record[name]) <= spec["factors"][name]["max"]
-    geometry = sa.seed_geometry(phantom_base["cavity"], phantom_base["wm"], phantom_base["gm"], threshold)
+    geometry = sa.seed_geometry(phantom_base["wm"], phantom_base["gm"], threshold)
+    assert geometry.n_voxels == 3112 and geometry.mask.sum() == 3112
     np.testing.assert_allclose(geometry.bbox_lo, spec["seed_bbox_lo"])
     np.testing.assert_allclose(geometry.bbox_hi, spec["seed_bbox_hi"])
-    for voxel in geometry.voxels[[0, 17, 63]]:
-        u = ((voxel + 0.5) / n - geometry.bbox_lo) / (geometry.bbox_hi - geometry.bbox_lo)
-        fractions, projected = sa.project_seeds(u, geometry)
-        np.testing.assert_array_equal(projected[0], voxel)
-        np.testing.assert_allclose(fractions[0], (voxel + 0.5) / n)
-    # A point outside the seedable set projects onto its nearest voxel.
-    _, projected = sa.project_seeds([[-0.4, 0.5, 0.5]], geometry)
-    assert seedable[tuple(projected[0])] and projected[0][0] == geometry.voxels[:, 0].min()
-    # The threshold decides what is seedable: a faint-tissue cavity voxel
-    # is out at 0.1 and in at 0.
-    faint_wm = phantom_base["wm"].copy()
+    # The threshold decides what is seedable: a faint-tissue voxel is out
+    # at 0.1 and in at 0; nothing seedable raises.
+    faint_wm, faint_gm = phantom_base["wm"].copy(), phantom_base["gm"].copy()
     faint_wm[tuple(geometry.voxels[0])] = 0.05
-    assert sa.seed_geometry(phantom_base["cavity"], faint_wm, np.zeros_like(faint_wm), 0.1).n_voxels == 63
-    assert sa.seed_geometry(phantom_base["cavity"], faint_wm, np.zeros_like(faint_wm), 0.0).n_voxels == 64
+    faint_gm[tuple(geometry.voxels[0])] = 0.0
+    assert sa.seed_geometry(faint_wm, faint_gm, 0.1).n_voxels == 3111
+    assert sa.seed_geometry(faint_wm, faint_gm, 0.0).n_voxels == faint_wm.size
     with pytest.raises(ValueError, match="no seedable voxel"):
-        sa.seed_geometry(phantom_base["cavity"], faint_wm, np.zeros_like(faint_wm), 2.0)
+        sa.seed_geometry(faint_wm, faint_gm, 2.0)
+    with pytest.raises(ValueError, match="3D and alike"):
+        sa.seed_geometry(faint_wm[0], faint_gm[0], 0.1)
     # The chemotherapy budget of the shipped ranges on the phantom schedule.
     assert spec["chemo_total_dose"] == 225.0
     np.testing.assert_allclose(spec["chemo_log_kill_range"], [1.1e-3 * 225 / 20, 5.6e-3 * 225 / 5])
-    # Every config is a complete StuppFKPPSolver run.
-    for path in sorted((sweep_dir / "configs").iterdir()):
-        solver = StuppFKPPSolver(read_config(path))
+    # Every config is a complete StuppFKPPSolver run once the derived maps
+    # are given (here: empty).
+    shape = seedable.shape
+    for path in sorted((sweep_dir / "configs").iterdir())[:5]:
+        config = read_config(path)
+        assert config["resection_cavity"] is None and config["rt_dose"] is None
+        solver = StuppFKPPSolver({**config, "resection_cavity": np.zeros(shape, bool), "rt_dose": np.zeros(shape)})
         assert solver.config[SOLVER_KEY] == "StuppFKPPSolver"
+        FKPPSolver(sa.growth_config(config))
+    # A base config with a cavity or a dose map, or without tissue maps, is refused.
+    entries = json.loads(phantom_base["path"].read_text())
+    with_dose = tmp_path / "with_dose.json"
+    nib.save(nib.Nifti1Image(np.zeros(shape, dtype=np.float32), np.eye(4)), str(tmp_path / "dose.nii.gz"))
+    with_dose.write_text(json.dumps({**entries, "rt_dose": "dose.nii.gz"}))
+    with pytest.raises(ValueError, match=r"sets \['rt_dose'\], which every run derives"):
+        sa.make_design(SHIPPED_SEARCH_SPACE, with_dose, tmp_path / "sa", "refused", log2_n=1)
+    no_maps = tmp_path / "no_maps.json"
+    no_maps.write_text(json.dumps({key: value for key, value in entries.items() if key != "gray_matter_pbmap"}))
+    with pytest.raises(ValueError, match=r"lacks \['gray_matter_pbmap'\]"):
+        sa.make_design(SHIPPED_SEARCH_SPACE, no_maps, tmp_path / "sa", "refused", log2_n=1)
+    with pytest.raises(ValueError, match="cavity_threshold"):
+        sa.make_design(SHIPPED_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "refused", cavity_threshold=0.0)
+    assert not (tmp_path / "sa" / "refused").exists()
 
 
+def test_project_seeds_nested_ranges():
+    """The nested-range mapping: on a full box the three coordinates fall
+    into equal integer bins per axis; a picked index that is not seedable
+    snaps to the nearest seedable one of its slab / row / column; every
+    result is seedable; coordinates off [0, 1] raise."""
+    full = sa.SeedGeometry((4, 5, 6), np.ones((4, 5, 6), bool), np.argwhere(np.ones((4, 5, 6), bool)),
+                           np.full(3, 0.5), np.full(3, 0.5))
+    u = [[0.0, 0.0, 0.0], [0.24, 0.19, 0.16], [0.25, 0.2, 0.17], [0.5, 0.5, 0.5], [1.0, 1.0, 1.0]]
+    fractions, voxels = sa.project_seeds(u, full)
+    np.testing.assert_array_equal(voxels, [[0, 0, 0], [0, 0, 0], [1, 1, 1], [2, 2, 3], [3, 4, 5]])
+    np.testing.assert_allclose(fractions, (voxels + 0.5) / np.array([4.0, 5.0, 6.0]))
+    assert sa.project_seeds([0.5, 0.5, 0.5], full)[1].shape == (1, 3)
+    # Holes: slab 1 has seedable rows 0 and 3 only, and row (1, 3) the
+    # voxels 0, 1 and 4 only.
+    mask = np.zeros((3, 4, 5), bool)
+    mask[0, 1, 2] = True
+    mask[1, 0, :] = True
+    mask[1, 3, [0, 1, 4]] = True
+    mask[2, 2, 2] = True
+    holes = sa.SeedGeometry(mask.shape, mask, np.argwhere(mask), np.zeros(3), np.ones(3))
+    _, voxels = sa.project_seeds([[0.5, 0.5, 0.5], [0.5, 0.9, 0.7], [0.5, 0.9, 0.3], [0.0, 0.5, 0.5], [0.99, 0.0, 0.0]], holes)
+    # u_y = 0.5 picks row 2 of slab 1, snapped to row 3 (nearer than 0);
+    # u_z = 0.5 picks voxel 2 of that row, snapped to 1 (nearer than 4).
+    np.testing.assert_array_equal(voxels, [[1, 3, 1], [1, 3, 4], [1, 3, 1], [0, 1, 2], [2, 2, 2]])
+    assert all(mask[tuple(v)] for v in voxels)
+    rng = np.random.default_rng(0)
+    _, voxels = sa.project_seeds(rng.random((500, 3)), holes)
+    assert all(mask[tuple(v)] for v in voxels)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        sa.project_seeds([[1.2, 0.5, 0.5]], full)
+    with pytest.raises(ValueError, match=r"\(n, 3\)"):
+        sa.project_seeds([[0.5, 0.5]], full)
+
+
+# --- (5) growth stage, treatment maps and one two-stage run ---
+
+
+def test_growth_config(phantom_base):
+    """The growth stage keeps the FKPPSolver entries of the run config,
+    drops the treatment entries and stops at resection_time."""
+    base = read_config(phantom_base["path"], solver=StuppFKPPSolver)
+    growth = sa.growth_config({**base, "_design": "comment", "resection_time": 7.5})
+    assert growth[SOLVER_KEY] == "FKPPSolver" and growth["stopping_time"] == 7.5
+    assert set(growth) - {SOLVER_KEY} <= FKPPSolver.config_keys()
+    assert not set(growth) & StuppFKPPSolver.TREATMENT_KEYS and "time_after_resection" not in growth
+    for key in ("white_matter_pbmap", "rho", "white_matter_diffusivity", "steps_per_day", "min_tissue_fraction", *SEED_KEYS):
+        assert growth[key] == base[key]
+    solver = FKPPSolver(growth)
+    assert solver.params["stopping_time"] == 7.5
+
+
+def test_treatment_maps():
+    """A unit ball of radius 4 at the threshold gives the ball as cavity
+    and, with a 6 mm margin, a dose region that holds every voxel within
+    9 mm of the centre and none beyond 11 mm, at the total dose; the
+    margin counts millimetres on anisotropic voxels; a density below the
+    threshold everywhere gives empty maps."""
+    shape = (41, 41, 41)
+    centre = np.array([20.0, 20.0, 20.0])
+    radius = np.linalg.norm(np.indices(shape).reshape(3, -1).T - centre, axis=1).reshape(shape)
+    density = np.where(radius <= 4, 0.8, 0.59)
+    cavity, dose = sa.treatment_maps(density, (1.0, 1.0, 1.0), 0.6, 6.0, 60.0)
+    np.testing.assert_array_equal(cavity, radius <= 4)
+    assert dose.dtype == np.float32 and set(np.unique(dose)) == {0.0, 60.0}
+    assert np.all(dose[radius <= 9] == 60.0) and np.all(dose[radius > 11] == 0.0)
+    assert np.all(dose[cavity] == 60.0)
+    # Anisotropic voxels: 2 mm along z, so the margin reaches 3 voxels
+    # from the cavity along z and 6 across.
+    cavity_z, dose_z = sa.treatment_maps(density, (1.0, 1.0, 2.0), 0.6, 6.0, 4.0)
+    np.testing.assert_array_equal(cavity_z, cavity)
+    assert dose_z[20, 20, 24 + 3] == 4.0 and dose_z[20, 20, 24 + 4] == 0.0
+    assert dose_z[20, 20 + 4 + 6, 20] == 4.0 and dose_z[20, 20 + 4 + 7, 20] == 0.0
+    cavity_empty, dose_empty = sa.treatment_maps(np.full(shape, 0.59), (1.0, 1.0, 1.0), 0.6, 6.0, 60.0)
+    assert not cavity_empty.any() and not dose_empty.any()
+    assert sa.treatment_maps(density, (1.0, 1.0, 1.0), 0.6, 0.0, 60.0)[1].astype(bool).sum() == cavity.sum()
+    with pytest.raises(ValueError, match="3D"):
+        sa.treatment_maps(density[0], (1.0, 1.0), 0.6, 6.0, 60.0)
+
+
+def test_align_treated_config():
+    """n_steps = n_growth + ceil(time_after / dt), the horizon a multiple
+    of dt, resection_time the midpoint of step n_growth; a stage that did
+    not run is refused."""
+    config = {"resection_time": 71.2, "time_after_resection": 260.0, "steps_per_day": 12, "dt": None, "rho": 0.1}
+    aligned = sa.align_treated_config(config, 217, 71.2 / 217)
+    dt = 71.2 / 217
+    n_after = int(np.ceil(260.0 / dt))
+    assert aligned["n_steps"] == 217 + n_after and aligned["dt"] is None and aligned["steps_per_day"] is None
+    assert aligned["resection_time"] == pytest.approx(216.5 * dt)
+    assert aligned["time_after_resection"] == pytest.approx((n_after + 0.5) * dt)
+    horizon = aligned["resection_time"] + aligned["time_after_resection"]
+    assert horizon == pytest.approx(aligned["n_steps"] * dt) and horizon / aligned["n_steps"] == pytest.approx(dt, rel=1e-15)
+    assert aligned["rho"] == 0.1 and "n_steps" not in config  # the input is left alone
+    # time_after already a multiple of dt: no extra step.
+    exact = sa.align_treated_config({"resection_time": 10.0, "time_after_resection": 5.0}, 100, 0.1)
+    assert exact["n_steps"] == 150 and exact["time_after_resection"] == pytest.approx(50.5 * 0.1)
+    with pytest.raises(ValueError, match="growth stage must have run"):
+        sa.align_treated_config(config, 0, 0.1)
+
+
+def test_treatment_settings():
+    assert sa.treatment_settings() == {"cavity_threshold": 0.6, "rt_margin_mm": 15.0, "rt_dose_per_fraction_gy": 2.0}
+    assert sa.spec_treatment_settings({}) == sa.treatment_settings()
+    assert sa.spec_treatment_settings({"treatment": {"cavity_threshold": 0.5, "rt_margin_mm": 3, "rt_dose_per_fraction_gy": 1}}) == {
+        "cavity_threshold": 0.5, "rt_margin_mm": 3.0, "rt_dose_per_fraction_gy": 1.0
+    }
+    for bad in ({"cavity_threshold": 0.0}, {"cavity_threshold": 1.5}, {"rt_margin_mm": -1.0}, {"rt_dose_per_fraction": np.inf}):
+        with pytest.raises(ValueError, match=next(iter(bad))):
+            sa.treatment_settings(**bad)
+
+
+def test_run_one_two_stages(phantom_base):
+    """One design point on the phantom (CPU): the growth stage is saved
+    into growth/, the cavity is the growth density at or above the
+    threshold, the dose map holds the total dose within the margin, the
+    treated stage's config.json references both maps and reproduces the
+    run through read_config, both stages start from the same seed, and
+    the treated stage's final density vanishes inside the cavity."""
+    tmp_path = phantom_base["tmp_path"]
+    sweep_dir = sa.make_design(
+        sa.DEFAULT_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "one", log2_n=1, seed=2, rt_margin_mm=3.0
+    )
+    config_path = sweep_dir / "configs" / "r0000_A.json"
+    run_dir = sweep_dir / "runs" / "r0000_A"
+    treatment = sa.spec_treatment_settings(json.loads((sweep_dir / "spec.json").read_text()))
+    assert treatment["rt_margin_mm"] == 3.0
+    assert sa.run_one(config_path, run_dir, treatment["cavity_threshold"], 3.0, treatment["rt_dose_per_fraction_gy"]) == 0
+    growth = json.loads((run_dir / "growth" / "result.json").read_text())
+    result = json.loads((run_dir / "result.json").read_text())
+    config = _config_entries(config_path)
+    assert growth["success"] and result["success"]
+    assert read_config(run_dir / "growth" / "config.json")[SOLVER_KEY] == "FKPPSolver"
+    assert growth["final_time"] == config["resection_time"]
+    # The treated stage is stepped on the growth stage's grid of times.
+    n_after = int(np.ceil(config["time_after_resection"] / growth["dt"] - 1e-9))
+    assert result["n_steps"] == growth["n_steps"] + n_after
+    assert result["dt"] == pytest.approx(growth["dt"], rel=1e-12)
+    horizon = config["resection_time"] + config["time_after_resection"]
+    assert horizon - 1e-9 <= result["final_time"] <= horizon + growth["dt"]
+    assert result["final_time"] == pytest.approx(result["n_steps"] * growth["dt"], rel=1e-12)
+    growth_density = np.asarray(nib.load(str(run_dir / "growth" / "final_cell_density.nii.gz")).get_fdata())
+    cavity = np.asarray(nib.load(str(run_dir / "resection_cavity.nii.gz")).get_fdata())
+    dose = np.asarray(nib.load(str(run_dir / "rt_dose.nii.gz")).get_fdata())
+    record = json.loads((run_dir / "treatment.json").read_text())
+    assert set(np.unique(cavity)) <= {0.0, 1.0} and cavity.sum() == record["n_cavity_voxels"] > 0
+    np.testing.assert_array_equal(cavity.astype(bool), growth_density >= 0.6)
+    expected_cavity, expected_dose = sa.treatment_maps(growth_density, (1.0, 1.0, 1.0), 0.6, 3.0, 4.0)
+    np.testing.assert_array_equal(cavity.astype(bool), expected_cavity)
+    np.testing.assert_array_equal(dose, expected_dose)
+    assert record["rt_total_dose_gy"] == 4.0 and record["n_fractions"] == 2
+    assert record["dose_volume_mm3"] == np.count_nonzero(dose) > record["cavity_volume_mm3"] == cavity.sum()
+    assert record["max_density_at_resection"] == pytest.approx(growth_density.max(), rel=1e-6)
+    saved = read_config(run_dir / "config.json")
+    assert saved["resection_cavity"] == {"segmentation": str(run_dir / "resection_cavity.nii.gz"), "label": 1}
+    assert saved["rt_dose"] == str(run_dir / "rt_dose.nii.gz")
+    assert saved["n_steps"] == result["n_steps"] and saved["steps_per_day"] is None and saved["dt"] is None
+    assert saved["resection_time"] == pytest.approx((growth["n_steps"] - 0.5) * growth["dt"])
+    assert record["resection_step"] == growth["n_steps"] and record["resection_time"] == config["resection_time"]
+    assert record["treated_dt"] == result["dt"] and record["growth_dt"] == growth["dt"]
+    assert record["resection_time_config"] == saved["resection_time"]
+    reproduced = StuppFKPPSolver(saved)
+    np.testing.assert_array_equal(reproduced.params["resection_cavity"], expected_cavity)
+    np.testing.assert_allclose(reproduced.params["rt_dose"], expected_dose)
+    initial = np.asarray(nib.load(str(run_dir / "initial_cell_density.nii.gz")).get_fdata())
+    growth_initial = np.asarray(nib.load(str(run_dir / "growth" / "initial_cell_density.nii.gz")).get_fdata())
+    np.testing.assert_array_equal(initial, growth_initial)
+    final = np.asarray(nib.load(str(run_dir / "final_cell_density.nii.gz")).get_fdata())
+    assert final.max() > 0 and np.all(final[expected_cavity] == 0)
+    # The run-status record of a run that failed in its growth stage.
+    failed_dir = sweep_dir / "runs" / "failed"
+    (failed_dir / "growth").mkdir(parents=True)
+    (failed_dir / "growth" / "result.json").write_text(json.dumps({"success": False, "error": "boom"}))
+    (sweep_dir / "configs" / "failed.json").write_text("not json")
+    failed = sa.run_subprocess(sweep_dir, "failed", None, treatment)
+    assert not failed["success"] and failed["error"] == "growth stage: boom" and failed["exit_code"] != 0
+
+
+# --- (6) QoIs on synthetic fields ---
 def test_chemo_log_kill_range():
     """The shipped ranges with the example config's 8 900 mg/m^2 schedule
     bound the total log kill kill * D_tot / decay to [0.5, 10] within 5 %;
@@ -372,7 +571,7 @@ def test_chemo_log_kill_range():
     assert sa.chemo_log_kill_range(example, base_only) == (8900.0, (expected, expected))
 
 
-# --- (5) QoIs on synthetic fields ---
+# --- (6) QoIs on synthetic fields ---
 
 
 def _gaussian(shape, zooms, centre_mm, sigmas_mm, peak=1.0) -> np.ndarray:
@@ -575,17 +774,18 @@ def test_accounting_on_poisoned_sweep(tmp_path):
     assert {r["n_blocks_used"] for r in sobol if r["qoi"] == "log10_mass"} == {"7"}
 
 
-# --- (6) end to end on the phantom ---
+# --- (7) end to end on the phantom ---
 
 
 @pytest.mark.slow
 def test_end_to_end_on_phantom(phantom_base):
-    """design (N = 4, 6 factors: 32 runs), run on the CPU, qoi and analyze
-    with 20 bootstrap resamples: the files exist, run_status.csv and
-    qoi.csv have one line per run, sobol.csv has k x #QoIs lines with no
-    NaN in ST, the figures are written, and a second run pass skips
-    every finished run. About 30-45 s: 32 solver processes, each
-    compiling the scan (``slow``; deselect with -m "not slow")."""
+    """design (N = 4, 6 factors: 32 runs, 3 mm margin), run on the CPU,
+    qoi and analyze with 20 bootstrap resamples: the files of both stages
+    exist, run_status.csv and qoi.csv have one line per run, the derived
+    volumes are carried into qoi.csv, sobol.csv has k x #QoIs lines with
+    no NaN in ST, the figures are written, and a second run pass skips
+    every finished run. About 60-90 s: 32 processes, each compiling two
+    scans (``slow``; deselect with -m "not slow")."""
     tmp_path = phantom_base["tmp_path"]
     search_space = tmp_path / "small_space.json"
     search_space.write_text(
@@ -595,15 +795,18 @@ def test_end_to_end_on_phantom(phantom_base):
                 "_note": "small phantom search space",
                 "rho": {"min": 0.1, "max": 0.3, "scale": "log"},
                 "white_matter_diffusivity": {"min": 0.05, "max": 0.3, "scale": "log"},
-                "resection_time": {"min": 1.0, "max": 3.0, "scale": "linear"},
-                "gaussian_seed_mass": 200.0,
+                "resection_time": {"min": 10.0, "max": 14.0, "scale": "linear"},
+                "gaussian_seed_mass": 250.0,
                 **_seed_entries(),
             }
         )
     )
-    sweep_dir = sa.make_design(search_space, phantom_base["path"], tmp_path / "sa", "e2e", log2_n=2, seed=1)
+    sweep_dir = sa.make_design(
+        search_space, phantom_base["path"], tmp_path / "sa", "e2e", log2_n=2, seed=1, rt_margin_mm=3.0
+    )
     spec = json.loads((sweep_dir / "spec.json").read_text())
-    assert spec["k"] == 6 and spec["n_runs"] == 32 and spec["overrides"] == {"gaussian_seed_mass": 200.0}
+    assert spec["k"] == 6 and spec["n_runs"] == 32 and spec["overrides"] == {"gaussian_seed_mass": 250.0}
+    assert spec["treatment"]["rt_margin_mm"] == 3.0 and spec["treatment"]["rt_total_dose_gy"] == 4.0
     counts = sa.run_sweep(sweep_dir, gpus=[], jobs_per_gpu=8)  # 8 CPU workers
     assert counts == {"skipped": 0, "ok": 32, "failed": 0}
     status = _read_csv(sweep_dir / "run_status.csv")
@@ -611,21 +814,31 @@ def test_end_to_end_on_phantom(phantom_base):
     for record in status:
         run_dir = sweep_dir / "runs" / record["run_name"]
         assert (run_dir / "final_cell_density.nii.gz").is_file() and (run_dir / "config.json").is_file()
+        assert (run_dir / "growth" / "result.json").is_file() and (run_dir / "treatment.json").is_file()
+        assert (run_dir / "resection_cavity.nii.gz").is_file() and (run_dir / "rt_dose.nii.gz").is_file()
         assert (sweep_dir / "logs" / f"{record['run_name']}.log").is_file()
         assert json.loads((run_dir / "result.json").read_text())["success"] is True
+        saved = read_config(run_dir / "config.json")
+        assert saved["resection_cavity"]["segmentation"] == str(run_dir / "resection_cavity.nii.gz")
     assert sa.run_sweep(sweep_dir, gpus=[], jobs_per_gpu=1) == {"skipped": 32, "ok": 0, "failed": 0}
     sa.qoi_command(sweep_dir, 0.6, 0.3, workers=1)
     qoi = _read_csv(sweep_dir / "qoi.csv")
     assert len(qoi) == 32 and all(r["success"] == "True" for r in qoi)
     assert [r["index"] for r in qoi] == [str(i) for i in range(32)]
     assert all(float(r["mass"]) > 0 for r in qoi)
-    # The seed is resected early, so low-growth runs may stay below the
-    # thresholds (empty compartments are valid outcomes, r95 = 0).
-    assert sum(float(r["V_edema"]) > 0 for r in qoi) > 16 and any(float(r["V_core"]) > 0 for r in qoi)
+    # The derived volumes are carried over; most runs grow past the
+    # threshold by surgery, and a dosed region always contains its cavity.
+    assert all(r["cavity_volume_mm3"] != "" and r["dose_volume_mm3"] != "" for r in qoi)
+    assert sum(float(r["cavity_volume_mm3"]) > 0 for r in qoi) > 16
+    assert all(float(r["dose_volume_mm3"]) >= float(r["cavity_volume_mm3"]) for r in qoi)
+    # The tumor core is resected, so runs may stay below the thresholds
+    # afterwards (empty compartments are valid outcomes, r95 = 0).
+    assert sum(float(r["V_edema"]) > 0 for r in qoi) > 16
     assert all(float(r["r95_core"]) == 0 for r in qoi if r["n_core"] == "0")
     summary = json.loads((sweep_dir / "qoi_summary.json").read_text())
     assert summary["n_success"] == 32 and summary["n_nan_mass_weighted"] == 0
     assert summary["n_runs_extinct"] == 0 and spec["chemo_total_dose"] == 225.0
+    assert summary["n_runs_empty_cavity"] == sum(float(r["cavity_volume_mm3"]) == 0 for r in qoi) < 16
     assert set(summary["per_qoi"]) == set(sa.ANALYSED_QOIS) and summary["block_size"] == 8
     results = sa.analyze_sweep(sweep_dir, n_bootstrap=20, seed=0)
     assert set(results) == set(sa.ANALYSED_QOIS)
