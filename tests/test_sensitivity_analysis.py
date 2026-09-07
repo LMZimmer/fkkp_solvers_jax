@@ -368,6 +368,34 @@ def test_design_bookkeeping(phantom_base):
     assert not (tmp_path / "sa" / "refused").exists()
 
 
+def test_tissue_map_override_and_cli_defaults(phantom_base):
+    """The tissue maps given to make_design (the command line's default:
+    the BraTS MNI152 atlas of PredictGBM) replace the base config's in
+    base_config.json and the run configs; an empty entry keeps the base
+    config's; an unknown key raises. The parser defaults --output-dir to
+    DEFAULT_OUTPUT_DIR and the map flags to DEFAULT_TISSUE_MAPS."""
+    tmp_path = phantom_base["tmp_path"]
+    other = tmp_path / "other_wm.nii.gz"
+    nib.save(nib.Nifti1Image(np.asarray(phantom_base["wm"]), np.eye(4)), str(other))
+    sweep_dir = sa.make_design(
+        sa.DEFAULT_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "maps", log2_n=1,
+        tissue_maps={"white_matter_pbmap": other, "gray_matter_pbmap": ""},
+    )
+    base = read_config(sweep_dir / "base_config.json")
+    assert base["white_matter_pbmap"] == str(other.resolve())
+    assert base["gray_matter_pbmap"] == str((tmp_path / "volumes" / "gm.nii.gz").resolve())
+    config = read_config(sweep_dir / "configs" / "r0000_A.json")
+    assert config["white_matter_pbmap"] == str(other.resolve())
+    with pytest.raises(ValueError, match="not one of"):
+        sa.make_design(sa.DEFAULT_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "bad", log2_n=1,
+                       tissue_maps={"csf_pbmap": other})
+    args = sa.build_parser().parse_args(["design", "--name", "x"])
+    assert args.output_dir == str(sa.DEFAULT_OUTPUT_DIR) == "/mnt/Drive4/lucas/stupp_sensitivity_analysis_atlas"
+    assert args.white_matter_pbmap == str(sa.DEFAULT_TISSUE_MAPS["white_matter_pbmap"])
+    assert args.gray_matter_pbmap.endswith("brats_mni152/brats_mni152_gm_pbmap.nii.gz")
+    assert sa.build_parser().parse_args(["all", "--name", "x", "--gray-matter-pbmap", ""]).gray_matter_pbmap == ""
+
+
 def test_project_seeds_nested_ranges():
     """The nested-range mapping: on a full box the three coordinates fall
     into equal integer bins per axis; a picked index that is not seedable

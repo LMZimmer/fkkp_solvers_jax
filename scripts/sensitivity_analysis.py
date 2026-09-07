@@ -54,11 +54,14 @@ resection_cavity and rt_dose, and is either
     the unit cube (u in [0, 1)) and transformed to a + u (b - a) for
     "linear" or 10 ** (log10 a + u (log10 b - log10 a)) for "log".
 Everything not listed comes from the base config (--config, default
-fisher_kpp_jax/configs/StuppFKPPSolver.json, which runs on the atlas
-tissue maps of reference_solves/; read with fisher_kpp_jax.read_config so
-every run config carries absolute volume paths). The base config's
-resection_cavity and rt_dose must be null, since they are derived per
-run. chemo_times and rt_times are shifted by resection_time - base
+fisher_kpp_jax/configs/StuppFKPPSolver.json; read with
+fisher_kpp_jax.read_config so every run config carries absolute volume
+paths), except the tissue maps: --white-matter-pbmap and
+--gray-matter-pbmap (default the BraTS MNI152 atlas maps of PredictGBM,
+DEFAULT_TISSUE_MAPS) replace the base config's white_matter_pbmap and
+gray_matter_pbmap; an empty string keeps the base config's entry. The
+base config's resection_cavity and rt_dose must be null, since they are
+derived per run. chemo_times and rt_times are shifted by resection_time - base
 resection_time, so the treatment block keeps its offset after surgery;
 the base config's time step is copied through (the solver raises a
 coarse step to its stability estimate itself).
@@ -100,10 +103,12 @@ order and position k + 1 is B_j (with --second-order, positions
 k + 1..2k are B_A^(i) and B_j comes last). Run names are
 r{row:04d}_{A | B | AB-<factor> | BA-<factor>}, row being the block j.
 
-Output layout:
+Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
+/mnt/Drive4/lucas/stupp_sensitivity_analysis_atlas; --name required):
   <output-dir>/<name>/
     search_space.json    copy of the search-space file used
-    base_config.json     the base config as read (absolute volume paths)
+    base_config.json     the base config as read (absolute volume paths,
+                         the tissue maps as replaced)
     spec.json            search space, base config path, seed, N, k, factor
                          order, SALib version, seed box, seedable voxel
                          count, the treatment derivation settings
@@ -199,12 +204,12 @@ rows is taken from spec.json, so the --second-order flag of design/all
 reaches the analysis (which then writes sobol_S2.csv as well). SALib
 treats seed 0 as "unseeded", so the bootstrap is seeded with --seed + 1.
 
-Run from the project root, e.g.:
-  python scripts/sensitivity_analysis.py design --output-dir /mnt/Drive4/lucas/SAILOR/sa --name sa_atlas
-  python scripts/sensitivity_analysis.py run --sweep-dir /mnt/Drive4/lucas/SAILOR/sa/sa_atlas --gpus 1,2,3,5
-  python scripts/sensitivity_analysis.py qoi --sweep-dir /mnt/Drive4/lucas/SAILOR/sa/sa_atlas
-  python scripts/sensitivity_analysis.py analyze --sweep-dir /mnt/Drive4/lucas/SAILOR/sa/sa_atlas
-  python scripts/sensitivity_analysis.py all --output-dir /mnt/Drive4/lucas/SAILOR/sa --name sa_atlas --gpus 1,2,3,5
+Run from the project root, e.g. (SA = /mnt/Drive4/lucas/stupp_sensitivity_analysis_atlas):
+  python scripts/sensitivity_analysis.py design --name sa_atlas
+  python scripts/sensitivity_analysis.py run --sweep-dir $SA/sa_atlas --gpus 1,2,3,6
+  python scripts/sensitivity_analysis.py qoi --sweep-dir $SA/sa_atlas
+  python scripts/sensitivity_analysis.py analyze --sweep-dir $SA/sa_atlas
+  python scripts/sensitivity_analysis.py all --name sa_atlas --gpus 1,2,3,6
   python scripts/sensitivity_analysis.py all --output-dir runs/ --name check --log2-n 2 --gpus ""   (CPU only)
 The run step is resumable: runs whose result.json reports success are
 skipped, partial run directories are deleted and redone; a run whose
@@ -267,7 +272,16 @@ GROWTH_SOLVER_NAME = "FKPPSolver"
 SOLVER_KEY = "solver"
 DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_fkpp_search_space.json"
 DEFAULT_CONFIG = _ROOT / "fisher_kpp_jax" / "configs" / "StuppFKPPSolver.json"
-DEFAULT_GPUS = "1,2,3,5"
+# The tissue maps every design uses in place of the base config's (the
+# defaults of --white-matter-pbmap / --gray-matter-pbmap): the BraTS
+# MNI152 atlas of PredictGBM, 182 x 218 x 182 at 1 mm.
+_ATLAS_DIR = Path("/home/home/lucas/projects/live/PredictGBM/predict_gbm/data/atlas/brats_mni152")
+DEFAULT_TISSUE_MAPS: dict[str, Path] = {
+    "white_matter_pbmap": _ATLAS_DIR / "brats_mni152_wm_pbmap.nii.gz",
+    "gray_matter_pbmap": _ATLAS_DIR / "brats_mni152_gm_pbmap.nii.gz",
+}
+DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_atlas")
+DEFAULT_GPUS = "1,2,3,6"
 DEFAULT_LOG2_N = 10
 DEFAULT_DESIGN_SEED = 1
 DEFAULT_N_BOOTSTRAP = 1000
@@ -921,6 +935,7 @@ def make_design(
     cavity_threshold: float = CAVITY_THRESHOLD,
     rt_margin_mm: float = RT_MARGIN_MM,
     rt_dose_per_fraction: float = RT_DOSE_PER_FRACTION_GY,
+    tissue_maps: Mapping[str, str | Path | None] | None = None,
 ) -> Path:
     """
     Sample the Saltelli design and write the sweep directory (everything
@@ -938,6 +953,10 @@ def make_design(
         cavity_threshold: See ``treatment_settings``.
         rt_margin_mm: See ``treatment_settings``.
         rt_dose_per_fraction: See ``treatment_settings``.
+        tissue_maps: NIfTI paths replacing the base config's
+            white_matter_pbmap and/or gray_matter_pbmap (an entry that is
+            None or empty keeps the base config's); default none, the
+            command line passes ``DEFAULT_TISSUE_MAPS``.
 
     Returns:
         The sweep directory <output_dir>/<name>.
@@ -950,6 +969,11 @@ def make_design(
     config_path = Path(config_path).resolve()
     search_space_path = Path(search_space_path).resolve()
     base = read_config(config_path, solver=StuppFKPPSolver)
+    for key, path in (tissue_maps or {}).items():
+        if key not in DEFAULT_TISSUE_MAPS:
+            raise ValueError(f"tissue_maps: {key!r} is not one of {sorted(DEFAULT_TISSUE_MAPS)}.")
+        if path is not None and str(path):
+            base[key] = str(Path(path).resolve())
     missing = [key for key in BASE_KEYS_NEEDED if base.get(key) is None]
     if missing:
         raise ValueError(f"the base config {config_path} lacks {missing}, which the design needs.")
@@ -2037,7 +2061,13 @@ def _scatter_grid(
 def _add_design_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--search-space", default=str(DEFAULT_SEARCH_SPACE), help="search-space JSON")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="base config JSON")
-    parser.add_argument("--output-dir", required=True, help="parent of the sweep directory")
+    for key, path in DEFAULT_TISSUE_MAPS.items():
+        parser.add_argument(
+            f"--{key.replace('_', '-')}",
+            default=str(path),
+            help=f"NIfTI replacing the base config's {key} ('' keeps the base config's)",
+        )
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="parent of the sweep directory")
     parser.add_argument("--name", required=True, help="sweep directory name")
     parser.add_argument("--log2-n", type=int, default=DEFAULT_LOG2_N, help="N = 2 ** log2_n base points")
     parser.add_argument("--seed", type=int, default=DEFAULT_DESIGN_SEED, help="seed of the Sobol' sequence")
@@ -2121,6 +2151,7 @@ def design_command(args: argparse.Namespace) -> Path:
             args.cavity_threshold,
             args.rt_margin_mm,
             args.rt_dose_per_fraction,
+            {key: getattr(args, key) for key in DEFAULT_TISSUE_MAPS},
         )
     finally:
         if previous is None:
@@ -2128,7 +2159,9 @@ def design_command(args: argparse.Namespace) -> Path:
         else:
             os.environ["JAX_PLATFORMS"] = previous
     spec = read_json(sweep_dir / "spec.json")
+    base = read_json(sweep_dir / "base_config.json")
     print(f"design directory: {sweep_dir}")
+    print(f"tissue maps: {base['white_matter_pbmap']}, {base['gray_matter_pbmap']}")
     print(
         f"N = {spec['N']} (2^{spec['log2_n']}), k = {spec['k']}, {spec['n_runs']} runs "
         f"(seed {spec['seed']}, SALib {spec['salib_version']}"
