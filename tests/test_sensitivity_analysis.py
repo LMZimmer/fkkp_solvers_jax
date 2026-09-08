@@ -4,15 +4,20 @@ scripts/), self-contained.
 (1) The Ishigami function through the script's own design and analysis
 functions against its analytic Sobol' indices (the block/row bookkeeping
 end to end), (2) SALib's Saltelli row order as the script assumes it,
-verified against the installed version, (3) the factor transforms and the
-search-space checks, (4) the design bookkeeping on the 24^3 phantom with
-the shipped search space (every AB run differs from its block's A run only
-through its factor, seeds lie on seedable tissue voxels, every config
-constructs a StuppFKPPSolver once the derived maps are given) and the
-nested-range seed mapping, (5) the growth stage config, the treatment
-maps and one two-stage run on the phantom, (6) the QoIs on synthetic
-Gaussian fields against closed forms and (7) the whole pipeline on the
-phantom on the CPU (design, run, qoi, analyze) with a small search space.
+verified against the installed version, (3) the factor transforms, the
+search-space checks, the derived seed group (its parsing, the derivation
+against the solver's own seed, its design-time validation), (4) the design
+bookkeeping on the 24^3 phantom with the shipped search space (every AB
+run differs from its block's A run only through its factor, or through
+the derived parameters of its group, seeds lie on seedable tissue voxels,
+every config constructs a StuppFKPPSolver once the derived maps are
+given, design.csv carries the derived columns), the nested-range seed
+mapping and the time-step check, (5) the growth stage config, the
+treatment maps, one two-stage run on the phantom with its pre-resection
+field and one growth-only run, (6) the QoIs on synthetic Gaussian fields
+against closed forms, the accounting and the half-sample summary fields
+and (7) the whole pipeline on the phantom on the CPU (design, run, qoi,
+analyze) with a small search space.
 """
 
 from __future__ import annotations
@@ -61,6 +66,13 @@ def _seed_entries(**overrides) -> dict:
     for key in SEED_KEYS:
         entries.setdefault(key, {"min": 0.0, "max": 1.0, "scale": "linear"})
     return entries
+
+
+SEED_GROUP = {
+    "derives": ["gaussian_seed_mass", "gaussian_seed_diffusion_time"],
+    "seed_peak_density": {"min": 0.2, "max": 1.0, "scale": "linear"},
+    "seed_sigma_mm": {"min": 1.0, "max": 5.0, "scale": "log"},
+}
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -194,17 +206,23 @@ def test_transforms():
 
 
 def test_load_search_space():
-    """The shipped file loads with 13 factors in file order and no
-    override; a mapping loads too; unknown keys, a derived volume, a bad
+    """The shipped file loads with 13 factors in file order, the seed
+    group's two sampled factors at the group's position, the seed scale
+    fixed at 1; a mapping loads too; unknown keys, a derived volume, a bad
     scale, a mismatching solver, seed entries off [0, 1] or missing each
     raise."""
     space = sa.load_search_space(SHIPPED_SEARCH_SPACE, CONFIG_KEYS)
-    assert len(space.names) == 13 and space.overrides == {}
+    assert len(space.names) == 13 and space.overrides == {"gaussian_seed_scale": 1.0}
     assert space.names[:3] == ["rho", "white_matter_diffusivity", "diffusivity_ratio"]
-    assert space.names[-3:] == list(SEED_KEYS)
+    assert space.names[-5:] == ["seed_peak_density", "seed_sigma_mm", *SEED_KEYS]
+    assert list(space.groups) == ["seed"] and space.derived_keys == ["gaussian_seed_mass", "gaussian_seed_diffusion_time"]
+    assert space.plain_names == [name for name in space.names if not name.startswith("seed_")]
+    assert space.group_factor_names == {"seed_peak_density", "seed_sigma_mm"}
     shipped = json.loads(SHIPPED_SEARCH_SPACE.read_text())
+    assert shipped["seed"] == SEED_GROUP and shipped["gaussian_seed_scale"] == 1.0
     assert space.factors["rho"] == sa.SearchSpaceParameter("rho", shipped["rho"]["min"], shipped["rho"]["max"], "log")
     assert space.factors["rt_alpha_beta_ratio"].scale == "linear"
+    assert space.factors["seed_sigma_mm"] == sa.SearchSpaceParameter("seed_sigma_mm", 1.0, 5.0, "log")
     assert "_note" in space.source and "_note" not in space.factors
     entries = _seed_entries(solver="StuppFKPPSolver", rho={"min": 0.1, "max": 0.2, "scale": "log"}, verbose=True)
     space = sa.load_search_space(entries, CONFIG_KEYS)
@@ -240,6 +258,107 @@ def test_load_search_space():
         sa.load_search_space(_seed_entries(gaussian_seed_x_fraction=0.5), CONFIG_KEYS)
 
 
+def test_derived_group_parsing():
+    """A derived group: its sampled factors take the group's position in
+    the factor order, its derived parameters are neither factors nor
+    overrides, ``derive`` / ``solver_values`` map the records; a group
+    whose derived parameters are unknown, unregistered, derived volumes
+    or given elsewhere, whose key or factor names are parameters, or
+    whose sub-entries are not the registered factors, raises."""
+    entries = _seed_entries(rho={"min": 0.1, "max": 0.2, "scale": "log"}, seed=SEED_GROUP, verbose=True)
+    space = sa.load_search_space(entries, CONFIG_KEYS)
+    assert space.names == ["rho", "seed_peak_density", "seed_sigma_mm", *SEED_KEYS]
+    assert space.plain_names == ["rho", *SEED_KEYS] and space.overrides == {"verbose": True}
+    group = space.groups["seed"]
+    assert group.name == "seed" and group.derivation is sa.DERIVATIONS[tuple(SEED_GROUP["derives"])]
+    assert list(group.factors) == ["seed_peak_density", "seed_sigma_mm"]
+    derived = space.derive({"seed_peak_density": np.array([0.5, 1.0]), "seed_sigma_mm": np.array([2.0, 4.0])})
+    np.testing.assert_allclose(derived["gaussian_seed_diffusion_time"], [2.0, 8.0])
+    np.testing.assert_allclose(derived["gaussian_seed_mass"], [0.5 * (8 * np.pi) ** 1.5, (32 * np.pi) ** 1.5])
+    record = {"rho": "0.15", "seed_peak_density": "0.5", "seed_sigma_mm": "2.0", "gaussian_seed_mass": "1.5",
+              "gaussian_seed_diffusion_time": "2.0", "gaussian_seed_x_fraction": 0.5, "gaussian_seed_y_fraction": 0.5,
+              "gaussian_seed_z_fraction": 0.5}
+    assert space.solver_values(record) == {
+        "rho": 0.15, "gaussian_seed_x_fraction": 0.5, "gaussian_seed_y_fraction": 0.5, "gaussian_seed_z_fraction": 0.5,
+        "gaussian_seed_mass": 1.5, "gaussian_seed_diffusion_time": 2.0,
+    }
+    # A plain search space has no group.
+    plain = sa.load_search_space(_seed_entries(), CONFIG_KEYS)
+    assert plain.groups == {} and plain.derived_keys == [] and plain.derive({}) == {}
+    with pytest.raises(ValueError, match="derives unknown parameter"):
+        sa.load_search_space(_seed_entries(seed={**SEED_GROUP, "derives": ["gaussian_seed_mass", "tau"]}), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="no derivation registered"):
+        sa.load_search_space(_seed_entries(seed={**SEED_GROUP, "derives": ["gaussian_seed_mass"]}), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="cannot be in a group"):
+        sa.load_search_space(_seed_entries(seed={**SEED_GROUP, "derives": ["rt_dose"]}), CONFIG_KEYS)
+    with pytest.raises(ValueError, match='"derives" must be a nonempty list'):
+        sa.load_search_space(_seed_entries(seed={**SEED_GROUP, "derives": "gaussian_seed_mass"}), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="must be exactly"):
+        sa.load_search_space(_seed_entries(seed={"derives": SEED_GROUP["derives"], "seed_peak_density": SEED_GROUP["seed_peak_density"]}), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="must be exactly"):
+        swapped = {"derives": SEED_GROUP["derives"], "seed_sigma_mm": SEED_GROUP["seed_sigma_mm"], "seed_peak_density": SEED_GROUP["seed_peak_density"]}
+        sa.load_search_space(_seed_entries(seed=swapped), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="seed: seed_sigma_mm: min < max"):
+        sa.load_search_space(_seed_entries(seed={**SEED_GROUP, "seed_sigma_mm": {"min": 5.0, "max": 1.0, "scale": "log"}}), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="must not be a parameter name"):
+        sa.load_search_space(_seed_entries(rho=SEED_GROUP), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="given twice"):
+        sa.load_search_space(_seed_entries(seed=SEED_GROUP, gaussian_seed_mass=250.0), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="given twice"):
+        sa.load_search_space(_seed_entries(gaussian_seed_mass={"min": 10.0, "max": 100.0, "scale": "log"}, seed=SEED_GROUP), CONFIG_KEYS)
+
+
+def test_seed_derivation(tissue_phantom):
+    """tau = sigma^2 / 2 and m = c_peak (4 pi tau)^(3/2) invert
+    ``seed_peak_density``, and the solver's own seed built from them has
+    the peak c_peak at the seed voxel and c_peak e^(-1/2) one sigma away
+    in mm, on isotropic and anisotropic voxels and with downsampling (the
+    solver converts voxel offsets to mm itself). The design-time checks:
+    a peak range at or below the floor, above 1, a nonpositive width or a
+    seed scale other than 1 raise."""
+    derived = sa.seed_parameters(0.5, np.sqrt(10.0))
+    np.testing.assert_allclose(derived["gaussian_seed_diffusion_time"], 5.0)
+    np.testing.assert_allclose(derived["gaussian_seed_mass"], 0.5 * (20 * np.pi) ** 1.5)
+    np.testing.assert_allclose(sa.seed_peak_density(derived["gaussian_seed_mass"], 5.0), 0.5)
+    np.testing.assert_allclose(sa.seed_peak_density(250.0, 5.0), 250 / (20 * np.pi) ** 1.5)
+    n = 33
+    wm, gm = np.ones((n, n, n)), np.zeros((n, n, n))
+    peak, sigma = 0.6, 3.0
+    d = sa.seed_parameters(peak, sigma)
+    for zooms, factor in (((1.0, 1.0, 1.0), 1.0), ((1.0, 1.5, 2.0), 1.0), ((1.0, 1.0, 1.0), 0.5)):
+        solver = FKPPSolver({
+            "white_matter_pbmap": wm, "gray_matter_pbmap": gm, "white_matter_diffusivity": 0.1, "rho": 0.1,
+            "voxel_size_mm": list(zooms), "resolution_factor": factor, "precision": "f64", "stopping_time": 1.0,
+            "steps_per_day": 10, "gaussian_seed_x_fraction": 0.5, "gaussian_seed_y_fraction": 0.5,
+            "gaussian_seed_z_fraction": 0.5, "gaussian_seed_scale": 1.0, "gaussian_seed_floor": 0.1,
+            "gaussian_seed_mass": float(d["gaussian_seed_mass"]),
+            "gaussian_seed_diffusion_time": float(d["gaussian_seed_diffusion_time"]),
+        })
+        solver.resolve_time_stepping()
+        seed = np.asarray(solver._gaussian_seed(), dtype=np.float64)
+        i, j, k = solver.seed_voxel
+        dx = solver.grid_spacing[0]
+        steps = int(round(sigma / dx))
+        np.testing.assert_allclose(seed[i, j, k], peak, rtol=1e-6)
+        np.testing.assert_allclose(seed[i + steps, j, k], peak * np.exp(-((steps * dx) ** 2) / (2 * sigma**2)), rtol=1e-6)
+        np.testing.assert_allclose(seed[i, j + 1, k], peak * np.exp(-(solver.grid_spacing[1] ** 2) / (2 * sigma**2)), rtol=1e-6)
+    params = {"gaussian_seed_floor": 0.1, "gaussian_seed_scale": 1.0}
+    factors = {"seed_peak_density": sa.SearchSpaceParameter("seed_peak_density", 0.2, 1.0, "linear"),
+               "seed_sigma_mm": sa.SearchSpaceParameter("seed_sigma_mm", 1.0, 5.0, "log")}
+    record = sa.DERIVATIONS[sa.SEED_DERIVED_KEYS].validate(factors, params)
+    assert record["gaussian_seed_floor"] == 0.1 and record["gaussian_seed_scale"] == 1.0
+    np.testing.assert_allclose(record["gaussian_seed_diffusion_time_range"], [0.5, 12.5])
+    np.testing.assert_allclose(record["gaussian_seed_mass_range"], [0.2 * (2 * np.pi) ** 1.5, (50 * np.pi) ** 1.5])
+    with pytest.raises(ValueError, match="min must exceed the config's gaussian_seed_floor 0.1"):
+        sa.DERIVATIONS[sa.SEED_DERIVED_KEYS].validate({**factors, "seed_peak_density": sa.SearchSpaceParameter("seed_peak_density", 0.1, 1.0, "linear")}, params)
+    with pytest.raises(ValueError, match="max must be at most 1"):
+        sa.DERIVATIONS[sa.SEED_DERIVED_KEYS].validate({**factors, "seed_peak_density": sa.SearchSpaceParameter("seed_peak_density", 0.2, 1.5, "linear")}, params)
+    with pytest.raises(ValueError, match="seed_sigma_mm: min must be positive"):
+        sa.DERIVATIONS[sa.SEED_DERIVED_KEYS].validate({**factors, "seed_sigma_mm": sa.SearchSpaceParameter("seed_sigma_mm", -1.0, 5.0, "linear")}, params)
+    with pytest.raises(ValueError, match="needs gaussian_seed_scale = 1"):
+        sa.DERIVATIONS[sa.SEED_DERIVED_KEYS].validate(factors, {**params, "gaussian_seed_scale": 2.0})
+
+
 # --- (4) design bookkeeping ---
 
 
@@ -252,11 +371,14 @@ def test_design_bookkeeping(phantom_base):
     with one A, one B and one AB per factor in every block; every AB
     config differs from its block's A config only through its factor (the
     seed fractions for a seed factor, the shifted event times for
-    resection_time); every seed is a seedable tissue voxel whose fractions
-    the config holds; the derived volumes stay null in the run configs
-    and every config constructs a solver once they are given; a base
-    config that sets them, or lacks the tissue maps, is refused; the
-    design is never overwritten."""
+    resection_time, the derived seed parameters for a seed-group factor);
+    design.csv carries the unit-cube coordinates, the sampled factors and
+    the derived parameters, which the configs hold and which invert to
+    the sampled peak; every seed is a seedable tissue voxel whose
+    fractions the config holds; the derived volumes stay null in the run
+    configs and every config constructs a solver once they are given; a
+    base config that sets them, lacks the tissue maps, or sets a seed
+    scale other than 1 is refused; the design is never overwritten."""
     tmp_path = phantom_base["tmp_path"]
     sweep_dir = sa.make_design(SHIPPED_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "design", log2_n=2, seed=3)
     assert sweep_dir == tmp_path / "sa" / "design"
@@ -267,7 +389,15 @@ def test_design_bookkeeping(phantom_base):
     k, n_blocks = spec["k"], spec["N"]
     assert (k, n_blocks, spec["n_runs"], spec["block_size"]) == (13, 4, 60, 15)
     assert spec["salib_version"] and spec["seed"] == 3 and not spec["second_order"]
-    assert spec["growth_solver"] == "FKPPSolver"
+    assert spec["growth_solver"] == "FKPPSolver" and spec["growth_only"] is False
+    assert spec["overrides"] == {"gaussian_seed_scale": 1.0}
+    assert spec["time_step"] == {"n_steps": None, "dt": None, "steps_per_day": 110}
+    assert spec["derived_keys"] == ["gaussian_seed_mass", "gaussian_seed_diffusion_time"]
+    seed_group = spec["derived_groups"]["seed"]
+    assert seed_group["derives"] == spec["derived_keys"] and seed_group["factors"] == ["seed_peak_density", "seed_sigma_mm"]
+    assert seed_group["gaussian_seed_floor"] == 0.1 and seed_group["gaussian_seed_scale"] == 1.0
+    assert seed_group["formula"] == sa.SEED_FORMULA
+    group_factors = set(seed_group["factors"])
     assert spec["treatment"] == {
         "cavity_threshold": 0.6, "rt_margin_mm": 15.0, "rt_dose_per_fraction_gy": 2.0,
         "n_fractions": 2, "rt_total_dose_gy": 4.0,
@@ -304,10 +434,30 @@ def test_design_bookkeeping(phantom_base):
                 shift = ab["resection_time"] - base["resection_time"]
                 np.testing.assert_allclose(ab["chemo_times"], np.asarray(base["chemo_times"]) + shift)
                 np.testing.assert_allclose(ab["rt_times"], np.asarray(base["rt_times"]) + shift)
+            elif factor == "seed_peak_density":
+                assert differing == {"gaussian_seed_mass"}
+            elif factor == "seed_sigma_mm":
+                assert differing == {"gaussian_seed_mass", "gaussian_seed_diffusion_time"}
             else:
                 assert differing == {factor}
-            assert ab[factor] == float(record[factor])
+            if factor not in group_factors:
+                assert ab[factor] == float(record[factor])
     assert n_seed_changes > 0
+    # design.csv: u, the sampled value and the derived parameters of
+    # every row; the configs hold the derived values, which invert to
+    # the sampled peak and width.
+    for record in design:
+        config = _config_entries(sweep_dir / "configs" / f"{record['run_name']}.json")
+        for name in names:
+            assert 0 <= float(record[f"u_{name}"]) < 1
+        for key in spec["derived_keys"]:
+            assert config[key] == float(record[key])
+        assert config["gaussian_seed_scale"] == 1.0 and "seed_peak_density" not in config
+        peak, sigma = float(record["seed_peak_density"]), float(record["seed_sigma_mm"])
+        assert 0.2 <= peak <= 1.0 and 1.0 <= sigma <= 5.0
+        np.testing.assert_allclose(config["gaussian_seed_diffusion_time"], sigma**2 / 2)
+        np.testing.assert_allclose(sa.seed_peak_density(config["gaussian_seed_mass"], config["gaussian_seed_diffusion_time"]), peak)
+    assert sa.seed_parameters(0.5, 2.0) == sa.seed_parameters(0.5, 2.0)  # deterministic
     # Seeds: seedable tissue voxels (wm + gm >= the solver's
     # min_tissue_fraction), the config holds their fractions.
     threshold = spec["seed_min_tissue_fraction"]
@@ -368,7 +518,46 @@ def test_design_bookkeeping(phantom_base):
         sa.make_design(SHIPPED_SEARCH_SPACE, no_maps, tmp_path / "sa", "refused", log2_n=1)
     with pytest.raises(ValueError, match="cavity_threshold"):
         sa.make_design(SHIPPED_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "refused", cavity_threshold=0.0)
+    # The seed derivation needs gaussian_seed_scale = 1: a base config
+    # with another scale is refused (the shipped space overrides it, so
+    # a space without the override is used).
+    scaled = tmp_path / "scaled.json"
+    scaled.write_text(json.dumps({**entries, "gaussian_seed_scale": 2.0}))
+    unscaled_space = tmp_path / "unscaled_space.json"
+    unscaled_space.write_text(json.dumps(_seed_entries(solver="StuppFKPPSolver", seed=SEED_GROUP)))
+    with pytest.raises(ValueError, match="needs gaussian_seed_scale = 1"):
+        sa.make_design(unscaled_space, scaled, tmp_path / "sa", "refused", log2_n=1)
+    # A peak range reaching the base config's floor is refused at design time.
+    floored = tmp_path / "floored_space.json"
+    floored.write_text(json.dumps(_seed_entries(
+        solver="StuppFKPPSolver", gaussian_seed_floor=0.3, seed=SEED_GROUP)))
+    with pytest.raises(ValueError, match="exceed the config's gaussian_seed_floor 0.3"):
+        sa.make_design(floored, phantom_base["path"], tmp_path / "sa", "refused", log2_n=1)
     assert not (tmp_path / "sa" / "refused").exists()
+
+
+def test_time_step_check(phantom_base):
+    """A base config with n_steps, dt and steps_per_day all null (every
+    run would fall back to the solver's horizon-dependent stability
+    estimate) is refused at design time; an override of the search space
+    counts; spec.json records the setting."""
+    tmp_path = phantom_base["tmp_path"]
+    entries = json.loads(phantom_base["path"].read_text())
+    no_step = tmp_path / "no_step.json"
+    no_step.write_text(json.dumps({**entries, "steps_per_day": None}))
+    with pytest.raises(ValueError, match=r"sets none of \['n_steps', 'dt', 'steps_per_day'\]"):
+        sa.make_design(SHIPPED_SEARCH_SPACE, no_step, tmp_path / "sa", "refused", log2_n=1)
+    assert not (tmp_path / "sa" / "refused").exists()
+    unlisted = tmp_path / "unlisted.json"
+    unlisted.write_text(json.dumps({key: value for key, value in entries.items() if key != "steps_per_day"}))
+    with pytest.raises(ValueError, match="sets none of"):
+        sa.make_design(SHIPPED_SEARCH_SPACE, unlisted, tmp_path / "sa", "refused", log2_n=1)
+    with_dt = tmp_path / "with_dt_space.json"
+    with_dt.write_text(json.dumps(_seed_entries(solver="StuppFKPPSolver", dt=0.02, seed=SEED_GROUP)))
+    sweep_dir = sa.make_design(with_dt, no_step, tmp_path / "sa", "dt", log2_n=1)
+    spec = json.loads((sweep_dir / "spec.json").read_text())
+    assert spec["time_step"] == {"n_steps": None, "dt": 0.02, "steps_per_day": None}
+    assert read_config(sweep_dir / "configs" / "r0000_A.json")["dt"] == 0.02
 
 
 def test_tissue_map_override_and_cli_defaults(phantom_base):
@@ -535,12 +724,16 @@ def _phantom_search_space(tmp_path: Path) -> Path:
 
 def test_run_one_two_stages(phantom_base):
     """One design point on the phantom (CPU): the growth stage's record
-    and config are saved into growth/ without volumes, the cavity is the
-    growth density at or above the threshold (checked by re-solving the
-    saved growth config), the dose map holds the total dose within the
+    and config are saved into growth/ without volumes, its final density
+    as the pre-resection field (float32, the final field's affine; equal
+    to the re-solved saved growth config), the cavity is that density at
+    or above the threshold, the dose map holds the total dose within the
     margin, the treated stage's config.json references both maps and
-    reproduces the run through read_config, the seed is not saved, and
-    the treated stage's final density vanishes inside the cavity."""
+    reproduces the run through read_config, the seed is not saved, the
+    treated stage's final density vanishes inside the cavity; the qoi
+    record holds the pre_ QoIs of the pre-resection field and the time
+    stepping of both stages; a run without the pre-resection field
+    (--no-keep-pre-resection-field) has no pre_ QoIs and is counted."""
     tmp_path = phantom_base["tmp_path"]
     sweep_dir = sa.make_design(
         _phantom_search_space(tmp_path), phantom_base["path"], tmp_path / "sa", "one", log2_n=1, seed=2, rt_margin_mm=3.0
@@ -567,6 +760,13 @@ def test_run_one_two_stages(phantom_base):
     assert growth["files"] == ["config.json", "result.json"] and growth["grid_shape"] is None
     growth_density = FKPPSolver(read_config(run_dir / "growth" / "config.json")).solve().final_state["cell_density"]
     growth_density = np.asarray(growth_density, dtype=np.float64)
+    pre_image = nib.load(str(run_dir / "pre_resection_cell_density.nii.gz"))
+    final_image = nib.load(str(run_dir / "final_cell_density.nii.gz"))
+    assert pre_image.get_data_dtype() == final_image.get_data_dtype() == np.float32
+    np.testing.assert_array_equal(pre_image.affine, final_image.affine)
+    assert pre_image.header.get_zooms() == final_image.header.get_zooms()
+    pre_density = np.asarray(pre_image.get_fdata(), dtype=np.float64)
+    np.testing.assert_allclose(pre_density, growth_density.astype(np.float32), rtol=1e-6)
     cavity = np.asarray(nib.load(str(run_dir / "resection_cavity.nii.gz")).get_fdata())
     dose = np.asarray(nib.load(str(run_dir / "rt_dose.nii.gz")).get_fdata())
     record = json.loads((run_dir / "treatment.json").read_text())
@@ -593,6 +793,37 @@ def test_run_one_two_stages(phantom_base):
     assert result["files"] == ["config.json", "final_cell_density.nii.gz", "result.json"]
     final = np.asarray(nib.load(str(run_dir / "final_cell_density.nii.gz")).get_fdata())
     assert final.max() > 0 and np.all(final[expected_cavity] == 0)
+    assert record["pre_resection_file"] == "pre_resection_cell_density.nii.gz"
+    # The saved records feed run_status.csv and qoi.csv: the time
+    # stepping of both stages, the volumes; the qoi record holds the
+    # pre_ QoIs of the pre-resection field next to those of the final one.
+    saved_records = sa.run_records(run_dir)
+    assert saved_records["success"] and saved_records["solver"] == "StuppFKPPSolver"
+    assert saved_records["growth_dt"] == growth["dt"] and saved_records["growth_n_steps"] == growth["n_steps"]
+    assert saved_records["treated_dt"] == result["dt"] and saved_records["n_steps"] == result["n_steps"]
+    assert saved_records["cavity_volume_mm3"] == record["cavity_volume_mm3"]
+    design = {r["run_name"]: r for r in _read_csv(sweep_dir / "design.csv")}
+    wm = phantom_base["wm"]
+    qoi = sa.qoi_record(sweep_dir, design["r0000_A"], wm, (1.0, 1.0, 1.0), 0.6, 0.3)
+    assert qoi["success"] and qoi["growth_dt"] == growth["dt"] and qoi["treated_dt"] == result["dt"]
+    seed_voxel = tuple(int(design["r0000_A"][f"seed_voxel_{ijk}"]) for ijk in "ijk")
+    expected_pre = sa.compute_qois(pre_density, (1.0, 1.0, 1.0), seed_voxel, wm, 0.6, 0.3)
+    expected_final = sa.compute_qois(final, (1.0, 1.0, 1.0), seed_voxel, wm, 0.6, 0.3)
+    for name in sa.QOI_NAMES:
+        assert qoi[f"pre_{name}"] == expected_pre[name] and qoi[name] == expected_final[name], name
+    assert qoi["pre_V_core"] > 0 and qoi["pre_mass"] > 0 and qoi["pre_mass"] != qoi["mass"]
+    assert set(qoi) == set(sa.QOI_COLUMNS)
+    # Without the pre-resection field: no file, no pre_ QoIs, counted.
+    run_dir_b = sweep_dir / "runs" / "r0000_B"
+    assert sa.run_one(sweep_dir / "configs" / "r0000_B.json", run_dir_b, 0.6, 3.0, 2.0, keep_pre_resection_field=False) == 0
+    assert not (run_dir_b / "pre_resection_cell_density.nii.gz").exists()
+    assert json.loads((run_dir_b / "treatment.json").read_text())["pre_resection_file"] is None
+    qoi_b = sa.qoi_record(sweep_dir, design["r0000_B"], wm, (1.0, 1.0, 1.0), 0.6, 0.3)
+    assert qoi_b["success"] and not any(key.startswith("pre_") for key in qoi_b)
+    summary = sa.qoi_summary([qoi, qoi_b], 0.6, 0.3, n_blocks=1, size=8)  # r0000_A is index 0, r0000_B index 7
+    assert summary["n_runs_without_pre_resection_field"] == 1 and summary["n_success"] == 2
+    assert summary["per_qoi"]["pre_log10_mass"]["n_runs_nan"] == 1 and summary["per_qoi"]["log10_mass"]["n_runs_nan"] == 0
+    assert summary["per_qoi"]["pre_log10_mass"]["n_runs_failed"] == 6  # the six runs not run
     # The run-status record of a run that failed in its growth stage.
     failed_dir = sweep_dir / "runs" / "failed"
     (failed_dir / "growth").mkdir(parents=True)
@@ -600,6 +831,81 @@ def test_run_one_two_stages(phantom_base):
     (sweep_dir / "configs" / "failed.json").write_text("not json")
     failed = sa.run_subprocess(sweep_dir, "failed", None, treatment)
     assert not failed["success"] and failed["error"] == "growth stage: boom" and failed["exit_code"] != 0
+    assert list(failed) == sa.STATUS_COLUMNS and failed["growth_dt"] is None
+
+
+def test_growth_only(phantom_base):
+    """Growth-only mode: the design records it and refuses treatment
+    factors other than resection_time; a run is the growth stage saved
+    into the run directory itself (an FKPPSolver config.json, the final
+    field, a pre-resection symlink to it, no maps, no growth/, no
+    treatment.json), its records report the one stage's time step, and
+    its qoi record has equal final and pre_ QoIs; the run pass follows
+    spec.json's mode and refuses --growth-only on a two-stage design."""
+    tmp_path = phantom_base["tmp_path"]
+    space_path = _phantom_search_space(tmp_path)
+    sweep_dir = sa.make_design(space_path, phantom_base["path"], tmp_path / "sa", "growth", log2_n=1, seed=2, growth_only=True)
+    spec = json.loads((sweep_dir / "spec.json").read_text())
+    assert spec["growth_only"] is True and "resection_time" in spec["factor_names"]
+    treated_space = tmp_path / "treated_space.json"
+    entries = json.loads(space_path.read_text())
+    treated_space.write_text(json.dumps({**entries, "chemo_kill_rate": {"min": 1e-4, "max": 1e-3, "scale": "log"}}))
+    with pytest.raises(ValueError, match=r"growth-only design: \['chemo_kill_rate'\] are treatment parameters"):
+        sa.make_design(treated_space, phantom_base["path"], tmp_path / "sa", "refused", log2_n=1, growth_only=True)
+    assert not (tmp_path / "sa" / "refused").exists()
+    config_path = sweep_dir / "configs" / "r0000_A.json"
+    run_dir = sweep_dir / "runs" / "r0000_A"
+    assert sa.run_one(config_path, run_dir, growth_only=True) == 0
+    assert sorted(p.name for p in run_dir.iterdir()) == [
+        "config.json", "final_cell_density.nii.gz", "pre_resection_cell_density.nii.gz", "result.json",
+    ]
+    pre_path = run_dir / "pre_resection_cell_density.nii.gz"
+    assert pre_path.is_symlink() and pre_path.resolve() == (run_dir / "final_cell_density.nii.gz").resolve()
+    result = json.loads((run_dir / "result.json").read_text())
+    config = _config_entries(config_path)
+    assert result["success"] and result[SOLVER_KEY] == "FKPPSolver" and result["final_time"] == config["resection_time"]
+    assert result["files"] == ["config.json", "final_cell_density.nii.gz", "result.json"]
+    saved = read_config(run_dir / "config.json")
+    assert saved[SOLVER_KEY] == "FKPPSolver" and saved["stopping_time"] == config["resection_time"]
+    records = sa.run_records(run_dir)
+    assert records["success"] and records["solver"] == "FKPPSolver"
+    assert records["growth_dt"] == result["dt"] and records["growth_n_steps"] == result["n_steps"]
+    assert records["treated_dt"] is None and records["cavity_volume_mm3"] is None
+    design = {r["run_name"]: r for r in _read_csv(sweep_dir / "design.csv")}
+    qoi = sa.qoi_record(sweep_dir, design["r0000_A"], phantom_base["wm"], (1.0, 1.0, 1.0), 0.6, 0.3)
+    assert qoi["success"] and qoi["mass"] > 0 and qoi["V_core"] > 0
+    for name in sa.QOI_NAMES:
+        assert qoi[f"pre_{name}"] == qoi[name], name
+    assert qoi["growth_dt"] == result["dt"] and qoi["treated_dt"] is None and qoi["cavity_volume_mm3"] is None
+    summary = sa.qoi_summary([qoi], 0.6, 0.3, n_blocks=1, size=1)
+    assert summary["n_runs_empty_cavity"] == 0 and summary["n_runs_without_pre_resection_field"] == 0
+    # Without the pre-resection field: no symlink either.
+    run_dir_b = sweep_dir / "runs" / "r0000_B"
+    assert sa.run_one(sweep_dir / "configs" / "r0000_B.json", run_dir_b, growth_only=True, keep_pre_resection_field=False) == 0
+    assert sorted(p.name for p in run_dir_b.iterdir()) == ["config.json", "final_cell_density.nii.gz", "result.json"]
+    # The mode of a run pass.
+    assert sa.resolve_growth_only(sweep_dir, dict(spec), False) is True  # the design decides
+    assert sa.resolve_growth_only(sweep_dir, dict(spec), True) is True
+    two_stage = {**spec, "growth_only": False}
+    assert sa.resolve_growth_only(sweep_dir, two_stage, False) is False
+    with pytest.raises(ValueError, match="designed as a two-stage sweep"):
+        sa.resolve_growth_only(sweep_dir, two_stage, True)
+    older = tmp_path / "older"
+    older.mkdir()
+    old_spec = {key: value for key, value in spec.items() if key != "growth_only"}
+    sa.write_json(older / "spec.json", old_spec)
+    assert sa.resolve_growth_only(older, dict(old_spec), True) is True
+    assert json.loads((older / "spec.json").read_text())["growth_only"] is True
+    sa.write_json(older / "spec.json", old_spec)
+    assert sa.resolve_growth_only(older, dict(old_spec), False) is False
+    assert json.loads((older / "spec.json").read_text())["growth_only"] is False
+    # The command line.
+    args = sa.build_parser().parse_args(["run", "--sweep-dir", "x", "--growth-only", "--no-keep-pre-resection-field"])
+    assert args.growth_only and not args.keep_pre_resection_field
+    args = sa.build_parser().parse_args(["all", "--name", "x"])
+    assert not args.growth_only and args.keep_pre_resection_field
+    args = sa.build_parser().parse_args(["run-one", "--config", "c", "--run-dir", "d", "--growth-only"])
+    assert args.growth_only and args.keep_pre_resection_field
 
 
 # --- (6) QoIs on synthetic fields ---
@@ -835,6 +1141,50 @@ def test_accounting_on_poisoned_sweep(tmp_path):
     sobol = _read_csv(sweep_dir / "sobol.csv")
     assert {r["n_blocks_used"] for r in sobol if r["qoi"] == "R_g"} == {"4"}
     assert {r["n_blocks_used"] for r in sobol if r["qoi"] == "log10_mass"} == {"7"}
+    # No pre-resection field anywhere (an older sweep): the pre_ QoIs are
+    # NaN for every successful run, counted, and skipped by the analysis.
+    assert summary["n_runs_without_pre_resection_field"] == 31
+    for qoi in sa.ANALYSED_QOIS:
+        if qoi.startswith("pre_"):
+            assert summary["per_qoi"][qoi]["n_runs_nan"] == 31 and summary["per_qoi"][qoi]["n_blocks_used"] == 0
+            assert sobol_summary["qois"][qoi]["skipped"] is True
+    assert {r["qoi"] for r in sobol} == set(sa.FINAL_ANALYSED_QOIS)
+    # The half-sample convergence fields are finite floats: the maxima of
+    # |S1 - S1_half| and |ST - ST_half| over the factors.
+    for qoi in sa.FINAL_ANALYSED_QOIS:
+        entry = sobol_summary["qois"][qoi]
+        rows = [r for r in sobol if r["qoi"] == qoi]
+        for key, half in (("S1", "S1_half"), ("ST", "ST_half")):
+            value = entry[f"max_abs_change_{key}_half"]
+            assert isinstance(value, float) and np.isfinite(value)
+            assert value == pytest.approx(max(abs(float(r[key]) - float(r[half])) for r in rows))
+
+
+def test_half_sample_summary_fields():
+    """qoi_summary_entry's max_abs_change_S1_half / _ST_half are the maxima
+    of |S1 - S1_half| / |ST - ST_half| (finite floats, not null) whenever
+    the half design was analysed, and None when it was too small."""
+    from SALib.test_functions import Ishigami
+
+    names = ["x1", "x2", "x3"]
+    samples = sa.saltelli_design(names, log2_n=6, seed=1)
+    y = Ishigami.evaluate(sa.transform_factor(samples, -np.pi, np.pi, "linear"))
+    values = {index: float(value) for index, value in enumerate(y)}
+    result = sa.analyze_response(values, names, n_blocks=64, n_bootstrap=10, seed=0)
+    accounting = sa.response_accounting([{"index": i, "success": True, "y": v} for i, v in values.items()], "y", 64, 5)
+    entry = sa.qoi_summary_entry(names, result, accounting)
+    assert result["n_blocks_half"] == 32 and np.all(np.isfinite(result["S1_half"]))
+    for key, half in (("S1", "S1_half"), ("ST", "ST_half")):
+        value = entry[f"max_abs_change_{key}_half"]
+        assert isinstance(value, float) and np.isfinite(value) and value > 0
+        assert value == pytest.approx(float(np.max(np.abs(result[key] - result[half]))))
+    assert sa._jsonable(entry)[f"max_abs_change_S1_half"] == entry["max_abs_change_S1_half"]
+    # Three blocks: no half design (n_half = 1 < 2), the fields are None.
+    small = {index: float(value) for index, value in enumerate(y[: 3 * 5])}
+    result = sa.analyze_response(small, names, n_blocks=3, n_bootstrap=10, seed=0)
+    assert result["n_blocks_half"] == 1 and np.all(np.isnan(result["S1_half"]))
+    entry = sa.qoi_summary_entry(names, result, sa.response_accounting([], "y", 3, 5))
+    assert entry["max_abs_change_S1_half"] is None and entry["max_abs_change_ST_half"] is None
 
 
 # --- (7) end to end on the phantom ---
@@ -856,13 +1206,20 @@ def test_end_to_end_on_phantom(phantom_base):
     spec = json.loads((sweep_dir / "spec.json").read_text())
     assert spec["k"] == 6 and spec["n_runs"] == 32 and spec["overrides"] == {"gaussian_seed_mass": 250.0}
     assert spec["treatment"]["rt_margin_mm"] == 3.0 and spec["treatment"]["rt_total_dose_gy"] == 4.0
+    assert spec["derived_groups"] == {} and spec["growth_only"] is False and spec["time_step"]["steps_per_day"] == 110
     counts = sa.run_sweep(sweep_dir, gpus=[], jobs_per_gpu=8)  # 8 CPU workers
     assert counts == {"skipped": 0, "ok": 32, "failed": 0}
     status = _read_csv(sweep_dir / "run_status.csv")
     assert len(status) == 32 and all(r["success"] == "True" and r["exit_code"] == "0" for r in status)
+    assert list(status[0]) == sa.STATUS_COLUMNS
     for record in status:
         run_dir = sweep_dir / "runs" / record["run_name"]
         assert (run_dir / "final_cell_density.nii.gz").is_file() and (run_dir / "config.json").is_file()
+        assert (run_dir / "pre_resection_cell_density.nii.gz").is_file()
+        growth = json.loads((run_dir / "growth" / "result.json").read_text())
+        assert float(record["growth_dt"]) == growth["dt"] and int(record["growth_n_steps"]) == growth["n_steps"]
+        assert float(record["treated_dt"]) == pytest.approx(growth["dt"], rel=1e-12)
+        assert float(record["growth_dt"]) <= 1 / 110 + 1e-12
         assert (run_dir / "growth" / "result.json").is_file() and (run_dir / "treatment.json").is_file()
         assert (run_dir / "resection_cavity.nii.gz").is_file() and (run_dir / "rt_dose.nii.gz").is_file()
         assert (sweep_dir / "logs" / f"{record['run_name']}.log").is_file()
@@ -875,6 +1232,14 @@ def test_end_to_end_on_phantom(phantom_base):
     assert len(qoi) == 32 and all(r["success"] == "True" for r in qoi)
     assert [r["index"] for r in qoi] == [str(i) for i in range(32)]
     assert all(float(r["mass"]) > 0 for r in qoi)
+    assert list(qoi[0]) == sa.QOI_COLUMNS
+    assert all(float(r["pre_mass"]) > 0 and float(r["pre_mass"]) != float(r["mass"]) for r in qoi)
+    assert sum(float(r["pre_V_core"]) > 0 for r in qoi) > 16
+    status_by_run = {s["run_name"]: s for s in status}  # run_status.csv is in completion order
+    assert all(
+        r["growth_dt"] == status_by_run[r["run_name"]]["growth_dt"] and r["treated_dt"] == status_by_run[r["run_name"]]["treated_dt"]
+        for r in qoi
+    )
     # The derived volumes are carried over; most runs grow past the
     # threshold by surgery, and a dosed region always contains its cavity.
     assert all(r["cavity_volume_mm3"] != "" and r["dose_volume_mm3"] != "" for r in qoi)
@@ -886,6 +1251,7 @@ def test_end_to_end_on_phantom(phantom_base):
     assert all(float(r["r95_core"]) == 0 for r in qoi if r["n_core"] == "0")
     summary = json.loads((sweep_dir / "qoi_summary.json").read_text())
     assert summary["n_success"] == 32 and summary["n_nan_mass_weighted"] == 0
+    assert summary["n_runs_without_pre_resection_field"] == 0 and summary["mean_run_wall_time_s"] > 0
     assert summary["n_runs_extinct"] == 0 and spec["chemo_total_dose"] == 225.0
     assert summary["n_runs_empty_cavity"] == sum(float(r["cavity_volume_mm3"]) == 0 for r in qoi) < 16
     assert set(summary["per_qoi"]) == set(sa.ANALYSED_QOIS) and summary["block_size"] == 8

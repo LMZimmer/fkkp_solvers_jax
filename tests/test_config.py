@@ -33,7 +33,7 @@ from fisher_kpp_jax import (
     solver_class,
     write_config,
 )
-from fisher_kpp_jax.base import DEFAULT_CONFIG_DIR, n_steps_from_dt
+from fisher_kpp_jax.base import DEFAULT_CONFIG_DIR, TIME_STEP_KEYS, n_steps_from_dt
 from fisher_kpp_jax.config import jsonable
 
 SOLVERS = [
@@ -102,13 +102,19 @@ def phantom_paths(tmp_path: Path, tissue_phantom) -> dict[str, str]:
 @pytest.mark.parametrize("cls", SOLVERS, ids=[cls.__name__ for cls in SOLVERS])
 def test_default_config_file(cls):
     """Every parameter is defined, the optional entries equal the class
-    defaults, the volume paths are absolute and point to existing files
-    (or are null), and the class is registered under its name."""
+    defaults except the time step (a default config may set one of the
+    three time-step keys: StuppFKPPSolver.json sets steps_per_day 12 for
+    the sensitivity analysis), the volume paths are absolute and point to
+    existing files (or are null), and the class is registered under its
+    name."""
     config = cls.get_default_config()
     assert config[SOLVER_KEY] == cls.__name__
     assert set(config) - {SOLVER_KEY} == cls.config_keys()
     for key, default in cls._DEFAULTS.items():
+        if key in TIME_STEP_KEYS:
+            continue
         assert jsonable(config[key]) == jsonable(default), key
+    assert sum(config[key] is not None for key in TIME_STEP_KEYS) <= 1
     for key in cls._VOLUME_KEYS:
         value = config[key]
         if value is not None:
