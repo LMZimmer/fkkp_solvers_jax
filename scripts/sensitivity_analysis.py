@@ -119,22 +119,30 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
                          seed_voxel_i/j/k
     configs/<run>.json   the run configs (resection_cavity and rt_dose null)
     logs/<run>.log       stdout/stderr of the runs
-    runs/<run>/          the treated stage's Result.save output (config.json
-                         with the derived maps' paths and the aligned time
-                         stepping, result.json,
-                         initial_/final_cell_density.nii.gz), the derived
-                         maps resection_cavity.nii.gz (uint8, label 1) and
+    runs/<run>/          the treated stage's Result.save output without the
+                         initial state (config.json with the derived maps'
+                         paths and the aligned time stepping, result.json,
+                         final_cell_density.nii.gz), the derived maps
+                         resection_cavity.nii.gz (uint8, label 1) and
                          rt_dose.nii.gz (Gy, total) with their record
                          treatment.json (settings, voxel counts, volumes,
                          the time stepping of both stages), and growth/
-                         with the growth stage's Result.save output
+                         with the growth stage's config.json and
+                         result.json only. The seed and the density at
+                         surgery are not kept: the seed voxel is in
+                         design.csv, the density at surgery is
+                         summarized by the two maps and treatment.json
+                         (max_density_at_resection), and both are
+                         reproduced by the saved configs.
     run_status.csv       appended as runs finish: run_name, success,
                          exit_code, wall_time_s, error, final_time, n_steps
     qoi.csv              one line per run: run_name, index, row, matrix,
                          success, the QoIs, final_time, n_steps, wall_time_s,
                          cavity_volume_mm3, dose_volume_mm3
     qoi_summary.json     run counts (successes, empty compartments, NaNs,
-                         extinct runs, empty cavities) and per analysed QoI
+                         extinct runs, empty cavities), the mean wall time
+                         of a run-one subprocess (run_status.csv) and per
+                         analysed QoI
                          the run/block accounting of the Sobol' analysis
     sobol.csv            one line per (qoi, factor): S1, S1_conf, ST, ST_conf,
                          S1_half, ST_half, n_blocks_used
@@ -219,14 +227,22 @@ settings of a design are stored in spec.json and handed to every run, so
 a resumed sweep derives its maps as the first pass did. Nothing is ever
 written outside <output-dir>/<name>/.
 
-Budget: one design point of the atlas base config measured about 7 s
-of process wall time on one Quadro RTX 8000 (1 mm atlas grid, day-360
-horizon, two solves compiled separately) and 6 MB of run directory
-(both stages' densities and the two maps), so N = 1024 and k = 13
-(15 360 runs) is about 8 h on 4 GPUs and about 90 GB. The per-run
-time scales with the crop box and the step count, so a sweep over
-large-D / large-rho points (whose stability estimate raises the step
-count) runs longer.
+Budget: a run's process wall time on one Quadro RTX 8000 (1 mm atlas
+grid, two solves compiled separately, about 0.7 GB of GPU memory and
+2 GB of host memory) is about 7 s plus 1.6 ms per step of the treated
+stage, whose step count the stability estimate sets to about
+8 D T / dx^2 + 100 (D the white-matter diffusivity in mm^2/day, T the
+horizon in days): 7 s at D = 0.2, about 55 s at D = 10. Over the shipped
+log-uniform D range 0.001-10 the mean is about 13 s; a 120-run sweep
+measured a mean of 9.7 s (its D values reached 1.8). A run directory is
+about 3.6 MB, nearly all of it the final density (the two maps are about
+0.2 MB; the seed and the density at surgery are not kept). A process spends
+its first seconds compiling and starting up, so several slots per GPU
+pay off: on GPUs 1, 2, 3 and 6, 30-run sweeps gave about 29 runs/min
+with one slot per GPU, 50 with two, 60 with three and 75 with four. The
+defaults, --log2-n 12 (N = 4096, 61 440 runs with the 13 factors) and
+--jobs-per-gpu 3 (about 55 runs/min at the 13 s mean), are sized for
+about 19-20 h and about 220 GB; --log2-n 11 halves both.
 """
 
 from __future__ import annotations
@@ -282,7 +298,8 @@ DEFAULT_TISSUE_MAPS: dict[str, Path] = {
 }
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_atlas")
 DEFAULT_GPUS = "1,2,3,6"
-DEFAULT_LOG2_N = 10
+DEFAULT_JOBS_PER_GPU = 3  # see Budget
+DEFAULT_LOG2_N = 12  # N = 4096, 61 440 runs with the 13 factors: about 20 h, see Budget
 DEFAULT_DESIGN_SEED = 1
 DEFAULT_N_BOOTSTRAP = 1000
 DEFAULT_BOOTSTRAP_SEED = 0
@@ -1323,12 +1340,13 @@ def run_one(
 ) -> int:
     """
     Solve one run config into run_dir in two stages: the growth stage
-    (``growth_config``, saved into run_dir/growth), the treatment maps
-    derived from its final density (``treatment_maps``, saved as
-    resection_cavity.nii.gz, rt_dose.nii.gz and treatment.json) and the
-    treated stage with those maps on the growth stage's time steps
-    (``align_treated_config``; ``solve(store_result=True,
-    outdir=run_dir)``, whose config.json references the maps).
+    (``growth_config``; its config and result record saved into
+    run_dir/growth, not its volumes), the treatment maps derived from its
+    final density (``treatment_maps``, saved as resection_cavity.nii.gz,
+    rt_dose.nii.gz and treatment.json) and the treated stage with those
+    maps on the growth stage's time steps (``align_treated_config``;
+    ``Result.save`` into run_dir without the initial state; its
+    config.json references the maps).
 
     Args:
         config_path: The run config (resection_cavity and rt_dose null).
@@ -1348,10 +1366,12 @@ def run_one(
     given = [key for key in DERIVED_VOLUME_KEYS if config.get(key) is not None]
     if given:
         raise ValueError(f"run config {config_path} sets {given}, which the run derives; set them to null.")
+    run_dir.mkdir(parents=True, exist_ok=True)
     growth_solver = FKPPSolver(growth_config(config))
-    growth = growth_solver.solve(store_result=True, outdir=run_dir / GROWTH_DIR)
+    growth = growth_solver.solve()
     _print_stage("growth stage", growth)
     if not growth.success:
+        growth.save(run_dir / GROWTH_DIR)  # the record, for run_status.csv
         return 1
     density = np.asarray(growth.final_state["cell_density"], dtype=np.float64)
     zooms = tuple(float(v) for v in growth_solver.params["voxel_size_mm"])
@@ -1365,6 +1385,12 @@ def run_one(
     nib.save(nib.Nifti1Image(dose, affine), str(run_dir / DOSE_FILE))
     voxel_volume = float(np.prod(zooms))
     n_cavity, n_dose = int(cavity.sum()), int(np.count_nonzero(dose))
+    # The growth stage's record and config are kept, its volumes are not:
+    # the seed is the treated stage's too and the density at surgery is
+    # summarized by the maps (see the module docstring).
+    growth.initial_state = {}
+    growth.final_state = {}
+    growth.save(run_dir / GROWTH_DIR)
     record = {
         **treatment,
         "n_fractions": n_fractions,
@@ -1391,7 +1417,9 @@ def run_one(
     config["resection_cavity"] = {"segmentation": str(run_dir / CAVITY_FILE), "label": CAVITY_LABEL}
     config["rt_dose"] = str(run_dir / DOSE_FILE)
     treated = align_treated_config(config, growth.n_steps, growth.dt)
-    result = StuppFKPPSolver(treated).solve(store_result=True, outdir=run_dir)
+    result = StuppFKPPSolver(treated).solve()
+    result.initial_state = {}  # the seed is not kept, see the module docstring
+    result.save(run_dir)
     _print_stage("treated stage", result)
     record.update(
         resection_step=int(growth.n_steps),
@@ -1665,14 +1693,35 @@ def accounting_line(qoi: str, accounting: Mapping[str, Any]) -> str:
     )
 
 
+def mean_run_wall_time(status_records: Sequence[Mapping[str, Any]]) -> float | None:
+    """
+    The mean wall_time_s of the run_status.csv records, over each run's
+    last successful record (a redone run appends a new record): the whole
+    run-one subprocess, both stages, compilation and file I/O included.
+    None without successful records.
+    """
+    latest: dict[str, float] = {}
+    for record in status_records:
+        if _is_success(record):
+            latest[record["run_name"]] = as_float(record.get("wall_time_s"))
+    times = [value for value in latest.values() if np.isfinite(value)]
+    return round(float(np.mean(times)), 3) if times else None
+
+
 def qoi_summary(
-    records: Sequence[Mapping[str, Any]], tau_core: float, tau_edema: float, n_blocks: int, size: int
+    records: Sequence[Mapping[str, Any]],
+    tau_core: float,
+    tau_edema: float,
+    n_blocks: int,
+    size: int,
+    status_records: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """
     The qoi_summary.json record: the global run counts (successes, empty
     compartments per threshold, NaN mass-weighted QoIs, extinct runs at or
-    below the mass floor, runs whose derived cavity is empty) and, per
-    analysed QoI, ``response_accounting``.
+    below the mass floor, runs whose derived cavity is empty), the mean
+    wall time of a run-one subprocess (``mean_run_wall_time`` of the
+    run_status.csv records) and, per analysed QoI, ``response_accounting``.
     """
     successes = [r for r in records if _is_success(r)]
     return {
@@ -1680,6 +1729,7 @@ def qoi_summary(
         "n_runs": len(records),
         "n_success": len(successes),
         "n_failed": len(records) - len(successes),
+        "mean_run_wall_time_s": mean_run_wall_time(status_records),
         "block_size": size,
         "n_blocks_total": n_blocks,
         "tau_core": tau_core,
@@ -2095,7 +2145,9 @@ def _add_treatment_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gpus", default=DEFAULT_GPUS, help="comma-separated CUDA device ids; '' = CPU only")
-    parser.add_argument("--jobs-per-gpu", type=int, default=1, help="slots per GPU (CPU: parallel workers)")
+    parser.add_argument(
+        "--jobs-per-gpu", type=int, default=DEFAULT_JOBS_PER_GPU, help="slots per GPU (CPU: parallel workers)"
+    )
 
 
 def _add_qoi_args(parser: argparse.ArgumentParser) -> None:
@@ -2192,13 +2244,16 @@ def qoi_command(sweep_dir: Path, tau_core: float, tau_edema: float, workers: int
     spec = read_json(sweep_dir / "spec.json")
     records = qoi_table(sweep_dir, tau_core, tau_edema, workers)
     write_csv(sweep_dir / "qoi.csv", records, QOI_COLUMNS)
-    summary = qoi_summary(records, tau_core, tau_edema, int(spec["N"]), int(spec["block_size"]))
+    status_path = sweep_dir / "run_status.csv"
+    status_records = read_csv(status_path) if status_path.is_file() else []
+    summary = qoi_summary(records, tau_core, tau_edema, int(spec["N"]), int(spec["block_size"]), status_records)
     write_json(sweep_dir / "qoi_summary.json", summary)
     print(
         f"qoi.csv: {summary['n_success']}/{summary['n_runs']} successful runs; empty core "
         f"{summary['n_empty_core']}, empty edema {summary['n_empty_edema']}, NaN mass-weighted "
         f"{summary['n_nan_mass_weighted']}, NaN anisotropy {summary['n_nan_anisotropy']}, extinct "
-        f"{summary['n_runs_extinct']}, empty cavity {summary['n_runs_empty_cavity']}",
+        f"{summary['n_runs_extinct']}, empty cavity {summary['n_runs_empty_cavity']}; "
+        f"mean wall time {summary['mean_run_wall_time_s']} s per run",
         flush=True,
     )
     for qoi, accounting in summary["per_qoi"].items():

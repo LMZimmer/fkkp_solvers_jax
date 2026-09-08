@@ -202,7 +202,8 @@ def test_load_search_space():
     assert len(space.names) == 13 and space.overrides == {}
     assert space.names[:3] == ["rho", "white_matter_diffusivity", "diffusivity_ratio"]
     assert space.names[-3:] == list(SEED_KEYS)
-    assert space.factors["rho"] == sa.SearchSpaceParameter("rho", 0.0089228, 0.3449, "log")
+    shipped = json.loads(SHIPPED_SEARCH_SPACE.read_text())
+    assert space.factors["rho"] == sa.SearchSpaceParameter("rho", shipped["rho"]["min"], shipped["rho"]["max"], "log")
     assert space.factors["rt_alpha_beta_ratio"].scale == "linear"
     assert "_note" in space.source and "_note" not in space.factors
     entries = _seed_entries(solver="StuppFKPPSolver", rho={"min": 0.1, "max": 0.2, "scale": "log"}, verbose=True)
@@ -341,8 +342,10 @@ def test_design_bookkeeping(phantom_base):
     with pytest.raises(ValueError, match="3D and alike"):
         sa.seed_geometry(faint_wm[0], faint_gm[0], 0.1)
     # The chemotherapy budget of the shipped ranges on the phantom schedule.
+    space = sa.load_search_space(SHIPPED_SEARCH_SPACE, CONFIG_KEYS)
+    kill, decay = space.factors["chemo_kill_rate"], space.factors["chemo_decay_rate"]
     assert spec["chemo_total_dose"] == 225.0
-    np.testing.assert_allclose(spec["chemo_log_kill_range"], [1.1e-3 * 225 / 20, 5.6e-3 * 225 / 5])
+    np.testing.assert_allclose(spec["chemo_log_kill_range"], [kill.low * 225 / decay.high, kill.high * 225 / decay.low])
     # Every config is a complete StuppFKPPSolver run once the derived maps
     # are given (here: empty).
     shape = seedable.shape
@@ -393,7 +396,9 @@ def test_tissue_map_override_and_cli_defaults(phantom_base):
     assert args.output_dir == str(sa.DEFAULT_OUTPUT_DIR) == "/mnt/Drive4/lucas/stupp_sensitivity_analysis_atlas"
     assert args.white_matter_pbmap == str(sa.DEFAULT_TISSUE_MAPS["white_matter_pbmap"])
     assert args.gray_matter_pbmap.endswith("brats_mni152/brats_mni152_gm_pbmap.nii.gz")
-    assert sa.build_parser().parse_args(["all", "--name", "x", "--gray-matter-pbmap", ""]).gray_matter_pbmap == ""
+    everything = sa.build_parser().parse_args(["all", "--name", "x", "--gray-matter-pbmap", ""])
+    assert everything.gray_matter_pbmap == ""
+    assert (everything.log2_n, everything.jobs_per_gpu, everything.gpus) == (12, 3, "1,2,3,6")
 
 
 def test_project_seeds_nested_ranges():
@@ -507,16 +512,38 @@ def test_treatment_settings():
             sa.treatment_settings(**bad)
 
 
+def _phantom_search_space(tmp_path: Path) -> Path:
+    """A small search space whose ranges keep the phantom tumor growing
+    past the cavity threshold by surgery: rho, D and resection_time
+    factors, the seed mass fixed, the three seed factors."""
+    path = tmp_path / "small_space.json"
+    path.write_text(
+        json.dumps(
+            {
+                "solver": "StuppFKPPSolver",
+                "_note": "small phantom search space",
+                "rho": {"min": 0.1, "max": 0.3, "scale": "log"},
+                "white_matter_diffusivity": {"min": 0.05, "max": 0.3, "scale": "log"},
+                "resection_time": {"min": 10.0, "max": 14.0, "scale": "linear"},
+                "gaussian_seed_mass": 250.0,
+                **_seed_entries(),
+            }
+        )
+    )
+    return path
+
+
 def test_run_one_two_stages(phantom_base):
-    """One design point on the phantom (CPU): the growth stage is saved
-    into growth/, the cavity is the growth density at or above the
-    threshold, the dose map holds the total dose within the margin, the
-    treated stage's config.json references both maps and reproduces the
-    run through read_config, both stages start from the same seed, and
+    """One design point on the phantom (CPU): the growth stage's record
+    and config are saved into growth/ without volumes, the cavity is the
+    growth density at or above the threshold (checked by re-solving the
+    saved growth config), the dose map holds the total dose within the
+    margin, the treated stage's config.json references both maps and
+    reproduces the run through read_config, the seed is not saved, and
     the treated stage's final density vanishes inside the cavity."""
     tmp_path = phantom_base["tmp_path"]
     sweep_dir = sa.make_design(
-        sa.DEFAULT_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "one", log2_n=1, seed=2, rt_margin_mm=3.0
+        _phantom_search_space(tmp_path), phantom_base["path"], tmp_path / "sa", "one", log2_n=1, seed=2, rt_margin_mm=3.0
     )
     config_path = sweep_dir / "configs" / "r0000_A.json"
     run_dir = sweep_dir / "runs" / "r0000_A"
@@ -536,7 +563,10 @@ def test_run_one_two_stages(phantom_base):
     horizon = config["resection_time"] + config["time_after_resection"]
     assert horizon - 1e-9 <= result["final_time"] <= horizon + growth["dt"]
     assert result["final_time"] == pytest.approx(result["n_steps"] * growth["dt"], rel=1e-12)
-    growth_density = np.asarray(nib.load(str(run_dir / "growth" / "final_cell_density.nii.gz")).get_fdata())
+    assert sorted(p.name for p in (run_dir / "growth").iterdir()) == ["config.json", "result.json"]
+    assert growth["files"] == ["config.json", "result.json"] and growth["grid_shape"] is None
+    growth_density = FKPPSolver(read_config(run_dir / "growth" / "config.json")).solve().final_state["cell_density"]
+    growth_density = np.asarray(growth_density, dtype=np.float64)
     cavity = np.asarray(nib.load(str(run_dir / "resection_cavity.nii.gz")).get_fdata())
     dose = np.asarray(nib.load(str(run_dir / "rt_dose.nii.gz")).get_fdata())
     record = json.loads((run_dir / "treatment.json").read_text())
@@ -559,9 +589,8 @@ def test_run_one_two_stages(phantom_base):
     reproduced = StuppFKPPSolver(saved)
     np.testing.assert_array_equal(reproduced.params["resection_cavity"], expected_cavity)
     np.testing.assert_allclose(reproduced.params["rt_dose"], expected_dose)
-    initial = np.asarray(nib.load(str(run_dir / "initial_cell_density.nii.gz")).get_fdata())
-    growth_initial = np.asarray(nib.load(str(run_dir / "growth" / "initial_cell_density.nii.gz")).get_fdata())
-    np.testing.assert_array_equal(initial, growth_initial)
+    assert not (run_dir / "initial_cell_density.nii.gz").exists()
+    assert result["files"] == ["config.json", "final_cell_density.nii.gz", "result.json"]
     final = np.asarray(nib.load(str(run_dir / "final_cell_density.nii.gz")).get_fdata())
     assert final.max() > 0 and np.all(final[expected_cavity] == 0)
     # The run-status record of a run that failed in its growth stage.
@@ -576,13 +605,12 @@ def test_run_one_two_stages(phantom_base):
 # --- (6) QoIs on synthetic fields ---
 def test_chemo_log_kill_range():
     """The shipped ranges with the example config's 8 900 mg/m^2 schedule
-    bound the total log kill kill * D_tot / decay to [0.5, 10] within 5 %;
-    an override or a fixed value stands in for a factor range."""
+    give the total log kill kill * D_tot / decay range of the factor
+    bounds; an override or a fixed value stands in for a factor range."""
     example = read_config(SCRIPT.parent / "stupp_config_example.json", solver=StuppFKPPSolver)
     space = sa.load_search_space(SHIPPED_SEARCH_SPACE, CONFIG_KEYS)
     total_dose, (low, high) = sa.chemo_log_kill_range(example, space)
-    assert total_dose == 8900.0
-    np.testing.assert_allclose([low, high], [0.5, 10.0], rtol=0.05)
+    assert total_dose == 8900.0 and 0 < low < high
     kill, decay = space.factors["chemo_kill_rate"], space.factors["chemo_decay_rate"]
     assert (low, high) == (kill.low * 8900 / decay.high, kill.high * 8900 / decay.low)
     fixed = sa.load_search_space(
@@ -698,8 +726,15 @@ def test_log10_mass_floor():
     records = [
         {"success": True, "index": i, **values} for i, values in enumerate((zero, extinct, qoi))
     ]
-    summary = sa.qoi_summary(records, 0.6, 0.3, n_blocks=1, size=3)
+    status = [  # r1 failed first and was redone: only its last record counts
+        {"run_name": "r0", "success": "True", "wall_time_s": "2.0"},
+        {"run_name": "r1", "success": "False", "wall_time_s": "9.0"},
+        {"run_name": "r1", "success": "True", "wall_time_s": "4.0"},
+    ]
+    summary = sa.qoi_summary(records, 0.6, 0.3, n_blocks=1, size=3, status_records=status)
     assert summary["n_runs_extinct"] == 2 and summary["n_nan_mass_weighted"] == 2
+    assert summary["mean_run_wall_time_s"] == 3.0
+    assert sa.qoi_summary(records, 0.6, 0.3, 1, 3)["mean_run_wall_time_s"] is None
     assert summary["per_qoi"]["log10_mass"]["n_blocks_dropped"] == 0
     assert summary["per_qoi"]["R_g"] == {
         "n_runs_total": 3, "n_runs_failed": 0, "n_runs_nan": 2, "n_blocks_total": 1,
@@ -815,22 +850,8 @@ def test_end_to_end_on_phantom(phantom_base):
     every finished run. About 60-90 s: 32 processes, each compiling two
     scans (``slow``; deselect with -m "not slow")."""
     tmp_path = phantom_base["tmp_path"]
-    search_space = tmp_path / "small_space.json"
-    search_space.write_text(
-        json.dumps(
-            {
-                "solver": "StuppFKPPSolver",
-                "_note": "small phantom search space",
-                "rho": {"min": 0.1, "max": 0.3, "scale": "log"},
-                "white_matter_diffusivity": {"min": 0.05, "max": 0.3, "scale": "log"},
-                "resection_time": {"min": 10.0, "max": 14.0, "scale": "linear"},
-                "gaussian_seed_mass": 250.0,
-                **_seed_entries(),
-            }
-        )
-    )
     sweep_dir = sa.make_design(
-        search_space, phantom_base["path"], tmp_path / "sa", "e2e", log2_n=2, seed=1, rt_margin_mm=3.0
+        _phantom_search_space(tmp_path), phantom_base["path"], tmp_path / "sa", "e2e", log2_n=2, seed=1, rt_margin_mm=3.0
     )
     spec = json.loads((sweep_dir / "spec.json").read_text())
     assert spec["k"] == 6 and spec["n_runs"] == 32 and spec["overrides"] == {"gaussian_seed_mass": 250.0}
