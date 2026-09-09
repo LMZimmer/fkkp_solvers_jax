@@ -29,7 +29,13 @@ seed, one step before and one day after the resection; three evenly spaced
 days inside the radiotherapy block; three evenly spaced days from its end
 to the end of the run (each recorded at the nearest time step). The cavity
 outline and the seed voxel are marked. A total-mass-vs-time panel
-with the treatment events marked sits below. Written into
+with the treatment events marked sits below; it is sampled at the seed
+(t = 0), the nine montage days, every --snapshot-interval-days days
+(default 7) over the whole run and the day after the last fraction of
+each week of radiotherapy (fractions at most a day apart form a week).
+The run ends --horizon-days (default 230) after the seed, replacing the
+config's time_after_resection; treatment events scheduled later never
+fire. Written into
 <output-dir>/<run-name>/ (exist_ok=False, nothing outside it): config.json,
 result.json and the initial and final cell density of the treated solve
 (fisher_kpp_jax.Result.save; the synthetic cavity and dose map are in-memory
@@ -39,7 +45,7 @@ pre-resection solve, snapshot times and masses).
 
 Run from the project root, e.g.:
   CUDA_VISIBLE_DEVICES=<free gpu> python scripts/run_stupp_synthetic.py --output-dir runs/
-  JAX_PLATFORMS=cpu python scripts/run_stupp_synthetic.py --output-dir runs/ --n-snapshots 13
+  JAX_PLATFORMS=cpu python scripts/run_stupp_synthetic.py --output-dir runs/ --snapshot-interval-days 14
 """
 
 from __future__ import annotations
@@ -65,7 +71,7 @@ from scipy.ndimage import center_of_mass, distance_transform_edt  # noqa: E402
 
 from fisher_kpp_jax import SOLVER_KEY, FKPPSolver, StuppFKPPSolver, read_config  # noqa: E402
 from fisher_kpp_jax.config import jsonable  # noqa: E402
-from fisher_kpp_jax.util import montage_days, render, select_panels  # noqa: E402
+from fisher_kpp_jax.util import montage_days, render, select_panels, session_blocks  # noqa: E402
 
 DEFAULT_CONFIG = str(_ROOT / "scripts" / "stupp_config_example.json")
 DEFAULT_WM = str(_ROOT / "reference_solves" / "wm_pbmap.nii.gz")
@@ -121,7 +127,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--threshold", type=float, default=0.01, help="cell density below which the overlay is transparent"
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--snapshot-interval-days",
+        type=float,
+        default=7.0,
+        help="spacing of the periodic snapshots of the mass-vs-time panel in days (default 7)",
+    )
+    parser.add_argument(
+        "--horizon-days",
+        type=float,
+        default=230.0,
+        help="end of the run in days after the seed (default 230); replaces the config's time_after_resection",
+    )
+    args = parser.parse_args(argv)
+    if not args.snapshot_interval_days > 0:
+        parser.error("--snapshot-interval-days must be positive.")
+    if not np.isfinite(args.horizon_days) or args.horizon_days <= 0:
+        parser.error("--horizon-days must be positive.")
+    return args
+
+
+def mass_curve_days(
+    resection_time: float, rt_times: np.ndarray, stopping_time: float, interval: float
+) -> list[float]:
+    """
+    Snapshot days recorded for the mass-vs-time panel on top of the
+    montage days: every ``interval`` days over the whole run (the seed at
+    t = 0 is the initial state) and the day after the last fraction of
+    each week of radiotherapy (fractions at most a day apart form a
+    week, so the snapshot follows that week's last fraction).
+    """
+    days = [float(day) for day in np.arange(interval, stopping_time, interval)]
+    days += [end + 1.0 for _, end in session_blocks(np.sort(np.asarray(rt_times, dtype=np.float64)))]
+    return [day for day in days if day <= stopping_time]
 
 
 def synthetic_treatment_volumes(
@@ -196,7 +234,12 @@ def main(argv: list[str] | None = None) -> int:
         **seed_fractions,
     )
     resection_time = float(config["resection_time"])
-    stopping_time = resection_time + float(config["time_after_resection"])
+    stopping_time = float(args.horizon_days)
+    if stopping_time <= resection_time:
+        raise ValueError(
+            f"--horizon-days {stopping_time:g} must exceed the config's resection_time {resection_time:g}."
+        )
+    config["time_after_resection"] = stopping_time - resection_time
 
     # Solve 1: untreated up to the resection (FKPPSolver, whose dynamics
     # StuppFKPPSolver reproduces up to that step); its final state defines
@@ -241,10 +284,15 @@ def main(argv: list[str] | None = None) -> int:
     z = args.slice_z if args.slice_z is not None else int(round(center_of_mass(dose)[2]))
     print(f"slice z={z}")
 
-    # Solve 2: the treated horizon, recording the montage frames.
+    # Solve 2: the treated horizon, recording the montage frames and the
+    # extra frames of the mass-vs-time panel.
     panel_days = montage_days(resection_time, dt, config["rt_times"], stopping_time)
+    curve_days = mass_curve_days(
+        resection_time, config["rt_times"], stopping_time, args.snapshot_interval_days
+    )
+    snapshot_days = sorted(set(panel_days) | set(curve_days))
     solver = StuppFKPPSolver(
-        {**config, "resection_cavity": cavity, "rt_dose": dose, "snapshot_times": panel_days}
+        {**config, "resection_cavity": cavity, "rt_dose": dose, "snapshot_times": snapshot_days}
     )
     params = solver.params
     treated = solver.solve(store_result=True, outdir=run_dir)
@@ -259,6 +307,11 @@ def main(argv: list[str] | None = None) -> int:
     times = treated.snapshot_times
     masses = frames.sum(axis=(1, 2, 3))
     panels = select_panels(pre.initial_state["cell_density"], frames, times, panel_days)
+    # The mass curve: the seed at t = 0, then every recorded frame.
+    initial_mass = float(treated.initial_state["cell_density"].sum())
+    curve_times = np.concatenate([[0.0], times])
+    curve_masses = np.concatenate([[initial_mass], masses])
+    print(f"mass curve: {curve_times.size} points (seed, {len(panel_days)} montage days, {len(curve_days)} extra days)")
 
     header = (
         f"D {params['white_matter_diffusivity']:g}, rho {params['rho']:g}, "
@@ -276,8 +329,8 @@ def main(argv: list[str] | None = None) -> int:
         seed_voxel,
         z,
         args.threshold,
-        times,
-        masses,
+        curve_times,
+        curve_masses,
         params,
     )
     # The treated solve's parameters and outcome are in config.json /
@@ -303,6 +356,8 @@ def main(argv: list[str] | None = None) -> int:
             "final_mass": pre.final_stopping_quantity,
             "wall_time_s": pre.wall_time_s,
         },
+        "initial_mass": initial_mass,
+        "montage_days": jsonable(panel_days),
         "snapshot_times": jsonable(times),
         "snapshot_masses": jsonable(masses),
     }

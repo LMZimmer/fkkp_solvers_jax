@@ -27,6 +27,12 @@ _COMMON = dict(
     gaussian_seed_x_fraction=0.5,
     gaussian_seed_y_fraction=0.5,
     gaussian_seed_z_fraction=0.5,
+    # The phantom seed is pinned (peak 0.50, sigma 3.2 mm, about 160 mass
+    # units inside the 9-voxel phantom): the solver defaults (tau 15,
+    # mass 1500, GliODIL's seed) fill the phantom and put its mass past
+    # the 300-unit stopping thresholds of the early-exit tests at step 0.
+    gaussian_seed_diffusion_time=5.0,
+    gaussian_seed_mass=250.0,
     resolution_factor=0.6,
     stopping_time=10,
     precision="f64",

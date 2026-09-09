@@ -150,6 +150,9 @@ def render(
             label="chemotherapy only" if index == 0 else None,
         )
     ax.set_yscale("log")
+    # The panel ends with the run: events scheduled after the last recorded
+    # day (the end of the run) never fired.
+    ax.set_xlim(-0.01 * float(np.max(times)), 1.01 * float(np.max(times)))
     ax.set_xlabel("time [days]", fontsize=12)
     ax.set_ylabel("total mass", fontsize=12)
     ax.grid(alpha=0.3)

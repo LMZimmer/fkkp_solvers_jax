@@ -23,6 +23,7 @@ analyze) with a small search space.
 from __future__ import annotations
 
 import csv
+import gzip
 import importlib.util
 import json
 import sys
@@ -101,6 +102,10 @@ def phantom_base(tmp_path: Path, tissue_phantom) -> dict:
         "gaussian_seed_x_fraction": 0.5,
         "gaussian_seed_y_fraction": 0.5,
         "gaussian_seed_z_fraction": 0.5,
+        # Pinned so the phantom's seed (mass 250 in the search space: a peak
+        # of 0.50, sigma 3.2 mm on the 24-voxel grid) does not follow the
+        # solver defaults (tau 15, at which mass 250 is below the floor).
+        "gaussian_seed_diffusion_time": 5.0,
         "resolution_factor": 1.0,
         "precision": "f32",
         "steps_per_day": 110,
@@ -641,6 +646,39 @@ def test_growth_config(phantom_base):
     assert solver.params["stopping_time"] == 7.5
 
 
+def test_round_field():
+    """Storage rounding of a density field: float32 of the input's shape,
+    values below the floor (negative ones included) zero, the kept
+    mantissa bits the only nonzero ones, exact for values representable
+    in them, relative error within half a unit of the last kept bit,
+    idempotent, and the default rounding of a random field compresses
+    far better than the field itself."""
+    rng = np.random.default_rng(0)
+    volume = rng.random((6, 7, 8)) * np.logspace(-14, 0, 336).reshape(6, 7, 8)
+    volume[0, 0, :3] = [-1e-3, 0.0, 5e-11]
+    rounded = sa.round_field(volume)
+    assert rounded.dtype == np.float32 and rounded.shape == volume.shape
+    assert np.all(rounded[volume < 1e-10] == 0) and np.all(rounded[volume >= 1e-10] > 0)
+    bits = rounded.view(np.uint32)
+    assert not np.any(bits & np.uint32((1 << 16) - 1))  # 23 - 7 mantissa bits dropped
+    kept = volume >= 1e-10
+    np.testing.assert_allclose(rounded[kept], volume[kept], rtol=2.0**-8, atol=0)
+    assert np.abs(rounded[kept] / volume[kept] - 1).max() > 2.0**-10  # it does round
+    np.testing.assert_array_equal(sa.round_field(rounded), rounded)
+    exact = np.array([0.5, 0.75, 1.0, 1.0 + 2.0**-7, 2.0**-30], dtype=np.float32)
+    np.testing.assert_array_equal(sa.round_field(exact), exact)
+    # One kept bit represents 1, 1.5, 2, 3: ties go to the even mantissa.
+    np.testing.assert_array_equal(
+        sa.round_field(np.array([1.5, 2.5, 1.25, 1.75, 2.75]), mantissa_bits=1), [1.5, 2.0, 1.0, 2.0, 3.0]
+    )
+    np.testing.assert_array_equal(sa.round_field(np.array([0.3, 0.6]), mantissa_bits=23), np.float32([0.3, 0.6]))
+    assert sa.round_field(np.array([[1e-3]]), floor=1e-2)[0, 0] == 0
+    with pytest.raises(ValueError, match="mantissa_bits must be 1 to 23"):
+        sa.round_field(volume, mantissa_bits=0)
+    field = np.exp(-rng.random((40, 40, 40)) * 60)  # a plume down to e^-60
+    assert len(gzip.compress(sa.round_field(field).tobytes())) < len(gzip.compress(field.astype(np.float32).tobytes())) / 3
+
+
 def test_treatment_maps():
     """A unit ball of radius 4 at the threshold gives the ball as cavity
     and, with a 6 mm margin, a dose region that holds every voxel within
@@ -725,8 +763,9 @@ def _phantom_search_space(tmp_path: Path) -> Path:
 def test_run_one_two_stages(phantom_base):
     """One design point on the phantom (CPU): the growth stage's record
     and config are saved into growth/ without volumes, its final density
-    as the pre-resection field (float32, the final field's affine; equal
-    to the re-solved saved growth config), the cavity is that density at
+    as the pre-resection field (float32, the final field's affine; the
+    re-solved saved growth config rounded for storage, as is the final
+    field), the cavity is the unrounded density at
     or above the threshold, the dose map holds the total dose within the
     margin, the treated stage's config.json references both maps and
     reproduces the run through read_config, the seed is not saved, the
@@ -766,7 +805,8 @@ def test_run_one_two_stages(phantom_base):
     np.testing.assert_array_equal(pre_image.affine, final_image.affine)
     assert pre_image.header.get_zooms() == final_image.header.get_zooms()
     pre_density = np.asarray(pre_image.get_fdata(), dtype=np.float64)
-    np.testing.assert_allclose(pre_density, growth_density.astype(np.float32), rtol=1e-6)
+    np.testing.assert_array_equal(pre_density, sa.round_field(growth_density))
+    np.testing.assert_allclose(pre_density, growth_density, rtol=2.0**-8, atol=1e-10)
     cavity = np.asarray(nib.load(str(run_dir / "resection_cavity.nii.gz")).get_fdata())
     dose = np.asarray(nib.load(str(run_dir / "rt_dose.nii.gz")).get_fdata())
     record = json.loads((run_dir / "treatment.json").read_text())
@@ -793,6 +833,7 @@ def test_run_one_two_stages(phantom_base):
     assert result["files"] == ["config.json", "final_cell_density.nii.gz", "result.json"]
     final = np.asarray(nib.load(str(run_dir / "final_cell_density.nii.gz")).get_fdata())
     assert final.max() > 0 and np.all(final[expected_cavity] == 0)
+    np.testing.assert_array_equal(final, sa.round_field(final))  # stored rounded
     assert record["pre_resection_file"] == "pre_resection_cell_density.nii.gz"
     # The saved records feed run_status.csv and qoi.csv: the time
     # stepping of both stages, the volumes; the qoi record holds the

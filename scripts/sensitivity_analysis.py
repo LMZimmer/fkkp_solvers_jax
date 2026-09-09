@@ -192,7 +192,8 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
                          final_cell_density.nii.gz), the growth stage's
                          final density pre_resection_cell_density.nii.gz
                          (float32, the same affine; omitted with
-                         --no-keep-pre-resection-field), the derived maps
+                         --no-keep-pre-resection-field), both fields
+                         rounded for storage (round_field), the derived maps
                          resection_cavity.nii.gz (uint8, label 1) and
                          rt_dose.nii.gz (Gy, total) with their record
                          treatment.json (settings, voxel counts, volumes,
@@ -331,10 +332,12 @@ the old run, so the default design is halved: --log2-n 11 (N = 2048,
 30 720 runs with the 13 factors), about 11-14 h on the same 12 slots
 (the 14.1 h of the old sweep would hold about 38 000 runs, and N must be
 a power of two); --log2-n 12 is about 23 h. A run directory is about
-7.2 MB: the final density and the pre-resection field about 3.6 MB
-each (drop the latter with --no-keep-pre-resection-field), the two
-maps about 0.2 MB; the seed is not kept: about 220 GB at the default
-(110 GB without the pre-resection fields). A process spends its first
+2 MB: the final density and the pre-resection field about 0.9 MB each
+on average (a whole-brain tumor up to 3.3 MB, a small one 0.1 MB; both
+rounded for storage, see FIELD_MANTISSA_BITS, unrounded they were 3.6 MB
+each; drop the latter with --no-keep-pre-resection-field), the two
+maps about 0.2 MB; the seed is not kept: about 60 GB at the default
+(35 GB without the pre-resection fields). A process spends its first
 seconds compiling and starting up, so several slots per GPU pay off:
 30-run sweeps gave about 29 runs/min with one slot per GPU, 50 with
 two, 60 with three and 75 with four at the old 9 s per run. A
@@ -363,8 +366,9 @@ from queue import Empty, Queue
 from typing import Any, Literal
 
 # Keep XLA from grabbing 75% of a (possibly shared) GPU; must be set before
-# jax initializes the backend. fisher_kpp_jax (and with it jax) is imported
-# lazily, inside the subcommands that need the solver: design and run-one.
+# jax initializes its backend, which importing fisher_kpp_jax does not do
+# (the backend starts with the first array operation, in the subcommands
+# that run the solver: design and run-one).
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 # This machine has more cores than the bundled OpenBLAS's 128-thread build
 # limit; cap it so NumPy/SciPy teardown does not emit thread-region warnings.
@@ -373,10 +377,18 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "32")
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from numpy.typing import NDArray  # noqa: E402
+from SALib.analyze import sobol as sobol_analyze  # noqa: E402
+from SALib.sample import sobol as sobol_sample  # noqa: E402
 from scipy.ndimage import distance_transform_edt  # noqa: E402
+
+from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, read_config, write_config  # noqa: E402
 
 SOLVER_NAME = "StuppFKPPSolver"
 # The solver of the growth stage (seed to resection_time, no treatment).
@@ -420,10 +432,20 @@ DOSE_FILE = "rt_dose.nii.gz"  # float32, Gy, total over all fractions
 TREATMENT_FILE = "treatment.json"  # the derivation record
 CAVITY_LABEL = 1
 FINAL_FIELD_FILE = "final_cell_density.nii.gz"  # Result.save's final field
-# The growth stage's final density (the field the cavity is thresholded
+# The growth stage's final density (the density the cavity is thresholded
 # from), float32 with the final field's affine; a symlink to the final
 # field in growth-only mode.
 PRE_RESECTION_FILE = "pre_resection_cell_density.nii.gz"
+# The saved density fields are rounded (``round_field``) before writing:
+# the float32 mantissa to FIELD_MANTISSA_BITS bits (relative error at most
+# 2^-(bits+1), 0.4 %) and densities below FIELD_FLOOR to zero. Both make
+# the gzip five times smaller and leave every QoI within 1e-3 of its
+# spread over the design (measured on the 2026-09-08 atlas sweep); a
+# lower floor keeps the diffusion residue that costs the space, a higher
+# one (1e-8 and up) loses mass of the near-extinct treated tumors, whose
+# mass sits at such densities.
+FIELD_MANTISSA_BITS = 7
+FIELD_FLOOR = 1e-10
 PRE_PREFIX = "pre_"  # the QoI columns of that field
 # The three time-step entries of a config (at most one set); the base
 # config must set one, else every run would fall back to the solver's
@@ -1029,8 +1051,6 @@ def saltelli_design(
         The N (k + 2) x k (or N (2k + 2) x k) array in [0, 1), in SALib's
         row order (see the module docstring).
     """
-    from SALib.sample import sobol as sobol_sample
-
     samples = sobol_sample.sample(
         salib_problem(names),
         2 ** int(log2_n),
@@ -1206,8 +1226,7 @@ def write_json(path: Path, record: Mapping[str, Any]) -> None:
 
 
 def _jsonable(record: Any) -> Any:
-    """JSON conversion of numpy values without importing fisher_kpp_jax
-    (inf/nan become null)."""
+    """JSON conversion of numpy values (inf/nan become null)."""
     if isinstance(record, Mapping):
         return {str(k): _jsonable(v) for k, v in record.items()}
     if isinstance(record, (list, tuple, np.ndarray)):
@@ -1338,8 +1357,6 @@ def make_design(
     Returns:
         The sweep directory <output_dir>/<name>.
     """
-    from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, read_config
-
     sweep_dir = Path(output_dir) / name
     if sweep_dir.exists():
         raise FileExistsError(f"{sweep_dir} exists; a design is never overwritten.")
@@ -1454,8 +1471,6 @@ def write_design_outputs(
 ) -> None:
     """Create the sweep directory and write search_space.json,
     base_config.json, spec.json, design.csv and configs/<run>.json."""
-    from fisher_kpp_jax import write_config
-
     sweep_dir.mkdir(parents=True, exist_ok=False)
     for sub in ("configs", "logs", "runs"):
         (sweep_dir / sub).mkdir()
@@ -1723,8 +1738,6 @@ def growth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     Returns:
         The FKPPSolver config, "solver" entry included.
     """
-    from fisher_kpp_jax import FKPPSolver
-
     keys = FKPPSolver.config_keys() - {"stopping_time"}
     growth: dict[str, Any] = {SOLVER_KEY: GROWTH_SOLVER_NAME}
     growth.update({key: value for key, value in config.items() if key in keys})
@@ -1808,6 +1821,42 @@ def align_treated_config(config: Mapping[str, Any], n_growth: int, dt: float) ->
     return aligned
 
 
+def round_field(
+    volume: NDArray, mantissa_bits: int = FIELD_MANTISSA_BITS, floor: float = FIELD_FLOOR
+) -> NDArray:
+    """
+    A density field rounded for storage: float32 with the mantissa rounded
+    to mantissa_bits bits (round half to even) and every value below
+    floor, negative values included, set to zero. The result is a plain
+    float32 volume, so a NIfTI of it reads back without any decoding; the
+    zeroed mantissa bits and the zeroed residue are what gzip removes
+    (see FIELD_MANTISSA_BITS).
+
+    Args:
+        volume: The field, any float dtype.
+        mantissa_bits: Mantissa bits kept, 1 to 23.
+        floor: Values below it become zero.
+
+    Returns:
+        The rounded float32 field of volume's shape.
+    """
+    if not 1 <= mantissa_bits <= 23:
+        raise ValueError(f"mantissa_bits must be 1 to 23, got {mantissa_bits}.")
+    kept = np.where(np.asarray(volume) >= floor, volume, 0.0).astype(np.float32)
+    if mantissa_bits == 23:
+        return kept
+    bits = np.ascontiguousarray(kept).view(np.uint32).astype(np.uint64)
+    dropped = np.uint64(23 - mantissa_bits)
+    one = np.uint64(1)
+    half = one << (dropped - one)
+    mask = ~((one << dropped) - one)
+    # Round half to even: add half minus one plus the lowest kept bit,
+    # then clear the dropped bits; a carry into the exponent is a
+    # correct rounding up.
+    rounded = (bits + half - one + ((bits >> dropped) & one)) & mask
+    return rounded.astype(np.uint32).view(np.float32).reshape(kept.shape)
+
+
 def _print_stage(stage: str, result: Any) -> None:
     """The console line of one stage's Result."""
     status = "ok" if result.success else f"FAILED: {result.error}"
@@ -1837,7 +1886,9 @@ def run_one(
     resection_cavity.nii.gz, rt_dose.nii.gz and treatment.json) and the
     treated stage with those maps on the growth stage's time steps
     (``align_treated_config``; ``Result.save`` into run_dir without the
-    initial state; its config.json references the maps).
+    initial state; its config.json references the maps). Both saved
+    density fields are rounded for storage (``round_field``); the maps
+    and the treatment record derive from the unrounded density.
 
     In growth-only mode the growth stage is the run: ``Result.save`` of
     the growth stage into run_dir itself (config.json is the FKPPSolver
@@ -1853,14 +1904,12 @@ def run_one(
         rt_margin_mm: See ``treatment_settings``.
         rt_dose_per_fraction: See ``treatment_settings``.
         keep_pre_resection_field: Whether the density at resection time
-            is kept (about 3.6 MB per run on the atlas grid).
+            is kept (about 0.5 MB per run on the atlas grid).
         growth_only: Skip the treated stage.
 
     Returns:
         0 on success, 1 if either stage reports a failure.
     """
-    from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, read_config
-
     treatment = treatment_settings(cavity_threshold, rt_margin_mm, rt_dose_per_fraction)
     run_dir = Path(run_dir).resolve()
     config = read_config(config_path, solver=StuppFKPPSolver)
@@ -1873,6 +1922,7 @@ def run_one(
     _print_stage("growth stage", growth)
     growth.initial_state = {}  # the seed is not kept, see the module docstring
     if growth_only:
+        growth.final_state = {key: round_field(value) for key, value in growth.final_state.items()}
         growth.save(run_dir)
         if growth.success and keep_pre_resection_field:
             (run_dir / PRE_RESECTION_FILE).symlink_to(FINAL_FIELD_FILE)
@@ -1885,7 +1935,7 @@ def run_one(
     affine = np.eye(4) if growth.affine is None else np.asarray(growth.affine, dtype=np.float64)
     if keep_pre_resection_field:
         # Written as Result.save writes the final field: float32, the affine.
-        image = nib.Nifti1Image(density.astype(np.float32), affine)
+        image = nib.Nifti1Image(round_field(density), affine)
         image.set_data_dtype(np.float32)
         nib.save(image, str(run_dir / PRE_RESECTION_FILE))
     n_fractions = len(config["rt_times"])
@@ -1931,6 +1981,7 @@ def run_one(
     treated = align_treated_config(config, growth.n_steps, growth.dt)
     result = StuppFKPPSolver(treated).solve()
     result.initial_state = {}  # the seed is not kept, see the module docstring
+    result.final_state = {key: round_field(value) for key, value in result.final_state.items()}
     result.save(run_dir)
     _print_stage("treated stage", result)
     record.update(
@@ -2326,8 +2377,6 @@ def sobol_indices(
     Returns:
         S1, S1_conf, ST, ST_conf (and S2, S2_conf), float64 arrays.
     """
-    from SALib.analyze import sobol as sobol_analyze
-
     result = sobol_analyze.analyze(
         salib_problem(names),
         np.asarray(response, dtype=np.float64),
@@ -2489,8 +2538,6 @@ def _save_figure(figure: Any, stem: Path) -> list[Path]:
     paths = [stem.with_suffix(".png"), stem.with_suffix(".pdf")]
     figure.savefig(paths[0], dpi=150)
     figure.savefig(paths[1])
-    import matplotlib.pyplot as plt
-
     plt.close(figure)
     return paths
 
@@ -2511,9 +2558,6 @@ def make_figures(
     Returns:
         The files written.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
     figure_dir.mkdir(exist_ok=True)
     written: list[Path] = []
     if not results:
@@ -2535,8 +2579,6 @@ def make_figures(
 def _heatmap(results: Mapping[str, Mapping[str, Any]], names: Sequence[str], key: str) -> Any:
     """Factors x QoIs heatmap of one index (single-hue sequential map,
     values annotated)."""
-    import matplotlib.pyplot as plt
-
     qois = list(results)
     matrix = np.array([[float(results[qoi][key][i]) for qoi in qois] for i in range(len(names))])
     figure, axis = plt.subplots(figsize=(1.0 + 0.75 * len(qois), 0.9 + 0.42 * len(names)))
@@ -2558,8 +2600,6 @@ def _heatmap(results: Mapping[str, Mapping[str, Any]], names: Sequence[str], key
 
 def _bar_chart(qoi: str, names: Sequence[str], result: Mapping[str, Any]) -> Any:
     """Grouped bars of S1 and ST per factor with 95 % whiskers."""
-    import matplotlib.pyplot as plt
-
     positions = np.arange(len(names))
     width = 0.38
     figure, axis = plt.subplots(figsize=(1.5 + 0.55 * len(names), 3.6))
@@ -2601,8 +2641,6 @@ def _scatter_grid(
 ) -> Any:
     """One QoI against every factor over the given (A and B) rows,
     rasterised points with a binned-median line; log-x for log factors."""
-    import matplotlib.pyplot as plt
-
     n_cols = min(4, len(names))
     n_rows = int(np.ceil(len(names) / n_cols))
     figure, axes = plt.subplots(n_rows, n_cols, figsize=(3.2 * n_cols, 2.6 * n_rows), squeeze=False)
@@ -2688,7 +2726,7 @@ def _add_keep_pre_resection_arg(parser: argparse.ArgumentParser) -> None:
         "--keep-pre-resection-field",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=f"keep every run's density at resection_time as runs/<run>/{PRE_RESECTION_FILE} (about 3.6 MB per run)",
+        help=f"keep every run's density at resection_time as runs/<run>/{PRE_RESECTION_FILE} (about 0.5 MB per run)",
     )
 
 

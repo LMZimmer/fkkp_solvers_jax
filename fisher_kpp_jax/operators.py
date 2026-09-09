@@ -14,8 +14,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 
-GAUSSIAN_SEED_DIFFUSION_TIME: float = 5.0  # width of the analytic heat kernel
-GAUSSIAN_SEED_MASS: float = 250.0  # total mass of the kernel
+GAUSSIAN_SEED_DIFFUSION_TIME: float = 15.0  # width of the analytic heat kernel (mm^2)
+GAUSSIAN_SEED_MASS: float = 1500.0  # total mass of the kernel; with the width above a peak density of 0.58
 GAUSSIAN_SEED_FLOOR: float = 0.1  # values at or below this are zeroed
 
 # DTI guard thresholds (see solvers._dti_guard)

@@ -20,9 +20,11 @@ Two parameter choices pin the run to the GliODIL configuration:
   - n_steps=4608: GliODIL's Nt (dt = 100/4608 days; smaller than the
     solver's own stability choice of ~843 steps, so still stable);
   - gaussian_seed_diffusion_time=15, gaussian_seed_mass=1500: GliODIL's
-    gauss_sol3d seed ("experimentally chosen" there), much wider and heavier
-    than the TumorGrowthToolkit default of Dt=5, M=250 (which yields ~44%
-    less final mass over this run). The solver evaluates the seed on the
+    gauss_sol3d seed ("experimentally chosen" there), passed explicitly so
+    the run stays pinned even if the solver defaults change; they are much
+    wider and heavier than the TumorGrowthToolkit seed of Dt=5, M=250
+    (which yields ~44% less final mass over this run) and have been the
+    solver defaults as well since 2026-09-09. The solver evaluates the seed on the
     device at the state dtype; differences to GliODIL's host float64 profile
     are at the ULP level.
 

@@ -133,11 +133,12 @@ def test_logistic_sigmoid() -> None:
     )
 
 
-@pytest.mark.parametrize("mass", [jax_ops.GAUSSIAN_SEED_MASS, 2000.0])
+@pytest.mark.parametrize("mass", [jax_ops.GAUSSIAN_SEED_MASS, 4000.0])
 def test_clipped_gaussian(mass: float) -> None:
     """Analytic heat-kernel profile, floored at 0.1 and capped at 1.
 
-    mass=2000 raises the amplitude above 1 so the cap is exercised too.
+    mass=4000 raises the amplitude above 1 (1.55 at the default width) so
+    the cap is exercised too; the default mass peaks at 0.58.
     exp() may differ by ~1 ULP between XLA and libm; the floor/cap clipping
     thresholds are only crossed well away from these values here.
     """
@@ -161,7 +162,7 @@ def test_clipped_gaussian(mass: float) -> None:
     expected = amplitude * np.exp(-sq / (4 * diffusion_time))
     expected[expected <= jax_ops.GAUSSIAN_SEED_FLOOR] = 0.0
     expected = np.minimum(expected, 1.0)
-    assert (ours == 1.0).any() == (mass == 2000.0)  # cap active only at high mass
+    assert (ours == 1.0).any() == (mass == 4000.0)  # cap active only at high mass
     assert (ours == 0.0).any()  # floor active
     np.testing.assert_allclose(ours, expected, rtol=1e-13, atol=1e-16)
 
