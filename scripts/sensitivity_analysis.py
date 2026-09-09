@@ -314,27 +314,31 @@ written outside <output-dir>/<name>/.
 
 Budget: a run's process wall time on one Quadro RTX 8000 (1 mm atlas
 grid, two solves compiled separately, about 0.7 GB of GPU memory and
-2 GB of host memory) was about 6.6 s plus 1.9 ms per time step over both
-stages in the 2026-09-07 sweep (61 440 runs, mean 9.4 s at a mean of
-1 500 steps, the stability estimate's 8 D T / dx^2 + 100 steps with D
-the white-matter diffusivity in mm^2/day and T the horizon in days). At
-12 steps/day and the ~460-day horizon of the base schedule a run is
-about 5 500 treated-stage steps (plus the growth stage's 12 per day up
-to resection_time, about 1 400 at the mean resection_time; the treated
-stage repeats them), so about 6.6 s + 1.9 ms x 6 900 = 20 s per run,
-about 40 runs/min on the 12 slots below and about 26 h for 61 440 runs;
-fast diffusion (D above about 1.5 mm^2/day) raises the count further
-through the stability estimate. A run directory is about 7.2 MB: the
-final density and the pre-resection field about 3.6 MB each (drop the
-latter with --no-keep-pre-resection-field), the two maps about 0.2 MB;
-the seed is not kept. A process spends its first seconds compiling and
-starting up, so several slots per GPU pay off: on GPUs 1, 2, 3 and 6,
-30-run sweeps gave about 29 runs/min with one slot per GPU, 50 with two,
-60 with three and 75 with four at the old 9 s per run. The defaults,
---log2-n 12 (N = 4096, 61 440 runs with the 13 factors) and
---jobs-per-gpu 3, are sized for about a day and about 440 GB
-(220 GB without the pre-resection fields); --log2-n 11 halves both.
-A growth-only sweep is one solve of resection_time days per run.
+2 GB of host memory) was 6.6 s plus 1.4 ms per time step of the two
+stages together in the 2026-09-07 sweep (61 440 runs on the stability
+estimate's step, max(8 D T / dx^2 + 100, 1.1 rho T) with D the
+white-matter diffusivity in mm^2/day and T the horizon in days: a mean
+of 2 000 steps, 450 growth + 1 500 treated, and a mean of 9.4 s per
+run; 14.1 h with 3 slots on each of GPUs 1, 2, 3 and 6). At 12 steps/day
+and the ~460-day horizon of the base schedule a run is about 5 500
+treated-stage steps (12 per day, the growth stage's steps repeated)
+plus the growth stage's 12 per day up to resection_time, about 1 400 at
+the mean resection_time: 6 000 steps and 15 s per run on average
+(re-stepping every run of that sweep at 12 steps/day and applying the
+fit; the stability estimate is stricter than 12 steps/day for 7 % of
+the runs, D above about 1.5 mm^2/day, up to 22 s). That is 1.6 times
+the old run, so the default design is halved: --log2-n 11 (N = 2048,
+30 720 runs with the 13 factors), about 11-14 h on the same 12 slots
+(the 14.1 h of the old sweep would hold about 38 000 runs, and N must be
+a power of two); --log2-n 12 is about 23 h. A run directory is about
+7.2 MB: the final density and the pre-resection field about 3.6 MB
+each (drop the latter with --no-keep-pre-resection-field), the two
+maps about 0.2 MB; the seed is not kept: about 220 GB at the default
+(110 GB without the pre-resection fields). A process spends its first
+seconds compiling and starting up, so several slots per GPU pay off:
+30-run sweeps gave about 29 runs/min with one slot per GPU, 50 with
+two, 60 with three and 75 with four at the old 9 s per run. A
+growth-only sweep is one solve of resection_time days per run.
 """
 
 from __future__ import annotations
@@ -391,7 +395,7 @@ DEFAULT_TISSUE_MAPS: dict[str, Path] = {
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_atlas")
 DEFAULT_GPUS = "1,2,3,6"
 DEFAULT_JOBS_PER_GPU = 3  # see Budget
-DEFAULT_LOG2_N = 12  # N = 4096, 61 440 runs with the 13 factors: about a day, see Budget
+DEFAULT_LOG2_N = 11  # N = 2048, 30 720 runs with the 13 factors: about 11-14 h, see Budget
 DEFAULT_DESIGN_SEED = 1
 DEFAULT_N_BOOTSTRAP = 1000
 DEFAULT_BOOTSTRAP_SEED = 0

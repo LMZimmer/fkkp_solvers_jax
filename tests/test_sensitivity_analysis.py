@@ -587,7 +587,7 @@ def test_tissue_map_override_and_cli_defaults(phantom_base):
     assert args.gray_matter_pbmap.endswith("brats_mni152/brats_mni152_gm_pbmap.nii.gz")
     everything = sa.build_parser().parse_args(["all", "--name", "x", "--gray-matter-pbmap", ""])
     assert everything.gray_matter_pbmap == ""
-    assert (everything.log2_n, everything.jobs_per_gpu, everything.gpus) == (12, 3, "1,2,3,6")
+    assert (everything.log2_n, everything.jobs_per_gpu, everything.gpus) == (11, 3, "1,2,3,6")
 
 
 def test_project_seeds_nested_ranges():
