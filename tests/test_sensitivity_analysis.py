@@ -753,26 +753,26 @@ def test_truncate_schedule_and_snapshot_offsets():
     counts), the record holds the counts and the kept total dose; the
     shipped base config keeps 52 of 72 sessions (4 900 of 8 900 mg/m^2)
     at the shipped override. The snapshot offsets of the shipped base
-    schedule are 34 and 55 days after resection (days 149 and 170); the
+    schedule are 34 and 55 days after resection (days 134 and 155); the
     checks refuse a schedule off the weekly pattern, a Sunday without a
     session or with a fraction, and no fractions at all."""
     base = read_config(sa.DEFAULT_CONFIG, solver=StuppFKPPSolver)
     full = sa.truncate_schedule(base, {})
     assert full["schedule"]["n_chemo_sessions"] == 72 and full["schedule"]["n_chemo_sessions_dropped"] == 0
-    assert full["schedule"]["chemo_total_dose"] == 8900.0 and full["schedule"]["horizon"] == 375.0
+    assert full["schedule"]["chemo_total_dose"] == 8900.0 and full["schedule"]["horizon"] == 360.0
     assert full["chemo_times"] == base["chemo_times"] and full["rt_times"] == base["rt_times"]
     shipped = sa.truncate_schedule(base, {"time_after_resection": 120.0})
     assert shipped["schedule"] == {
-        "resection_time": 115.0, "time_after_resection": 120.0, "horizon": 235.0,
+        "resection_time": 100.0, "time_after_resection": 120.0, "horizon": 220.0,
         "n_chemo_sessions": 52, "n_chemo_sessions_dropped": 20, "chemo_total_dose": 4900.0,
         "chemo_total_dose_dropped": 4000.0, "n_fractions": 30, "n_fractions_dropped": 0,
     }
-    assert shipped["chemo_times"][-1] == 228.0 and shipped["chemo_doses"][-1] == 200.0 and len(shipped["chemo_doses"]) == 52
+    assert shipped["chemo_times"][-1] == 213.0 and shipped["chemo_doses"][-1] == 200.0 and len(shipped["chemo_doses"]) == 52
     assert shipped["chemo_times"] == base["chemo_times"][:52] and shipped["rt_times"] == base["rt_times"]
     assert sa.truncate_schedule(base, {"time_after_resection": 120.0, "chemo_doses": [1.0] * 72})["schedule"]["chemo_total_dose"] == 52.0
     tight = sa.truncate_schedule(base, {"time_after_resection": 40.0})
     assert tight["schedule"]["n_fractions"] == 20 and tight["schedule"]["n_fractions_dropped"] == 10
-    assert tight["schedule"]["n_chemo_sessions"] == 27 and tight["rt_times"][-1] == 154.0 and tight["chemo_times"][-1] == 155.0
+    assert tight["schedule"]["n_chemo_sessions"] == 27 and tight["rt_times"][-1] == 139.0 and tight["chemo_times"][-1] == 140.0
     with pytest.raises(ValueError, match="chemo_times has 72 entries, chemo_doses 2"):
         sa.truncate_schedule(base, {"chemo_doses": [1.0, 2.0]})
     # The search space's budget follows the truncated schedule.
@@ -782,22 +782,22 @@ def test_truncate_schedule_and_snapshot_offsets():
     np.testing.assert_allclose([low, high], [1e-4 * 4900 / 9.24, 3e-3 * 4900 / 9.24])
     # Snapshot offsets.
     assert sa.crt_snapshot_offsets(base["rt_times"], base["chemo_times"], base["resection_time"]) == {"mid_crt": 34.0, "end_crt": 55.0}
-    assert sa.crt_snapshot_offsets(shipped["rt_times"], shipped["chemo_times"], 115.0) == {"mid_crt": 34.0, "end_crt": 55.0}
-    assert base["rt_times"][0] + 20 == 149.0 and base["rt_times"][0] + 41 == 170.0 == base["chemo_times"][41]
+    assert sa.crt_snapshot_offsets(shipped["rt_times"], shipped["chemo_times"], 100.0) == {"mid_crt": 34.0, "end_crt": 55.0}
+    assert base["rt_times"][0] + 20 == 134.0 and base["rt_times"][0] + 41 == 155.0 == base["chemo_times"][41]
     assert sa.crt_snapshot_offsets(PHANTOM_RT_TIMES, PHANTOM_CHEMO_TIMES, PHANTOM_RESECTION) == {"mid_crt": 22.0, "end_crt": 43.0}
     shuffled = list(reversed(base["rt_times"]))
-    assert sa.crt_snapshot_offsets(shuffled, base["chemo_times"], 115.0) == {"mid_crt": 34.0, "end_crt": 55.0}
+    assert sa.crt_snapshot_offsets(shuffled, base["chemo_times"], 100.0) == {"mid_crt": 34.0, "end_crt": 55.0}
     with pytest.raises(ValueError, match="must be 30 fractions"):
-        sa.crt_snapshot_offsets(base["rt_times"][:-1], base["chemo_times"], 115.0)
+        sa.crt_snapshot_offsets(base["rt_times"][:-1], base["chemo_times"], 100.0)
     with pytest.raises(ValueError, match="must be 30 fractions"):
-        sa.crt_snapshot_offsets([t + (1 if t == 168.0 else 0) for t in base["rt_times"]], base["chemo_times"], 115.0)
-    with pytest.raises(ValueError, match="snapshot end_crt: day 170 .* has no chemotherapy session"):
-        sa.crt_snapshot_offsets(base["rt_times"], [t for t in base["chemo_times"] if t != 170.0], 115.0)
+        sa.crt_snapshot_offsets([t + (1 if t == 153.0 else 0) for t in base["rt_times"]], base["chemo_times"], 100.0)
+    with pytest.raises(ValueError, match="snapshot end_crt: day 155 .* has no chemotherapy session"):
+        sa.crt_snapshot_offsets(base["rt_times"], [t for t in base["chemo_times"] if t != 155.0], 100.0)
     with pytest.raises(ValueError, match="no rt_times"):
-        sa.crt_snapshot_offsets([], base["chemo_times"], 115.0)
+        sa.crt_snapshot_offsets([], base["chemo_times"], 100.0)
     # A fraction on a snapshot Sunday cannot happen on the weekly pattern,
     # so the check is exercised on the pattern check's own terms.
-    assert not any(t in (149.0, 170.0) for t in base["rt_times"])
+    assert not any(t in (134.0, 155.0) for t in base["rt_times"])
 
 
 def test_snapshot_days():

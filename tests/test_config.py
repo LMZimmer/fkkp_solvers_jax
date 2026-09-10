@@ -99,21 +99,45 @@ def phantom_paths(tmp_path: Path, tissue_phantom) -> dict[str, str]:
 # --- default configs ---
 
 
+# The entries with class defaults that a default config must keep at the
+# default: the structural and solver-behaviour entries (volume paths, the
+# grid, the snapshots, the stopping settings, the tissue and seed
+# thresholds, the state dtype, logging, the tensor model switch). The
+# time-step keys are exempt (a default config may set one of them). Every
+# other defaulted entry is a physical parameter (dynamics, seed shape,
+# treatment response, tensor model) that a default config may set to a
+# value of its own, e.g. StuppFKPPSolver.json to the medians of the
+# sensitivity search space.
+PINNED_DEFAULT_KEYS = frozenset({
+    "gray_matter_pbmap", "white_matter_pbmap", "voxel_size_mm", "snapshot_times",
+    "stopping_time", "stopping_threshold", "stopping_mode", "volume_threshold",
+    "min_tissue_fraction", "gaussian_seed_floor", "precision", "verbose", "uniform_gray_matter",
+})
+PHYSICAL_DEFAULT_KEYS = frozenset({
+    "diffusivity_ratio", "gaussian_seed_scale", "gaussian_seed_diffusion_time", "gaussian_seed_mass",
+    "rt_alpha_beta_ratio", "diffusivity_lower_limit", "diffusivity_upper_limit", "ellipsoid_scaling",
+    "normalization_std", "tensor_exponent", "tensor_linear_term", "max_tumor_occupancy", "nt_multiplier",
+})
+
+
 @pytest.mark.parametrize("cls", SOLVERS, ids=[cls.__name__ for cls in SOLVERS])
 def test_default_config_file(cls):
-    """Every parameter is defined, the optional entries equal the class
-    defaults except the time step (a default config may set one of the
-    three time-step keys: StuppFKPPSolver.json sets steps_per_day 12 for
-    the sensitivity analysis), the volume paths are absolute and point to
-    existing files (or are null), and the class is registered under its
-    name."""
+    """Every parameter is defined; the structural entries with class
+    defaults (PINNED_DEFAULT_KEYS) equal the defaults, the time step
+    excepted (a default config may set one of the three time-step keys:
+    StuppFKPPSolver.json sets steps_per_day 12 for the sensitivity
+    analysis), while the physical parameters (PHYSICAL_DEFAULT_KEYS) may
+    differ from them; every defaulted key is classified as one or the
+    other; the volume paths are absolute and point to existing files (or
+    are null); and the class is registered under its name."""
     config = cls.get_default_config()
     assert config[SOLVER_KEY] == cls.__name__
     assert set(config) - {SOLVER_KEY} == cls.config_keys()
+    unclassified = set(cls._DEFAULTS) - PINNED_DEFAULT_KEYS - PHYSICAL_DEFAULT_KEYS - set(TIME_STEP_KEYS)
+    assert not unclassified, unclassified
     for key, default in cls._DEFAULTS.items():
-        if key in TIME_STEP_KEYS:
-            continue
-        assert jsonable(config[key]) == jsonable(default), key
+        if key in PINNED_DEFAULT_KEYS:
+            assert jsonable(config[key]) == jsonable(default), key
     assert sum(config[key] is not None for key in TIME_STEP_KEYS) <= 1
     for key in cls._VOLUME_KEYS:
         value = config[key]
