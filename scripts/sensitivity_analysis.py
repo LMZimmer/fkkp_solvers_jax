@@ -4,9 +4,11 @@ model, fisher_kpp_jax.StuppFKPPSolver, on atlas tissue maps.
 
 A Saltelli design over the factors of a search-space file is run through
 the solver (one process per run, one run directory each), quantities of
-interest (QoIs) are read off the saved final cell densities afterwards,
-and SALib's Sobol' estimators give the first-order (S1) and total-order
-(ST) indices of every QoI with bootstrap confidence intervals.
+interest (QoIs) are read off the saved cell densities afterwards (the
+final field and three snapshots: at resection and at two points of the
+concomitant chemoradiotherapy), and SALib's Sobol' estimators give the
+first-order (S1) and total-order (ST) indices of every QoI with
+bootstrap confidence intervals.
 
 Every run is two solves. The resection cavity and the radiotherapy dose
 map are not inputs but follow from the tumor the run has grown by the
@@ -45,18 +47,51 @@ as n_runs_empty_cavity. The growth stage's final density, the field the
 cavity is thresholded from, is kept as pre_resection_cell_density.nii.gz
 (--keep-pre-resection-field, default on) and gets its own QoIs.
 
+Snapshots during treatment. The treated stage records its state on the
+Sunday closing the third and the sixth week of the concomitant
+chemoradiotherapy, the days with a TMZ dose but no fraction: with the
+first fraction on a Monday rt_start, the Sundays rt_start + 20
+(mid_crt) and rt_start + 41 (end_crt, the last concomitant dose), i.e.
+resection_time + 34 and + 55 days for the base schedule's fractions 14
+days after surgery. The design step derives rt_start as the first
+rt_time of the base schedule, checks that the fractions are exactly the
+30 of a five-on / two-off weekly pattern from that day (CRT_WEEKS,
+FRACTIONS_PER_WEEK) and that each Sunday has a chemotherapy session and
+no fraction (crt_snapshot_offsets; it refuses the design otherwise),
+and records the two offsets after resection_time in spec.json
+(snapshots); every run shifts them with its sampled resection_time as it
+shifts the schedule. The snapshot is the state at the end of that day,
+after its dose and before Monday's fraction: run_one requests, for the
+moment t_end = resection_time + offset + 1 at which the next day (and
+its fraction, which the solver fires in the step (t0, t1] containing
+it) begins, the last step end at least half a step before it,
+m dt = floor(t_end / dt - 1/2) dt (snapshot_days; 1-3 h before midnight
+at 12 steps/day, needing dt <= 1/2 day), which the solver's
+snapshot_times mechanism records exactly; both bounds are half a step
+away from any step end, so the state dtype's rounding of the step ends
+cannot move the fraction before the snapshot nor the session after it.
+The frames are saved as mid_crt_cell_density.nii.gz and
+end_crt_cell_density.nii.gz next to the pre-resection field (float32,
+the final field's affine, rounded for storage), the requested and the
+recorded days go into treatment.json and the treated stage's config.json
+holds the requested days as snapshot_times, so a re-solve of the saved
+config reproduces the frames. Each snapshot gets the full QoI set under
+its prefix (mid_crt_, end_crt_), analysed alongside the pre_ and the
+final QoIs. Growth-only runs have no treated stage and no snapshots.
+
 Growth-only mode (--growth-only on design, run and all; recorded in
 spec.json as growth_only, which a run pass follows): the growth stage is
 the run. run_one saves it into the run directory itself (config.json is
 the FKPPSolver config, final_cell_density.nii.gz the density at
 resection_time, pre_resection_cell_density.nii.gz a symlink to it, no
-maps, no growth/, no treatment.json), so the final and the pre_ QoIs
-coincide. The horizon is resection_time (a factor or a fixed value). No
-treatment parameter other than resection_time may be a factor or a
-derived parameter of such a design, since none reaches the response;
-the treatment settings and the chemotherapy budget are still recorded.
-It is meant for a cheaper identifiability sweep over the growth factors
-(with --second-order).
+maps, no growth/, no treatment.json, no mid_crt / end_crt snapshots),
+so the final and the pre_ QoIs coincide and the mid_crt_ / end_crt_
+QoIs are absent. The horizon is resection_time (a factor or a fixed
+value). No treatment parameter other than resection_time may be a factor
+or a derived parameter of such a design, since none reaches the
+response; the treatment settings and the chemotherapy budget are still
+recorded. It is meant for a cheaper identifiability sweep over the
+growth factors (with --second-order).
 
 Search-space file (JSON, --search-space; default
 fisher_kpp_jax/search_spaces/stupp_fkpp_search_space.json). It reads like
@@ -69,8 +104,8 @@ other key is either
       - {"min": a, "max": b, "scale": "linear" | "log"}: a factor, sampled on
         the unit cube (u in [0, 1)) and transformed to a + u (b - a) for
         "linear" or 10 ** (log10 a + u (log10 b - log10 a)) for "log"; or
-  - a derived factor group: a key that is not a parameter (e.g. "seed")
-    whose value has "derives": [<solver parameters>] and one
+  - a derived factor group: a key that is not a parameter (e.g. "growth",
+    "seed") whose value has "derives": [<solver parameters>] and one
     {"min", "max", "scale"} sub-entry per sampled factor of the
     derivation registered for those parameters (DERIVATIONS, keyed by
     the "derives" tuple; the sub-entries must be exactly its factors, in
@@ -78,12 +113,43 @@ other key is either
     design, design.csv, spec.json and the Sobol' analysis use the sampled
     factors, which take the group's position in the factor order; the run
     configs receive the derived parameters. A solver parameter appears at
-    most once, as a factor, an override or a derived parameter. Every
-    group's checks run at design time against the resolved parameters of
-    the growth stage (base config, overrides, defaults) and their record
-    (the formula, the parameters the derivation depends on) goes into
-    spec.json under derived_groups. A second group is one more
-    DERIVATIONS entry; the design code does not name any group.
+    most once, as a factor, an override or a derived parameter. A
+    derivation may take another group's sampled factors as inputs
+    (Derivation.requires): the groups are then evaluated in dependency
+    order whatever their order in the file (group_evaluation_order), and
+    a search space holding the dependent group without the group that
+    samples the required factor is refused with a message naming it. A
+    derivation may also return extra per-row quantities
+    (Derivation.extras) that go into design.csv next to the derived
+    parameters but not into the run configs. Every group's checks run at
+    design time against the resolved parameters of the growth stage
+    (base config, overrides, defaults) and the required factors' ranges,
+    and their record (the formula, the parameters the derivation depends
+    on, the implied ranges) goes into spec.json under derived_groups. A
+    further group is one more DERIVATIONS entry; the design code does not
+    name any group.
+Two derivations are registered, and the shipped search space uses both:
+  - "growth" derives white_matter_diffusivity and rho from the front
+    speed front_speed_mm_per_day = v and the front width front_width_mm =
+    lambda of the Fisher-KPP travelling wave (v = 2 sqrt(D rho),
+    lambda = sqrt(D / rho)): D = v lambda / 2 and rho = v / (2 lambda)
+    (growth_parameters). The design step checks that the implied ranges
+    at the corners of the (v, lambda) rectangle stay within RHO_BOUNDS
+    (0.001-0.2 /day) and DIFFUSIVITY_BOUNDS (0.01-2 mm^2/day), the outer
+    bounds of the 2026-09-08 search space, and prints them. Sampling
+    (v, lambda) instead of a (D, rho) rectangle keeps every run at a
+    physiological expansion rate (the shipped 0.25 mm/day bound is above
+    the fastest reported radial expansion, about 0.2 mm/day), which the
+    corners of the old rectangle (v up to 1.3 mm/day) were not.
+  - "seed" derives gaussian_seed_mass and gaussian_seed_diffusion_time
+    from the peak density seed_peak_density and the width relative to
+    the front width, seed_relative_width = s = sigma / lambda, taking
+    the row's front_width_mm of the growth group (which the search space
+    must therefore hold; the growth group is evaluated first): see Seed
+    below. Its extras are seed_sigma_mm = s lambda and
+    seed_enhancing_radius_mm = sigma sqrt(2 ln(c_peak / 0.6)), the
+    radius of the seed's region at or above the 0.6 enhancing threshold
+    (0 for a peak below it).
 Everything not listed comes from the base config (--config, default
 fisher_kpp_jax/configs/StuppFKPPSolver.json; read with
 fisher_kpp_jax.read_config so every run config carries absolute volume
@@ -92,8 +158,22 @@ paths), except the tissue maps: --white-matter-pbmap and
 DEFAULT_TISSUE_MAPS) replace the base config's white_matter_pbmap and
 gray_matter_pbmap; an empty string keeps the base config's entry. The
 base config's resection_cavity and rt_dose must be null, since they are
-derived per run. chemo_times and rt_times are shifted by resection_time - base
+derived per run, and its snapshot_times is set by the run (above).
+
+Horizon and schedule. The shipped search space fixes time_after_resection
+at 120 days (a plain override): the run ends 7 days after the last dose
+of the second adjuvant TMZ cycle (days 109-113 after resection), the
+last point the treated stage is compared at, instead of the base
+config's 260 days after the six cycles. The base config keeps the full
+schedule; the design step truncates it to the horizon (truncate_schedule:
+the chemotherapy sessions, with their doses, and the fractions later
+than resection_time + time_after_resection are dropped, so no dose is
+ever scheduled after the end of a run) and records the kept and dropped
+sessions and the kept total dose in spec.json (schedule); every run
+config holds the truncated schedule shifted by resection_time - base
 resection_time, so the treatment block keeps its offset after surgery.
+For the shipped base config 52 of the 72 sessions remain (4 900 of
+8 900 mg/m^2) and all 30 fractions.
 
 Time step. The base config (with the overrides) must set one of n_steps,
 dt and steps_per_day (the design step refuses a config with all three
@@ -122,11 +202,19 @@ independently puts most of a design on seeds the floor erases entirely
 (peak m / (4 pi tau)^(3/2) at or below the floor; 35 % of the 2026-09-07
 sweep) or the clip flattens, so the shipped search space samples the
 seed through the derived group "seed" on the admissible band: the peak
-density seed_peak_density = c_peak in (gaussian_seed_floor, 1] and the
-width seed_sigma_mm = sigma in mm, derived (seed_parameters) as
-tau = sigma^2 / 2 and m = c_peak (4 pi tau)^(3/2). The design step checks
+density seed_peak_density = c_peak in (gaussian_seed_floor, 1] (0.6-1,
+so that every seed has an enhancing core) and the relative width
+seed_relative_width = s = sigma / lambda (2-4, log-uniform) with lambda
+the row's front width of the growth group, derived (seed_group_parameters)
+as sigma = s lambda, tau = sigma^2 / 2 and m = c_peak (4 pi tau)^(3/2).
+A seed wider than the front it develops into keeps the initial transient
+short; with lambda in 1-5 mm the width is 2-20 mm (a 28 mm seed with
+peak 1 would hold 350 cm^3 at day 0, which is why the front width is
+capped at 5 mm rather than 7). The design step checks
 min(seed_peak_density) > gaussian_seed_floor and max(seed_peak_density)
-<= 1 against the resolved floor, and that gaussian_seed_scale is 1.
+<= 1 against the resolved floor, that gaussian_seed_scale is 1 and that
+the growth group is present, and records the implied ranges of sigma,
+the enhancing radius, tau and m in spec.json.
 
 Seed reinterpretation. The three gaussian_seed_{x,y,z}_fraction entries
 must be linear factors within [0, 1], but their sampled value u is NOT the
@@ -149,11 +237,14 @@ the seedable voxels, their count and the tissue threshold.
 The design step also reports the chemotherapy budget of the search space:
 the model's total log kill over the schedule is
 L = chemo_kill_rate * D_tot / chemo_decay_rate with D_tot the sum of the
-base config's chemo_doses (after the search space's overrides), so the
-factor ranges imply [L_min, L_max] = [kill_min D_tot / decay_max,
-kill_max D_tot / decay_min] (a fixed value stands in for a range where one
-of the two is not a factor). spec.json holds chemo_total_dose and
-chemo_log_kill_range; nothing is enforced.
+chemo_doses within the horizon (after the search space's overrides and
+the truncation), so the factor ranges imply [L_min, L_max] = [kill_min
+D_tot / decay_max, kill_max D_tot / decay_min] (a fixed value stands in
+for a range where one of the two is not a factor: the shipped search
+space fixes chemo_decay_rate at 9.24 /day, temozolomide's 1.8 h plasma
+half-life, since the drug clears between daily doses and only the ratio
+chemo_kill_rate / chemo_decay_rate reaches the response). spec.json
+holds chemo_total_dose and chemo_log_kill_range; nothing is enforced.
 
 Design (SALib.sample.sobol: Saltelli scheme on a scrambled Sobol'
 sequence). k factors, N = 2 ** log2_n base points, N (k + 2) runs
@@ -173,53 +264,64 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
                          the tissue maps as replaced)
     spec.json            search space, base config path, seed, N, k, factor
                          order, the derived groups (derives, factors,
-                         formula, the parameters the derivation depends on)
-                         and derived_keys, the time step, growth_only, SALib
-                         version, seed box, seedable voxel count, the
-                         treatment derivation settings
+                         requires, extras, formula, the parameters the
+                         derivation depends on, the implied ranges),
+                         derived_keys and extra_keys, the schedule within
+                         the horizon, the snapshot offsets, the time
+                         step, growth_only, SALib version, seed box,
+                         seedable voxel count, the treatment derivation
+                         settings
     design.csv           one line per run: run_name, index (position in the
                          SALib array), row (block), matrix (A, B, AB:<factor>),
                          u_<factor> and <factor> (the transformed value; seed
                          factors: the projected fractions) for every factor,
-                         the derived solver parameters of the groups (e.g.
-                         gaussian_seed_mass, gaussian_seed_diffusion_time),
+                         the derived solver parameters of the groups
+                         (white_matter_diffusivity, rho, gaussian_seed_mass,
+                         gaussian_seed_diffusion_time), their extras
+                         (seed_sigma_mm, seed_enhancing_radius_mm),
                          seed_voxel_i/j/k
-    configs/<run>.json   the run configs (resection_cavity and rt_dose null)
+    configs/<run>.json   the run configs (resection_cavity and rt_dose null,
+                         the schedule truncated and shifted)
     logs/<run>.log       stdout/stderr of the runs
     runs/<run>/          the treated stage's Result.save output without the
                          initial state (config.json with the derived maps'
-                         paths and the aligned time stepping, result.json,
-                         final_cell_density.nii.gz), the growth stage's
-                         final density pre_resection_cell_density.nii.gz
-                         (float32, the same affine; omitted with
-                         --no-keep-pre-resection-field), both fields
-                         rounded for storage (round_field), the derived maps
+                         paths, the aligned time stepping and the snapshot
+                         days, result.json, final_cell_density.nii.gz),
+                         the growth stage's final density
+                         pre_resection_cell_density.nii.gz (float32, the
+                         same affine; omitted with
+                         --no-keep-pre-resection-field), the treated
+                         stage's snapshots mid_crt_cell_density.nii.gz and
+                         end_crt_cell_density.nii.gz, all fields rounded
+                         for storage (round_field), the derived maps
                          resection_cavity.nii.gz (uint8, label 1) and
                          rt_dose.nii.gz (Gy, total) with their record
                          treatment.json (settings, voxel counts, volumes,
-                         the time stepping of both stages), and growth/
-                         with the growth stage's config.json and
-                         result.json only. The seed is not kept (its voxel
-                         is in design.csv and the saved configs reproduce
-                         it). Growth-only mode: config.json (FKPPSolver),
-                         result.json, final_cell_density.nii.gz and the
-                         pre_resection symlink only.
+                         the time stepping of both stages, the snapshot
+                         days), and growth/ with the growth stage's
+                         config.json and result.json only. The seed is not
+                         kept (its voxel is in design.csv and the saved
+                         configs reproduce it). Growth-only mode:
+                         config.json (FKPPSolver), result.json,
+                         final_cell_density.nii.gz and the pre_resection
+                         symlink only.
     run_status.csv       appended as runs finish: run_name, success,
                          exit_code, wall_time_s (the subprocess), error,
                          final_time, n_steps, growth_dt, growth_n_steps,
                          treated_dt
     qoi.csv              one line per run: run_name, index, row, matrix,
                          success, the QoIs of the final field, the same
-                         QoIs of the pre-resection field prefixed pre_,
-                         final_time, n_steps, wall_time_s (the treated
-                         stage's solve), growth_dt, growth_n_steps,
+                         QoIs of the pre-resection field prefixed pre_ and
+                         of the two snapshots prefixed mid_crt_ and
+                         end_crt_, final_time, n_steps, wall_time_s (the
+                         treated stage's solve), growth_dt, growth_n_steps,
                          treated_dt, cavity_volume_mm3, dose_volume_mm3
     qoi_summary.json     run counts (successes, empty compartments, NaNs,
                          extinct runs, empty cavities, runs without a
-                         pre-resection field), the mean wall time of a
-                         run-one subprocess (run_status.csv) and per
-                         analysed QoI the run/block accounting of the
-                         Sobol' analysis
+                         pre-resection field or without a snapshot
+                         field), the mean wall time of a run-one subprocess
+                         (run_status.csv) and per analysed QoI the
+                         run/block accounting of the Sobol' analysis
     sobol.csv            one line per (qoi, factor): S1, S1_conf, ST, ST_conf,
                          S1_half, ST_half, n_blocks_used
     sobol_summary.json   N, k, factor order, SALib version and per QoI the
@@ -245,6 +347,14 @@ M = dV sum_v c_v:
                                treatment eliminated that compartment, a
                                valid outcome, not a failure)
   centroid_drift               |xbar - x_seed|, xbar the mass centroid
+  centroid_x_mm, centroid_y_mm, centroid_z_mm
+                               the components of xbar, absolute in mm
+                               along the grid axes (index times zooms, the
+                               frame of every other QoI; the atlas affine
+                               is a translation and axis signs of it,
+                               which leave Sobol' indices unchanged): the
+                               tumor's position, whose indices are meant
+                               to carry the seed-position factors
   R_g                          sqrt(sum_v c_v |x_v - xbar|^2 / sum_v c_v)
   anisotropy, log10_anisotropy lambda_max / lambda_min of the mass-weighted
                                covariance of the voxel centres
@@ -252,15 +362,18 @@ M = dV sum_v c_v:
                                config's white-matter probability map
   n_core, n_edema              |Omega_tau| (voxel counts)
   voxel_volume                 dV (mm^3)
-The four mass-weighted QoIs (centroid_drift, R_g, anisotropy, wm_fraction)
-are NaN when M < 1e-3 dV (no mass left to locate); qoi_summary.json counts
-the runs at or below that floor (n_runs_extinct). The same QoIs are
-computed on runs/<run>/pre_resection_cell_density.nii.gz (same
-thresholds, seed voxel and white-matter map) and stored prefixed pre_
-(pre_mass, pre_log10_mass, ..., pre_n_edema, pre_voxel_volume); a
-successful run without that file (an older sweep, or
---no-keep-pre-resection-field) has them all NaN and is counted as
-n_runs_without_pre_resection_field, not failed. final_time, n_steps and
+The seven mass-weighted QoIs (centroid_drift, the three centroid
+components, R_g, anisotropy, wm_fraction) are NaN when M < 1e-3 dV (no
+mass left to locate); qoi_summary.json counts the runs at or below that
+floor (n_runs_extinct). The same QoIs are computed on the snapshot
+fields (same thresholds, seed voxel and white-matter map) and stored
+under their prefixes (SNAPSHOT_PREFIXES): pre_ for
+runs/<run>/pre_resection_cell_density.nii.gz, mid_crt_ and end_crt_ for
+the treated stage's snapshots; a successful run without one of those
+files (an older sweep, --no-keep-pre-resection-field, growth-only mode)
+has that prefix's columns all NaN and is counted as
+n_runs_without_pre_resection_field / n_runs_without_mid_crt_field /
+n_runs_without_end_crt_field, not failed. final_time, n_steps and
 wall_time_s are carried over from result.json, growth_dt and
 growth_n_steps from growth/result.json (result.json itself in growth-only
 mode), treated_dt from result.json, cavity_volume_mm3 and
@@ -277,26 +390,30 @@ runs is failed or non-finite for that QoI, so
 ceil(n_runs_nan / block_size) <= n_blocks_dropped <= n_runs_nan +
 n_runs_failed. Extinct runs have a finite, floored log10_mass and
 non-finite mass-weighted QoIs, so they drop blocks for centroid_drift,
-R_g, log10_anisotropy and wm_fraction only. Both the qoi and the analyze
-command print the same accounting line per QoI.
+the centroid components, R_g, log10_anisotropy and wm_fraction only.
+Both the qoi and the analyze command print the same accounting line per
+QoI.
 
 Sobol' analysis (SALib.analyze.sobol). Analysed columns: log10_mass,
 V_core, V_edema, log10_V_core, log10_V_edema, r95_core, r95_edema,
-centroid_drift, R_g, log10_anisotropy, wm_fraction, and the same eleven
-prefixed pre_ (a QoI whose blocks all drop, e.g. a pre_ QoI of an older
-sweep, is skipped and marked in sobol_summary.json). The response is
-assembled in SALib's row order from qoi.csv (joined on index); SALib needs
-complete blocks and infers N from the length, so a block is dropped
-entirely when any of its runs failed or has a NaN value (reported per
-QoI). SALib uses the Saltelli et al. 2010 (Comput. Phys. Commun. 181:259)
-first-order and the Jansen 1999 (CPC 117:35) total-order estimators; the
-*_conf values are normal-approximation 95 % half-widths from the bootstrap
-standard deviation (resampling blocks), not percentile intervals. As a
-convergence check the point estimates are repeated on the first half of
-the blocks (S1_half, ST_half). Whether the design holds the second-order
-rows is taken from spec.json, so the --second-order flag of design/all
-reaches the analysis (which then writes sobol_S2.csv as well). SALib
-treats seed 0 as "unseeded", so the bootstrap is seeded with --seed + 1.
+centroid_drift, centroid_x_mm, centroid_y_mm, centroid_z_mm, R_g,
+log10_anisotropy, wm_fraction, and the same fourteen prefixed pre_,
+mid_crt_ and end_crt_ (56 QoIs; a QoI whose blocks all drop, e.g. a
+snapshot QoI of a sweep of the previous schema, is skipped and marked in
+sobol_summary.json, so an older sweep directory still analyses). The
+response is assembled in SALib's row order from qoi.csv (joined on
+index); SALib needs complete blocks and infers N from the length, so a
+block is dropped entirely when any of its runs failed or has a NaN value
+(reported per QoI). SALib uses the Saltelli et al. 2010 (Comput. Phys.
+Commun. 181:259) first-order and the Jansen 1999 (CPC 117:35)
+total-order estimators; the *_conf values are normal-approximation 95 %
+half-widths from the bootstrap standard deviation (resampling blocks),
+not percentile intervals. As a convergence check the point estimates are
+repeated on the first half of the blocks (S1_half, ST_half). Whether the
+design holds the second-order rows is taken from spec.json, so the
+--second-order flag of design/all reaches the analysis (which then
+writes sobol_S2.csv as well). SALib treats seed 0 as "unseeded", so the
+bootstrap is seeded with --seed + 1.
 
 Run from the project root, e.g. (SA = /mnt/Drive4/lucas/stupp_sensitivity_analysis_atlas):
   python scripts/sensitivity_analysis.py design --name sa_atlas
@@ -309,39 +426,38 @@ The run step is resumable: runs whose result.json reports success are
 skipped, partial run directories are deleted and redone; a run whose
 result.json reports a failure, or whose growth stage failed, counts as
 partial and is redone on every run pass. The treatment derivation
-settings of a design are stored in spec.json and handed to every run, so
-a resumed sweep derives its maps as the first pass did. Nothing is ever
+settings and the snapshot offsets of a design are stored in spec.json
+and handed to every run (run-one's --cavity-threshold, --rt-margin-mm,
+--rt-dose-per-fraction and --snapshots), so a resumed sweep derives its
+maps and records its snapshots as the first pass did. Nothing is ever
 written outside <output-dir>/<name>/.
 
 Budget: a run's process wall time on one Quadro RTX 8000 (1 mm atlas
 grid, two solves compiled separately, about 0.7 GB of GPU memory and
 2 GB of host memory) was 6.6 s plus 1.4 ms per time step of the two
 stages together in the 2026-09-07 sweep (61 440 runs on the stability
-estimate's step, max(8 D T / dx^2 + 100, 1.1 rho T) with D the
-white-matter diffusivity in mm^2/day and T the horizon in days: a mean
-of 2 000 steps, 450 growth + 1 500 treated, and a mean of 9.4 s per
-run; 14.1 h with 3 slots on each of GPUs 1, 2, 3 and 6). At 12 steps/day
-and the ~460-day horizon of the base schedule a run is about 5 500
-treated-stage steps (12 per day, the growth stage's steps repeated)
-plus the growth stage's 12 per day up to resection_time, about 1 400 at
-the mean resection_time: 6 000 steps and 15 s per run on average
-(re-stepping every run of that sweep at 12 steps/day and applying the
-fit; the stability estimate is stricter than 12 steps/day for 7 % of
-the runs, D above about 1.5 mm^2/day, up to 22 s). That is 1.6 times
-the old run, so the default design is halved: --log2-n 11 (N = 2048,
-30 720 runs with the 13 factors), about 11-14 h on the same 12 slots
-(the 14.1 h of the old sweep would hold about 38 000 runs, and N must be
-a power of two); --log2-n 12 is about 23 h. A run directory is about
-2 MB: the final density and the pre-resection field about 0.9 MB each
-on average (a whole-brain tumor up to 3.3 MB, a small one 0.1 MB; both
-rounded for storage, see FIELD_MANTISSA_BITS, unrounded they were 3.6 MB
-each; drop the latter with --no-keep-pre-resection-field), the two
-maps about 0.2 MB; the seed is not kept: about 60 GB at the default
-(35 GB without the pre-resection fields). A process spends its first
-seconds compiling and starting up, so several slots per GPU pay off:
-30-run sweeps gave about 29 runs/min with one slot per GPU, 50 with
-two, 60 with three and 75 with four at the old 9 s per run. A
-growth-only sweep is one solve of resection_time days per run.
+estimate's step; a mean of 2 000 steps and 9.4 s per run; 14.1 h with 3
+slots on each of GPUs 1, 2, 3 and 6), and the 2026-09-08 sweep at 12
+steps/day over the 260-day post-resection horizon (30 720 runs, about
+6 000 steps per run) confirmed the fit. With the 120-day horizon a run is
+about 12 (T_r + 120) treated-stage steps plus 12 T_r growth-stage steps,
+T_r the resection time: 4 100 steps and about 12 s at the mean
+resection_time of 115 days (estimated from that fit, not measured;
+the stability estimate is stricter than 12 steps/day only above
+D = 1.5 mm^2/day, which the growth band's 0.625 mm^2/day never reaches).
+The default design keeps --log2-n 11 (N = 2048): 28 672 runs with the
+12 factors, about 8-10 h on the same 12 slots; --log2-n 12 is about
+twice that. A run directory is about 4 MB: the final density, the
+pre-resection field and the two snapshots about 0.9 MB each on average
+(a whole-brain tumor up to 3.3 MB, a small one 0.1 MB; all rounded for
+storage, see FIELD_MANTISSA_BITS, unrounded they were 3.6 MB each; drop
+the pre-resection field with --no-keep-pre-resection-field), the two
+maps about 0.2 MB; the seed is not kept: about 115 GB at the default. A
+process spends its first seconds compiling and starting up, so several
+slots per GPU pay off: 30-run sweeps gave about 29 runs/min with one
+slot per GPU, 50 with two, 60 with three and 75 with four at the old
+9 s per run. A growth-only sweep is one solve of resection_time days per
+run.
 """
 
 from __future__ import annotations
@@ -407,7 +523,7 @@ DEFAULT_TISSUE_MAPS: dict[str, Path] = {
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_atlas")
 DEFAULT_GPUS = "1,2,3,6"
 DEFAULT_JOBS_PER_GPU = 3  # see Budget
-DEFAULT_LOG2_N = 11  # N = 2048, 30 720 runs with the 13 factors: about 11-14 h, see Budget
+DEFAULT_LOG2_N = 11  # N = 2048, 28 672 runs with the 12 factors: about 8-10 h, see Budget
 DEFAULT_DESIGN_SEED = 1
 DEFAULT_N_BOOTSTRAP = 1000
 DEFAULT_BOOTSTRAP_SEED = 0
@@ -453,12 +569,33 @@ PRE_PREFIX = "pre_"  # the QoI columns of that field
 TIME_STEP_KEYS: tuple[str, ...] = ("n_steps", "dt", "steps_per_day")
 
 SEED_KEYS: tuple[str, ...] = tuple(f"gaussian_seed_{axis}_fraction" for axis in "xyz")
-# The derived factor group of the seed: the sampled factors and the solver
-# parameters derived from them (see ``seed_parameters``).
+# The derived factor group of the growth dynamics: the front speed v and
+# the front width lambda of the Fisher-KPP travelling wave are sampled,
+# white_matter_diffusivity and rho derived (see ``growth_parameters``).
+GROWTH_SPEED_FACTOR = "front_speed_mm_per_day"
+GROWTH_WIDTH_FACTOR = "front_width_mm"
+GROWTH_DERIVED_KEYS: tuple[str, ...] = ("white_matter_diffusivity", "rho")
+# The admissible ranges of the derived dynamics (the outer bounds of the
+# 2026-09-08 search space, which sampled rho and the diffusivity
+# directly); a growth group whose implied ranges leave them is refused.
+RHO_BOUNDS: tuple[float, float] = (0.001, 0.2)  # 1/day
+DIFFUSIVITY_BOUNDS: tuple[float, float] = (0.01, 2.0)  # mm^2/day
+# The derived factor group of the seed: the peak density and the width
+# relative to the front width (sigma = seed_relative_width * lambda, with
+# lambda the row's front_width_mm of the growth group, which the seed
+# group therefore requires) are sampled, the solver's mass and diffusion
+# time derived (see ``seed_parameters``).
 SEED_PEAK_FACTOR = "seed_peak_density"
-SEED_SIGMA_FACTOR = "seed_sigma_mm"
+SEED_RELATIVE_WIDTH_FACTOR = "seed_relative_width"
 SEED_DERIVED_KEYS: tuple[str, ...] = ("gaussian_seed_mass", "gaussian_seed_diffusion_time")
-# Event times shifted with the sampled resection time.
+# The seed group's extra design.csv columns: the absolute width sigma in
+# mm and the radius of the seed's enhancing region, the density at or
+# above SEED_ENHANCING_THRESHOLD (0 when the peak is below it).
+SEED_SIGMA_COLUMN = "seed_sigma_mm"
+SEED_RADIUS_COLUMN = "seed_enhancing_radius_mm"
+SEED_ENHANCING_THRESHOLD = TAU_CORE
+# Event times shifted with the sampled resection time (and truncated to
+# the horizon, see ``truncate_schedule``).
 SHIFTED_TIME_KEYS: tuple[str, ...] = ("chemo_times", "rt_times")
 # Base config entries the design needs (the tissue maps for the seed
 # geometry, the times for the shift and the dose total).
@@ -466,8 +603,25 @@ BASE_KEYS_NEEDED: tuple[str, ...] = (
     "white_matter_pbmap",
     "gray_matter_pbmap",
     "resection_time",
+    "time_after_resection",
+    "chemo_doses",
     *SHIFTED_TIME_KEYS,
 )
+# The concomitant chemoradiotherapy of the base schedule: FRACTIONS_PER_WEEK
+# fractions on consecutive days, then a two-day break, for CRT_WEEKS weeks
+# from the first rt_time (``crt_snapshot_offsets`` checks the base
+# schedule follows it). The treated stage's snapshots are the state at
+# the end of the Sunday closing the third and the sixth week, days
+# SNAPSHOT_SUNDAYS after the first fraction: the days with a TMZ dose
+# but no fraction, so the snapshot holds that day's dose and no fraction
+# of the next week (``snapshot_days``).
+CRT_WEEKS = 6
+FRACTIONS_PER_WEEK = 5
+SNAPSHOT_SUNDAYS: dict[str, int] = {"mid_crt": 20, "end_crt": 41}
+# The snapshot fields of a run directory and the prefix of their QoI
+# columns, by snapshot name; the pre-resection field is the growth
+# stage's, the others the treated stage's (absent in growth-only mode).
+SNAPSHOT_FILES: dict[str, str] = {name: f"{name}_cell_density.nii.gz" for name in SNAPSHOT_SUNDAYS}
 
 # The resolved time stepping of both stages, carried into run_status.csv
 # and qoi.csv (``run_records``).
@@ -483,6 +637,9 @@ QOI_NAMES = [
     "r95_core",
     "r95_edema",
     "centroid_drift",
+    "centroid_x_mm",
+    "centroid_y_mm",
+    "centroid_z_mm",
     "R_g",
     "anisotropy",
     "log10_anisotropy",
@@ -491,13 +648,19 @@ QOI_NAMES = [
     "n_edema",
     "voxel_volume",
 ]
-MASS_WEIGHTED_QOIS: tuple[str, ...] = ("centroid_drift", "R_g", "anisotropy", "wm_fraction")
+CENTROID_QOIS: tuple[str, ...] = ("centroid_x_mm", "centroid_y_mm", "centroid_z_mm")
+MASS_WEIGHTED_QOIS: tuple[str, ...] = ("centroid_drift", *CENTROID_QOIS, "R_g", "anisotropy", "wm_fraction")
+# The QoI column prefixes of the snapshot fields, in column order: the
+# pre-resection field (pre_) and the treated stage's snapshots (mid_crt_,
+# end_crt_), each with the same QoIs as the final field.
+SNAPSHOT_PREFIXES: dict[str, str] = {PRE_PREFIX: PRE_RESECTION_FILE, **{f"{name}_": file for name, file in SNAPSHOT_FILES.items()}}
 # The same QoIs of the pre-resection field.
 PRE_QOI_NAMES = [f"{PRE_PREFIX}{name}" for name in QOI_NAMES]
+SNAPSHOT_QOI_NAMES = [f"{prefix}{name}" for prefix in SNAPSHOT_PREFIXES for name in QOI_NAMES]
 # Columns carried over from result.json, growth/result.json and
 # treatment.json (not analysed).
 CARRIED_COLUMNS = ["final_time", "n_steps", "wall_time_s", *STAGE_COLUMNS, "cavity_volume_mm3", "dose_volume_mm3"]
-QOI_COLUMNS = ["run_name", "index", "row", "matrix", "success", *QOI_NAMES, *PRE_QOI_NAMES, *CARRIED_COLUMNS]
+QOI_COLUMNS = ["run_name", "index", "row", "matrix", "success", *QOI_NAMES, *SNAPSHOT_QOI_NAMES, *CARRIED_COLUMNS]
 FINAL_ANALYSED_QOIS = [
     "log10_mass",
     "V_core",
@@ -507,11 +670,12 @@ FINAL_ANALYSED_QOIS = [
     "r95_core",
     "r95_edema",
     "centroid_drift",
+    *CENTROID_QOIS,
     "R_g",
     "log10_anisotropy",
     "wm_fraction",
 ]
-ANALYSED_QOIS = [*FINAL_ANALYSED_QOIS, *(f"{PRE_PREFIX}{name}" for name in FINAL_ANALYSED_QOIS)]
+ANALYSED_QOIS = [*FINAL_ANALYSED_QOIS, *(f"{prefix}{name}" for prefix in SNAPSHOT_PREFIXES for name in FINAL_ANALYSED_QOIS)]
 SOBOL_COLUMNS = ["qoi", "factor", "S1", "S1_conf", "ST", "ST_conf", "S1_half", "ST_half", "n_blocks_used"]
 
 # Figure colours (a validated categorical pair and neutral inks).
@@ -557,22 +721,34 @@ class Derivation:
         derives: The solver parameters derived, in order.
         factor_names: The sampled factors the derivation takes, in order;
             a group's sub-entries must be exactly these.
-        derive: Maps the sampled factor values (arrays by factor name, any
-            common shape) to the derived parameter values (arrays by
-            parameter name).
+        requires: Sampled factors of other groups the derivation takes as
+            well (e.g. the seed derivation takes the growth group's
+            front_width_mm); a search space must hold a group sampling
+            each of them, and that group is evaluated first.
+        extras: Further per-row quantities the derivation returns, written
+            into design.csv next to the derived parameters but not into
+            the run configs (e.g. the seed's width in mm).
+        derive: Maps the values of the factors and the required factors
+            (arrays by name, any common shape) to the derived parameter
+            values and the extras (arrays by name).
         validate: Checks the group's factor ranges against the resolved
             parameters of the growth stage (the base config with the
-            search space's overrides, defaults filled in) and returns the
-            record spec.json keeps under derived_groups (the parameter
-            values the derivation depends on).
+            search space's overrides, defaults filled in) and the ranges
+            of the required factors, and returns the record spec.json
+            keeps under derived_groups (the parameter values the
+            derivation depends on, the implied ranges).
         formula: The derivation in words, for spec.json.
     """
 
     derives: tuple[str, ...]
     factor_names: tuple[str, ...]
     derive: Callable[[Mapping[str, NDArray]], dict[str, NDArray]]
-    validate: Callable[[Mapping[str, SearchSpaceParameter], Mapping[str, Any]], dict[str, Any]]
+    validate: Callable[
+        [Mapping[str, SearchSpaceParameter], Mapping[str, Any], Mapping[str, SearchSpaceParameter]], dict[str, Any]
+    ]
     formula: str
+    requires: tuple[str, ...] = ()
+    extras: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -604,7 +780,9 @@ class SearchSpace:
             solver parameter, and the factors of the derived groups, named
             after the group's sub-entries, at the group's position.
         overrides: Fixed values written into every run config, by name.
-        groups: The derived factor groups by entry key, in file order.
+        groups: The derived factor groups by entry key, in evaluation
+            order (``group_evaluation_order``: a group after the groups
+            sampling the factors it requires).
         source: The file's entries as read, comments included.
     """
 
@@ -631,23 +809,36 @@ class SearchSpace:
 
     @property
     def derived_keys(self) -> list[str]:
-        """The solver parameters the derived groups write, in order."""
+        """The solver parameters the derived groups write, in evaluation
+        order."""
         return [key for group in self.groups.values() for key in group.derivation.derives]
+
+    @property
+    def extra_keys(self) -> list[str]:
+        """The groups' extra design.csv columns (not solver parameters),
+        in evaluation order."""
+        return [key for group in self.groups.values() for key in group.derivation.extras]
 
     def derive(self, values: Mapping[str, NDArray]) -> dict[str, NDArray]:
         """
-        The derived solver parameters of sampled factor values.
+        The derived solver parameters and extras of sampled factor values.
 
         Args:
             values: The sampled values by factor name (arrays of one
                 common shape, or scalars), the groups' factors included.
 
         Returns:
-            The derived values by solver parameter name, for every group.
+            The derived values by name (``derived_keys`` and
+            ``extra_keys``), the groups evaluated in order so that a
+            derivation may take another group's factors.
         """
         derived: dict[str, NDArray] = {}
         for group in self.groups.values():
-            derived.update(group.derivation.derive({name: np.asarray(values[name], dtype=np.float64) for name in group.factors}))
+            inputs = {
+                name: np.asarray(values[name], dtype=np.float64)
+                for name in (*group.factors, *group.derivation.requires)
+            }
+            derived.update(group.derivation.derive(inputs))
         return derived
 
     def solver_values(self, record: Mapping[str, Any]) -> dict[str, float]:
@@ -701,6 +892,76 @@ def _parse_parameter(name: str, entry: Mapping[str, Any], where: str) -> SearchS
     return SearchSpaceParameter(name, low, high, scale)
 
 
+def growth_parameters(front_speed: NDArray | float, front_width: NDArray | float) -> dict[str, NDArray]:
+    """
+    The Fisher-KPP dynamics of a front speed and a front width.
+
+    The travelling wave of du/dt = D lap u + rho u (1 - u) moves at
+    v = 2 sqrt(D rho) and has the width lambda = sqrt(D / rho), so
+    D = v lambda / 2 and rho = v / (2 lambda).
+
+    Args:
+        front_speed: v in mm/day.
+        front_width: lambda in mm.
+
+    Returns:
+        white_matter_diffusivity (D, mm^2/day) and rho (1/day), float64
+        arrays of the inputs' broadcast shape.
+    """
+    v = np.asarray(front_speed, dtype=np.float64)
+    width = np.asarray(front_width, dtype=np.float64)
+    return {"white_matter_diffusivity": v * width / 2.0, "rho": v / (2.0 * width)}
+
+
+def front_parameters(diffusivity: NDArray | float, rho: NDArray | float) -> dict[str, NDArray]:
+    """The inverse of ``growth_parameters``: v = 2 sqrt(D rho) and
+    lambda = sqrt(D / rho)."""
+    d = np.asarray(diffusivity, dtype=np.float64)
+    r = np.asarray(rho, dtype=np.float64)
+    return {GROWTH_SPEED_FACTOR: 2.0 * np.sqrt(d * r), GROWTH_WIDTH_FACTOR: np.sqrt(d / r)}
+
+
+GROWTH_FORMULA = (
+    f"white_matter_diffusivity = {GROWTH_SPEED_FACTOR} * {GROWTH_WIDTH_FACTOR} / 2 (mm^2/day) and "
+    f"rho = {GROWTH_SPEED_FACTOR} / (2 {GROWTH_WIDTH_FACTOR}) (1/day): the Fisher-KPP front moves at "
+    "v = 2 sqrt(D rho) and has the width lambda = sqrt(D / rho)"
+)
+
+
+def _validate_growth_group(
+    factors: Mapping[str, SearchSpaceParameter], config: Mapping[str, Any], required: Mapping[str, SearchSpaceParameter]
+) -> dict[str, Any]:
+    """
+    The growth group's design-time checks: positive ranges, and the
+    implied rho and white_matter_diffusivity ranges (at the corners of
+    the (v, lambda) rectangle) within RHO_BOUNDS and DIFFUSIVITY_BOUNDS.
+
+    Returns:
+        The spec.json record: the implied ranges and the bounds.
+    """
+    speed, width = factors[GROWTH_SPEED_FACTOR], factors[GROWTH_WIDTH_FACTOR]
+    for factor in (speed, width):
+        if factor.low <= 0:
+            raise ValueError(f"{factor.name}: min must be positive, got {factor.low!r}.")
+    diffusivity_range = (speed.low * width.low / 2.0, speed.high * width.high / 2.0)
+    rho_range = (speed.low / (2.0 * width.high), speed.high / (2.0 * width.low))
+    for key, implied, bounds in (
+        ("white_matter_diffusivity", diffusivity_range, DIFFUSIVITY_BOUNDS),
+        ("rho", rho_range, RHO_BOUNDS),
+    ):
+        if implied[0] < bounds[0] or implied[1] > bounds[1]:
+            raise ValueError(
+                f"the growth group implies {key} in [{implied[0]:.4g}, {implied[1]:.4g}], outside the admissible "
+                f"[{bounds[0]:g}, {bounds[1]:g}]; narrow {GROWTH_SPEED_FACTOR} or {GROWTH_WIDTH_FACTOR}."
+            )
+    return {
+        "white_matter_diffusivity_range": [float(v) for v in diffusivity_range],
+        "rho_range": [float(v) for v in rho_range],
+        "white_matter_diffusivity_bounds": list(DIFFUSIVITY_BOUNDS),
+        "rho_bounds": list(RHO_BOUNDS),
+    }
+
+
 def seed_parameters(peak_density: NDArray | float, sigma_mm: NDArray | float) -> dict[str, NDArray]:
     """
     The solver's seed parameters of a peak density and a width.
@@ -732,28 +993,77 @@ def seed_peak_density(mass: NDArray | float, diffusion_time: NDArray | float) ->
     return mass / (4.0 * np.pi * tau) ** 1.5
 
 
+def seed_enhancing_radius(
+    peak_density: NDArray | float, sigma_mm: NDArray | float, threshold: float = SEED_ENHANCING_THRESHOLD
+) -> NDArray:
+    """The radius in mm within which the seed's density is at or above
+    threshold: sigma sqrt(2 ln(c_peak / threshold)), 0 when the peak is
+    below it."""
+    peak = np.asarray(peak_density, dtype=np.float64)
+    sigma = np.asarray(sigma_mm, dtype=np.float64)
+    return sigma * np.sqrt(2.0 * np.maximum(np.log(peak / threshold), 0.0))
+
+
+def seed_group_parameters(values: Mapping[str, NDArray | float]) -> dict[str, NDArray]:
+    """
+    The seed group's derivation: the width in mm is
+    sigma = seed_relative_width * front_width_mm (the row's front width
+    of the growth group), the solver's parameters follow by
+    ``seed_parameters``, and the extras are sigma (``SEED_SIGMA_COLUMN``)
+    and the enhancing radius (``SEED_RADIUS_COLUMN``,
+    ``seed_enhancing_radius``).
+
+    Args:
+        values: seed_peak_density, seed_relative_width and front_width_mm
+            (arrays of one common shape, or scalars).
+
+    Returns:
+        gaussian_seed_mass, gaussian_seed_diffusion_time, seed_sigma_mm
+        and seed_enhancing_radius_mm.
+    """
+    peak = np.asarray(values[SEED_PEAK_FACTOR], dtype=np.float64)
+    sigma = np.asarray(values[SEED_RELATIVE_WIDTH_FACTOR], dtype=np.float64) * np.asarray(
+        values[GROWTH_WIDTH_FACTOR], dtype=np.float64
+    )
+    derived = seed_parameters(peak, sigma)
+    derived[SEED_SIGMA_COLUMN] = sigma
+    derived[SEED_RADIUS_COLUMN] = seed_enhancing_radius(peak, sigma)
+    return derived
+
+
 SEED_FORMULA = (
-    "gaussian_seed_diffusion_time = seed_sigma_mm^2 / 2 (mm^2; the solver evaluates the "
-    "profile exp(-r^2 / (4 tau)) with r in mm, gaussian_seed_scale = 1); "
-    "gaussian_seed_mass = seed_peak_density * (4 pi gaussian_seed_diffusion_time)^(3/2), "
-    "so the seed's peak equals seed_peak_density, above gaussian_seed_floor and at most 1"
+    f"{SEED_SIGMA_COLUMN} = {SEED_RELATIVE_WIDTH_FACTOR} * {GROWTH_WIDTH_FACTOR} (mm; the row's front width of "
+    f"the growth group); gaussian_seed_diffusion_time = {SEED_SIGMA_COLUMN}^2 / 2 (mm^2; the solver "
+    "evaluates the profile exp(-r^2 / (4 tau)) with r in mm, gaussian_seed_scale = 1); "
+    f"gaussian_seed_mass = {SEED_PEAK_FACTOR} * (4 pi gaussian_seed_diffusion_time)^(3/2), "
+    f"so the seed's peak equals {SEED_PEAK_FACTOR}, above gaussian_seed_floor and at most 1; "
+    f"{SEED_RADIUS_COLUMN} = {SEED_SIGMA_COLUMN} * sqrt(2 ln({SEED_PEAK_FACTOR} / {SEED_ENHANCING_THRESHOLD:g})), "
+    "the radius of the seed's region at or above that density (0 below it)"
 )
 
 
 def _validate_seed_group(
-    factors: Mapping[str, SearchSpaceParameter], config: Mapping[str, Any]
+    factors: Mapping[str, SearchSpaceParameter], config: Mapping[str, Any], required: Mapping[str, SearchSpaceParameter]
 ) -> dict[str, Any]:
     """
     The seed group's design-time checks: the peak range lies above the
     resolved gaussian_seed_floor (else a seed would be erased) and at most
-    at 1 (else clipped), the width range is positive, and
+    at 1 (else clipped), the relative width range is positive, and
     gaussian_seed_scale is 1 (else sigma would not be in mm).
 
+    Args:
+        factors: The group's factors.
+        config: The resolved parameters of the growth stage.
+        required: The required factors (front_width_mm of the growth
+            group).
+
     Returns:
-        The spec.json record: gaussian_seed_floor, gaussian_seed_scale and
-        the ranges of the derived parameters.
+        The spec.json record: gaussian_seed_floor, gaussian_seed_scale,
+        the range of sigma in mm and of the enhancing radius, and the
+        ranges of the derived parameters.
     """
-    peak, sigma = factors[SEED_PEAK_FACTOR], factors[SEED_SIGMA_FACTOR]
+    peak, relative = factors[SEED_PEAK_FACTOR], factors[SEED_RELATIVE_WIDTH_FACTOR]
+    width = required[GROWTH_WIDTH_FACTOR]
     floor = float(config["gaussian_seed_floor"])
     if not peak.low > floor:
         raise ValueError(
@@ -762,34 +1072,85 @@ def _validate_seed_group(
         )
     if peak.high > 1:
         raise ValueError(f"{SEED_PEAK_FACTOR}: max must be at most 1 (the solver clips above 1), got {peak.high!r}.")
-    if sigma.low <= 0:
-        raise ValueError(f"{SEED_SIGMA_FACTOR}: min must be positive, got {sigma.low!r}.")
+    if relative.low <= 0:
+        raise ValueError(f"{SEED_RELATIVE_WIDTH_FACTOR}: min must be positive, got {relative.low!r}.")
     scale = float(config["gaussian_seed_scale"])
     if scale != 1.0:
         raise ValueError(
-            f"the seed derivation takes {SEED_SIGMA_FACTOR} in mm, which needs gaussian_seed_scale = 1 "
+            f"the seed derivation takes {SEED_SIGMA_COLUMN} in mm, which needs gaussian_seed_scale = 1 "
             f"(a fixed override of the search space or the base config's value), got {scale!r}."
         )
-    corners = seed_parameters(np.array([peak.low, peak.high]), np.array([sigma.low, sigma.high]))
+    sigma_range = (relative.low * width.low, relative.high * width.high)
+    corners = seed_parameters(np.array([peak.low, peak.high]), np.array(sigma_range))
     return {
         "gaussian_seed_floor": floor,
         "gaussian_seed_scale": scale,
+        f"{SEED_SIGMA_COLUMN}_range": [float(v) for v in sigma_range],
+        f"{SEED_RADIUS_COLUMN}_range": [
+            float(seed_enhancing_radius(peak.low, sigma_range[0])),
+            float(seed_enhancing_radius(peak.high, sigma_range[1])),
+        ],
+        "seed_enhancing_threshold": SEED_ENHANCING_THRESHOLD,
         "gaussian_seed_diffusion_time_range": [float(v) for v in corners["gaussian_seed_diffusion_time"]],
         "gaussian_seed_mass_range": [float(v) for v in corners["gaussian_seed_mass"]],
     }
 
 
 # The registered derivations by the tuple of solver parameters they derive
-# (a search-space entry's "derives" list). A new group is one more entry.
+# (a search-space entry's "derives" list). A new group is one more entry;
+# a derivation that takes another group's factors names them in
+# ``requires`` and is evaluated after that group.
 DERIVATIONS: dict[tuple[str, ...], Derivation] = {
+    GROWTH_DERIVED_KEYS: Derivation(
+        derives=GROWTH_DERIVED_KEYS,
+        factor_names=(GROWTH_SPEED_FACTOR, GROWTH_WIDTH_FACTOR),
+        derive=lambda values: growth_parameters(values[GROWTH_SPEED_FACTOR], values[GROWTH_WIDTH_FACTOR]),
+        validate=_validate_growth_group,
+        formula=GROWTH_FORMULA,
+    ),
     SEED_DERIVED_KEYS: Derivation(
         derives=SEED_DERIVED_KEYS,
-        factor_names=(SEED_PEAK_FACTOR, SEED_SIGMA_FACTOR),
-        derive=lambda values: seed_parameters(values[SEED_PEAK_FACTOR], values[SEED_SIGMA_FACTOR]),
+        factor_names=(SEED_PEAK_FACTOR, SEED_RELATIVE_WIDTH_FACTOR),
+        derive=seed_group_parameters,
         validate=_validate_seed_group,
         formula=SEED_FORMULA,
+        requires=(GROWTH_WIDTH_FACTOR,),
+        extras=(SEED_SIGMA_COLUMN, SEED_RADIUS_COLUMN),
     ),
 }
+
+
+def group_evaluation_order(groups: Mapping[str, DerivedGroup], where: str = "search space") -> list[str]:
+    """
+    The evaluation order of derived groups: file order, except that a
+    group comes after the groups sampling the factors it requires.
+
+    Raises:
+        ValueError: A required factor is not sampled by any group (e.g.
+            a seed group without a growth group).
+    """
+    provider = {factor: name for name, group in groups.items() for factor in group.factors}
+    for name, group in groups.items():
+        for factor in group.derivation.requires:
+            if factor not in provider:
+                registered = [
+                    f"{list(d.derives)} (factors {list(d.factor_names)})" for d in DERIVATIONS.values() if factor in d.factor_names
+                ]
+                raise ValueError(
+                    f"{where}: {name}: the derivation of {list(group.derivation.derives)} takes {factor!r}, which no "
+                    f"group of the search space samples; add the group deriving {', '.join(registered) or '?'}."
+                )
+    order: list[str] = []
+    pending = list(groups)
+    while pending:
+        ready = [
+            name for name in pending if all(provider[f] in order for f in groups[name].derivation.requires)
+        ]
+        if not ready:
+            raise ValueError(f"{where}: the derived groups {pending} require each other.")
+        order.append(ready[0])
+        pending.remove(ready[0])
+    return order
 
 
 def _parse_group(name: str, entry: Mapping[str, Any], known: frozenset[str], where: str) -> DerivedGroup:
@@ -909,7 +1270,8 @@ def load_search_space(
                 f"{where}: {key} must be a linear factor within [0, 1], got "
                 f"[{factor.low}, {factor.high}] {factor.scale}."
             )
-    return SearchSpace(factors, overrides, dict(entries), groups)
+    ordered = {name: groups[name] for name in group_evaluation_order(groups, where)}
+    return SearchSpace(factors, overrides, dict(entries), ordered)
 
 
 # --- seed geometry ---
@@ -1097,8 +1459,8 @@ def design_table(
         Records with run_name, index (position in the sample), row (the
         block), matrix, u_<factor> for every factor, <factor> transformed
         (seed factors: the projected fractions), the derived solver
-        parameters of the groups (``SearchSpace.derive``) and
-        seed_voxel_i/j/k.
+        parameters and the extra columns of the groups
+        (``SearchSpace.derive``) and seed_voxel_i/j/k.
     """
     names = space.names
     size = block_size(len(names), second_order)
@@ -1129,10 +1491,144 @@ def design_table(
         }
         record.update({f"u_{name}": float(samples[index, column]) for column, name in enumerate(names)})
         record.update({name: float(values[name][index]) for name in names})
-        record.update({key: float(derived[key][index]) for key in space.derived_keys})
+        record.update({key: float(derived[key][index]) for key in (*space.derived_keys, *space.extra_keys)})
         record.update({f"seed_voxel_{ijk}": int(voxels[index, axis]) for axis, ijk in enumerate("ijk")})
         records.append(record)
     return records
+
+
+def truncate_schedule(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    The treatment schedule of the base config (with the search space's
+    overrides) truncated to the horizon: the chemotherapy sessions and
+    the fractions later than resection_time + time_after_resection are
+    dropped, so no dose falls after the horizon (the solver would warn
+    and never fire it).
+
+    Args:
+        base: The base config.
+        overrides: The search space's fixed overrides (time_after_resection,
+            chemo_times, chemo_doses, rt_times may be among them).
+
+    Returns:
+        chemo_times, chemo_doses, rt_times (the kept sessions, as lists of
+        floats, in the base clock) and the record spec.json keeps under
+        "schedule": the horizon, the sessions kept and dropped per key
+        and the kept total dose (chemo_total_dose).
+    """
+    effective = {**base, **overrides}
+    horizon = float(effective["resection_time"]) + float(effective["time_after_resection"])
+    chemo_times = np.asarray(effective["chemo_times"], dtype=np.float64)
+    chemo_doses = np.asarray(effective["chemo_doses"], dtype=np.float64)
+    rt_times = np.asarray(effective["rt_times"], dtype=np.float64)
+    if chemo_times.shape != chemo_doses.shape:
+        raise ValueError(f"chemo_times has {chemo_times.size} entries, chemo_doses {chemo_doses.size}.")
+    keep_chemo = chemo_times <= horizon
+    keep_rt = rt_times <= horizon
+    return {
+        "chemo_times": chemo_times[keep_chemo].tolist(),
+        "chemo_doses": chemo_doses[keep_chemo].tolist(),
+        "rt_times": rt_times[keep_rt].tolist(),
+        "schedule": {
+            "resection_time": float(effective["resection_time"]),
+            "time_after_resection": float(effective["time_after_resection"]),
+            "horizon": horizon,
+            "n_chemo_sessions": int(keep_chemo.sum()),
+            "n_chemo_sessions_dropped": int((~keep_chemo).sum()),
+            "chemo_total_dose": float(chemo_doses[keep_chemo].sum()),
+            "chemo_total_dose_dropped": float(chemo_doses[~keep_chemo].sum()),
+            "n_fractions": int(keep_rt.sum()),
+            "n_fractions_dropped": int((~keep_rt).sum()),
+        },
+    }
+
+
+def crt_snapshot_offsets(rt_times: Sequence[float], chemo_times: Sequence[float], resection_time: float) -> dict[str, float]:
+    """
+    The treated stage's snapshot days as offsets after resection_time, from
+    the base schedule: the first fraction starts the concomitant
+    chemoradiotherapy, whose fractions must be FRACTIONS_PER_WEEK
+    consecutive days then a two-day break for CRT_WEEKS weeks (the base
+    schedule's 30 fractions on weekdays over six weeks), and the
+    snapshot Sundays are SNAPSHOT_SUNDAYS days after the first fraction
+    (the Sunday closing the third and the sixth week), on which a
+    chemotherapy session must fall (TMZ is given daily, weekends
+    included) and no fraction.
+
+    Args:
+        rt_times: The base schedule's fractions (base clock).
+        chemo_times: The base schedule's chemotherapy sessions.
+        resection_time: The base config's resection_time.
+
+    Returns:
+        The offsets in days after resection_time by snapshot name, in
+        SNAPSHOT_SUNDAYS' order.
+
+    Raises:
+        ValueError: The fractions do not follow the weekly pattern, or a
+            snapshot Sunday has no chemotherapy session or has a fraction.
+    """
+    fractions = np.asarray(rt_times, dtype=np.float64)
+    sessions = np.asarray(chemo_times, dtype=np.float64)
+    if fractions.size == 0:
+        raise ValueError("the base schedule has no rt_times; the snapshots are defined on the fractions.")
+    start = float(fractions.min())
+    n_fractions = CRT_WEEKS * FRACTIONS_PER_WEEK
+    pattern = start + np.array([7 * (i // FRACTIONS_PER_WEEK) + i % FRACTIONS_PER_WEEK for i in range(n_fractions)], dtype=np.float64)
+    if fractions.size != n_fractions or not np.allclose(np.sort(fractions), pattern, rtol=0, atol=1e-9):
+        raise ValueError(
+            f"the base schedule's rt_times must be {n_fractions} fractions on {FRACTIONS_PER_WEEK} consecutive days a "
+            f"week for {CRT_WEEKS} weeks from the first fraction (day {start:g}: {pattern.tolist()}), got "
+            f"{np.sort(fractions).tolist()}; the snapshots are defined on that pattern."
+        )
+    offsets: dict[str, float] = {}
+    for name, sunday in SNAPSHOT_SUNDAYS.items():
+        day = start + sunday
+        if not np.any(np.isclose(sessions, day, rtol=0, atol=1e-9)):
+            raise ValueError(
+                f"snapshot {name}: day {day:g} ({sunday} days after the first fraction) has no chemotherapy session "
+                "in the base schedule's chemo_times; the snapshot is the state at the end of a TMZ day without a fraction."
+            )
+        if np.any(np.isclose(fractions, day, rtol=0, atol=1e-9)):
+            raise ValueError(f"snapshot {name}: day {day:g} has a fraction; the snapshot day must be free of fractions.")
+        offsets[name] = day - float(resection_time)
+    return offsets
+
+
+def snapshot_days(resection_time: float, offsets: Mapping[str, float], dt: float) -> dict[str, float]:
+    """
+    The days the treated stage records its snapshots on, for the solver's
+    snapshot_times: the state at the end of each snapshot day (the day
+    resection_time + offset, ending at resection_time + offset + 1, when
+    the next fraction may fire) is the state after the last step whose end
+    lies at least half a step before that moment, (m + 1/2) dt <= t_end,
+    at most 3/2 dt before it. Both bounds are half a step away from any
+    step end, so the state dtype's rounding of the step ends (the solver
+    fires an event at t in the step (t0, t1] containing it) cannot move
+    the next day's fraction before the snapshot, nor that day's
+    chemotherapy session, a day earlier, after it: with dt at most half a
+    day the session precedes the snapshot by more than a quarter step.
+
+    Args:
+        resection_time: The run's sampled resection_time (the one the
+            schedule was shifted with).
+        offsets: The snapshot offsets after resection_time
+            (``crt_snapshot_offsets``).
+        dt: The time step of the treated stage (the growth stage's).
+
+    Returns:
+        The days m dt by snapshot name; the solver records the state after
+        the step ending nearest to each, i.e. step m.
+    """
+    dt = float(dt)
+    if not (np.isfinite(dt) and 0 < dt <= 0.5):
+        raise ValueError(f"the snapshots need a step of at most half a day, got dt={dt!r}.")
+    days: dict[str, float] = {}
+    for name, offset in offsets.items():
+        t_end = float(resection_time) + float(offset) + 1.0
+        m = int(np.floor(t_end / dt - 0.5))
+        days[name] = m * dt
+    return days
 
 
 def run_config(
@@ -1140,7 +1636,8 @@ def run_config(
 ) -> dict[str, Any]:
     """
     The config of one run: the base config with the fixed overrides and
-    the sampled values substituted, chemo_times and rt_times shifted by
+    the sampled values substituted, the schedule truncated to the horizon
+    (``truncate_schedule``) and chemo_times and rt_times shifted by
     resection_time - base resection_time.
 
     Args:
@@ -1153,25 +1650,29 @@ def run_config(
 
     Returns:
         The run config, with a '_design' comment entry; resection_cavity
-        and rt_dose stay null (``run_one`` derives them).
+        and rt_dose stay null (``run_one`` derives them) and snapshot_times
+        stays the base config's (``run_one`` sets the treated stage's).
     """
     config: dict[str, Any] = {
         SOLVER_KEY: base.get(SOLVER_KEY, SOLVER_NAME),
         "_design": (
             "scripts/sensitivity_analysis.py: the base config with the search space's "
-            "overrides and the sampled factor values substituted, chemo_times and "
-            "rt_times shifted with resection_time; resection_cavity and rt_dose are "
-            "derived by the run from its growth stage (see treatment in spec.json); "
-            "see design.csv and spec.json in the parent directory."
+            "overrides and the sampled factor values substituted, chemo_times, "
+            "chemo_doses and rt_times truncated to the horizon and shifted with "
+            "resection_time; resection_cavity and rt_dose are derived by the run from "
+            "its growth stage (see treatment in spec.json) and the treated stage's "
+            "snapshot_times are set by the run (see snapshots in spec.json); see "
+            "design.csv and spec.json in the parent directory."
         ),
     }
     config.update({key: value for key, value in base.items() if key != SOLVER_KEY})
     config.update(space.overrides)
     config.update(values)
+    schedule = truncate_schedule(base, space.overrides)
     shift = float(config["resection_time"]) - float(base["resection_time"])
+    config["chemo_doses"] = schedule["chemo_doses"]
     for key in SHIFTED_TIME_KEYS:
-        times = space.overrides.get(key, base[key])
-        config[key] = [float(t) + shift for t in times]
+        config[key] = [float(t) + shift for t in schedule[key]]
     return config
 
 
@@ -1256,11 +1757,11 @@ def chemo_log_kill_range(
             range otherwise).
 
     Returns:
-        (D_tot, (L_min, L_max)) with D_tot the sum of chemo_doses and
+        (D_tot, (L_min, L_max)) with D_tot the sum of the chemo_doses
+        within the horizon (``truncate_schedule``) and
         L_min = kill_min D_tot / decay_max, L_max = kill_max D_tot / decay_min.
     """
-    doses = space.overrides.get("chemo_doses", base["chemo_doses"])
-    total_dose = float(np.sum(np.asarray(doses, dtype=np.float64)))
+    total_dose = float(truncate_schedule(base, space.overrides)["schedule"]["chemo_total_dose"])
 
     def bounds(key: str) -> tuple[float, float]:
         factor = space.factors.get(key)
@@ -1312,6 +1813,36 @@ def spec_treatment_settings(spec: Mapping[str, Any]) -> dict[str, float]:
         treatment.get("rt_margin_mm", RT_MARGIN_MM),
         treatment.get("rt_dose_per_fraction_gy", RT_DOSE_PER_FRACTION_GY),
     )
+
+
+def spec_snapshot_offsets(spec: Mapping[str, Any]) -> dict[str, float]:
+    """The treated stage's snapshot offsets after resection_time of a
+    spec.json record (``crt_snapshot_offsets``); empty for a growth-only
+    design or a spec without them (an older design records no
+    snapshots)."""
+    snapshots = spec.get("snapshots") or {}
+    return {str(name): float(offset) for name, offset in snapshots.items()}
+
+
+def format_snapshot_offsets(offsets: Mapping[str, float]) -> str:
+    """The --snapshots argument of run-one: "name=offset,...", '' for none."""
+    return ",".join(f"{name}={offset!r}" for name, offset in offsets.items())
+
+
+def parse_snapshot_offsets(text: str) -> dict[str, float]:
+    """The inverse of ``format_snapshot_offsets``: the snapshot names must
+    be among ``SNAPSHOT_FILES``, the offsets finite and nonnegative."""
+    offsets: dict[str, float] = {}
+    for item in (part.strip() for part in text.split(",") if part.strip()):
+        name, _, value = item.partition("=")
+        name = name.strip()
+        if name not in SNAPSHOT_FILES or name in offsets:
+            raise ValueError(f"--snapshots: {name!r} is not one of {sorted(SNAPSHOT_FILES)} or repeats, in {text!r}.")
+        offset = float(value)
+        if not (np.isfinite(offset) and offset >= 0):
+            raise ValueError(f"--snapshots: {name}: the offset must be finite and nonnegative, got {value!r}.")
+        offsets[name] = offset
+    return offsets
 
 
 def make_design(
@@ -1407,19 +1938,44 @@ def make_design(
         group.name: {
             "derives": list(group.derivation.derives),
             "factors": list(group.factors),
+            "requires": list(group.derivation.requires),
+            "extras": list(group.derivation.extras),
             "formula": group.derivation.formula,
-            **group.derivation.validate(group.factors, growth.params),
+            **group.derivation.validate(
+                group.factors, growth.params, {key: space.factors[key] for key in group.derivation.requires}
+            ),
         }
         for group in space.groups.values()
     }
+    # The schedule within the horizon, in the base clock (every run
+    # shifts it), and the treated stage's snapshot days after resection
+    # (defined on the whole base schedule, then checked against the
+    # horizon).
+    schedule = truncate_schedule(base, space.overrides)
+    snapshots: dict[str, float] | None = None
+    if not growth_only:
+        snapshots = crt_snapshot_offsets(effective["rt_times"], effective["chemo_times"], effective["resection_time"])
+        late = {name: offset for name, offset in snapshots.items() if offset + 1.0 > schedule["schedule"]["time_after_resection"]}
+        if late:
+            raise ValueError(
+                f"the snapshots {late} (days after resection_time, ending a day later) lie beyond "
+                f"time_after_resection = {schedule['schedule']['time_after_resection']:g}."
+            )
     # The treated stage's entries (schedule, kill rates, dose model) are
     # validated with an empty cavity and a zero dose map.
-    StuppFKPPSolver({**effective, "resection_cavity": np.zeros(wm.shape, dtype=bool), "rt_dose": np.zeros(wm.shape)})
+    StuppFKPPSolver(
+        {
+            **effective,
+            **{key: schedule[key] for key in ("chemo_times", "chemo_doses", "rt_times")},
+            "resection_cavity": np.zeros(wm.shape, dtype=bool),
+            "rt_dose": np.zeros(wm.shape),
+        }
+    )
     geometry = seed_geometry(wm, gm, min_tissue_fraction)
     samples = saltelli_design(space.names, log2_n, seed, second_order)
     table = design_table(samples, space, geometry, second_order)
     total_dose, log_kill_range = chemo_log_kill_range(base, space)
-    n_fractions = len(space.overrides.get("rt_times", base["rt_times"]))
+    n_fractions = schedule["schedule"]["n_fractions"]
     spec = {
         "name": name,
         "search_space_path": str(search_space_path),
@@ -1428,6 +1984,9 @@ def make_design(
         "overrides": space.overrides,
         "derived_groups": derived_groups,
         "derived_keys": space.derived_keys,
+        "extra_keys": space.extra_keys,
+        "schedule": schedule["schedule"],
+        "snapshots": snapshots,
         "base_config": str(config_path),
         "time_step": time_step,
         "growth_only": bool(growth_only),
@@ -1563,6 +2122,7 @@ def run_subprocess(
     treatment: Mapping[str, float],
     keep_pre_resection_field: bool = True,
     growth_only: bool = False,
+    snapshots: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """
     Run one design point in its own process (``run-one``) and read its
@@ -1576,6 +2136,8 @@ def run_subprocess(
             (``treatment_settings``).
         keep_pre_resection_field: See ``run_one``.
         growth_only: See ``run_one``.
+        snapshots: The treated stage's snapshot offsets
+            (``spec_snapshot_offsets``); none by default.
 
     Returns:
         A run_status.csv record (``STATUS_COLUMNS``; wall_time_s is the
@@ -1597,6 +2159,8 @@ def run_subprocess(
         str(treatment["rt_margin_mm"]),
         "--rt-dose-per-fraction",
         str(treatment["rt_dose_per_fraction_gy"]),
+        "--snapshots",
+        format_snapshot_offsets(snapshots or {}),
     ]
     if not keep_pre_resection_field:
         command.append("--no-keep-pre-resection-field")
@@ -1664,6 +2228,7 @@ def run_sweep(
     spec = read_json(sweep_dir / "spec.json")
     treatment = spec_treatment_settings(spec)
     growth_only = resolve_growth_only(sweep_dir, spec, growth_only)
+    snapshots = {} if growth_only else spec_snapshot_offsets(spec)
     pending: list[str] = []
     counts = {"skipped": 0, "ok": 0, "failed": 0}
     for record in read_csv(sweep_dir / "design.csv"):
@@ -1703,7 +2268,7 @@ def run_sweep(
                     name = queue.get_nowait()
                 except Empty:
                     return
-                record = run_subprocess(sweep_dir, name, gpu, treatment, keep_pre_resection_field, growth_only)
+                record = run_subprocess(sweep_dir, name, gpu, treatment, keep_pre_resection_field, growth_only, snapshots)
                 with lock:
                     writer.writerow({key: _csv_cell(record.get(key)) for key in columns})
                     handle.flush()
@@ -1730,7 +2295,8 @@ def growth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     The growth stage's config of a run config: the FKPPSolver entries of
     the StuppFKPPSolver config (tissue maps, dynamics, seed, grid, time
     step, stopping settings) with stopping_time = resection_time, so the
-    stage ends at the moment of surgery.
+    stage ends at the moment of surgery, and no snapshots (the treated
+    stage's are after resection).
 
     Args:
         config: A StuppFKPPSolver config (``read_config``).
@@ -1738,10 +2304,11 @@ def growth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     Returns:
         The FKPPSolver config, "solver" entry included.
     """
-    keys = FKPPSolver.config_keys() - {"stopping_time"}
+    keys = FKPPSolver.config_keys() - {"stopping_time", "snapshot_times"}
     growth: dict[str, Any] = {SOLVER_KEY: GROWTH_SOLVER_NAME}
     growth.update({key: value for key, value in config.items() if key in keys})
     growth["stopping_time"] = float(config["resection_time"])
+    growth["snapshot_times"] = None
     return growth
 
 
@@ -1857,6 +2424,31 @@ def round_field(
     return rounded.astype(np.uint32).view(np.float32).reshape(kept.shape)
 
 
+def _save_snapshots(run_dir: Path, result: Any, days: Mapping[str, float], affine: NDArray) -> dict[str, float]:
+    """
+    Save the treated stage's recorded snapshot frames: for every snapshot
+    whose requested day (``snapshot_days``) the solver recorded
+    (``Result.snapshot_times``; a frame after an early stop is missing),
+    the cell density frame as run_dir/<name>_cell_density.nii.gz (float32,
+    rounded for storage, the given affine).
+
+    Returns:
+        The recorded day by snapshot name, for the ones saved.
+    """
+    recorded_days = np.asarray(result.snapshot_times, dtype=np.float64)
+    frames = result.time_series["cell_density"]
+    recorded: dict[str, float] = {}
+    for name, day in days.items():
+        matches = np.flatnonzero(np.isclose(recorded_days, day, rtol=1e-9, atol=1e-9))
+        if matches.size == 0:
+            continue
+        image = nib.Nifti1Image(round_field(frames[int(matches[0])]), affine)
+        image.set_data_dtype(np.float32)
+        nib.save(image, str(run_dir / SNAPSHOT_FILES[name]))
+        recorded[name] = float(recorded_days[int(matches[0])])
+    return recorded
+
+
 def _print_stage(stage: str, result: Any) -> None:
     """The console line of one stage's Result."""
     status = "ok" if result.success else f"FAILED: {result.error}"
@@ -1875,6 +2467,7 @@ def run_one(
     rt_dose_per_fraction: float = RT_DOSE_PER_FRACTION_GY,
     keep_pre_resection_field: bool = True,
     growth_only: bool = False,
+    snapshots: Mapping[str, float] | None = None,
 ) -> int:
     """
     Solve one run config into run_dir in two stages: the growth stage
@@ -1886,9 +2479,12 @@ def run_one(
     resection_cavity.nii.gz, rt_dose.nii.gz and treatment.json) and the
     treated stage with those maps on the growth stage's time steps
     (``align_treated_config``; ``Result.save`` into run_dir without the
-    initial state; its config.json references the maps). Both saved
-    density fields are rounded for storage (``round_field``); the maps
-    and the treatment record derive from the unrounded density.
+    initial state; its config.json references the maps) recording the
+    snapshots (``snapshot_days``; each frame saved as
+    <name>_cell_density.nii.gz, ``SNAPSHOT_FILES``, the days recorded in
+    treatment.json). All saved density fields are rounded for storage
+    (``round_field``); the maps and the treatment record derive from the
+    unrounded density.
 
     In growth-only mode the growth stage is the run: ``Result.save`` of
     the growth stage into run_dir itself (config.json is the FKPPSolver
@@ -1906,11 +2502,18 @@ def run_one(
         keep_pre_resection_field: Whether the density at resection time
             is kept (about 0.5 MB per run on the atlas grid).
         growth_only: Skip the treated stage.
+        snapshots: The treated stage's snapshot offsets after the sampled
+            resection_time by name (``spec_snapshot_offsets``); none by
+            default, ignored in growth-only mode.
 
     Returns:
         0 on success, 1 if either stage reports a failure.
     """
     treatment = treatment_settings(cavity_threshold, rt_margin_mm, rt_dose_per_fraction)
+    snapshots = dict(snapshots or {})
+    unknown = sorted(set(snapshots) - set(SNAPSHOT_FILES))
+    if unknown:
+        raise ValueError(f"snapshots: unknown name(s) {unknown}; the snapshots are {sorted(SNAPSHOT_FILES)}.")
     run_dir = Path(run_dir).resolve()
     config = read_config(config_path, solver=StuppFKPPSolver)
     given = [key for key in DERIVED_VOLUME_KEYS if config.get(key) is not None]
@@ -1979,9 +2582,19 @@ def run_one(
     config["resection_cavity"] = {"segmentation": str(run_dir / CAVITY_FILE), "label": CAVITY_LABEL}
     config["rt_dose"] = str(run_dir / DOSE_FILE)
     treated = align_treated_config(config, growth.n_steps, growth.dt)
+    # The snapshot days on the treated stage's grid of times, from the
+    # sampled resection_time (the schedule's, not the aligned one).
+    days = snapshot_days(float(config["resection_time"]), snapshots, growth.dt)
+    horizon = treated["resection_time"] + treated["time_after_resection"]
+    late = {name: day for name, day in days.items() if day > horizon}
+    if late:
+        raise ValueError(f"the snapshots {late} lie beyond the treated stage's horizon {horizon:g}.")
+    treated["snapshot_times"] = sorted(days.values()) if days else None
     result = StuppFKPPSolver(treated).solve()
     result.initial_state = {}  # the seed is not kept, see the module docstring
     result.final_state = {key: round_field(value) for key, value in result.final_state.items()}
+    recorded = {} if result.snapshot_times is None else _save_snapshots(run_dir, result, days, affine)
+    result.time_series = None  # written above, not by Result.save
     result.save(run_dir)
     _print_stage("treated stage", result)
     record.update(
@@ -1991,8 +2604,23 @@ def run_one(
         growth_dt=growth.dt,
         treated_dt=result.dt,
         treated_n_steps=result.n_steps,
+        snapshots={
+            name: {
+                "offset_days": float(snapshots[name]),
+                "day": float(config["resection_time"]) + float(snapshots[name]),
+                "requested_day": days[name],
+                "recorded_day": recorded.get(name),
+                "file": SNAPSHOT_FILES[name] if name in recorded else None,
+            }
+            for name in snapshots
+        },
     )
     write_json(run_dir / TREATMENT_FILE, record)
+    if recorded:
+        print(
+            "snapshots: " + ", ".join(f"{name} at day {day:.4f}" for name, day in recorded.items()),
+            flush=True,
+        )
     if result.dt is not None and abs(result.dt - growth.dt) > 1e-9 * growth.dt:
         print(
             f"WARNING: the treated stage's step {result.dt:g} differs from the growth stage's "
@@ -2063,6 +2691,7 @@ def compute_qois(
     centroid = weights @ x
     offsets = x - centroid
     out["centroid_drift"] = float(np.linalg.norm(centroid - x_seed))
+    out.update({key: float(centroid[axis]) for axis, key in enumerate(CENTROID_QOIS)})
     out["R_g"] = float(np.sqrt(weights @ np.einsum("ij,ij->i", offsets, offsets)))
     covariance = (offsets * weights[:, None]).T @ offsets
     eigenvalues = np.linalg.eigvalsh(covariance)
@@ -2098,10 +2727,11 @@ def qoi_record(
     columns of the saved records (``run_records``: final_time, n_steps,
     wall_time_s, the time stepping of both stages, the derived maps'
     volumes) and, for a successful run, the QoIs of its final field and,
-    prefixed pre_, of its pre-resection field (NaN, i.e. absent, for a
-    run without that file: an older sweep or --no-keep-pre-resection-field;
-    qoi_summary.json counts them). The fields' shape and zooms must match
-    the base config's white-matter map.
+    prefixed per snapshot (``SNAPSHOT_PREFIXES``: pre_, mid_crt_,
+    end_crt_), of its snapshot fields (NaN, i.e. absent, for a run
+    without that file: an older sweep, --no-keep-pre-resection-field or
+    growth-only mode; qoi_summary.json counts them). The fields' shape
+    and zooms must match the base config's white-matter map.
     """
     name = design_record["run_name"]
     run_dir = sweep_dir / "runs" / name
@@ -2120,12 +2750,16 @@ def qoi_record(
     seed_voxel = tuple(int(design_record[f"seed_voxel_{ijk}"]) for ijk in "ijk")
     density, zooms = _load_field(field_path, wm.shape, wm_zooms)
     record.update(compute_qois(density, zooms, seed_voxel, wm, tau_core, tau_edema))
-    pre_path = run_dir / PRE_RESECTION_FILE
-    if pre_path.is_file():
-        if pre_path.resolve() != field_path.resolve():  # growth-only: one field under two names
-            density, zooms = _load_field(pre_path, wm.shape, wm_zooms)
-        pre = compute_qois(density, zooms, seed_voxel, wm, tau_core, tau_edema)
-        record.update({f"{PRE_PREFIX}{key}": value for key, value in pre.items()})
+    for prefix, file in SNAPSHOT_PREFIXES.items():
+        snapshot_path = run_dir / file
+        if not snapshot_path.is_file():
+            continue
+        if snapshot_path.resolve() == field_path.resolve():  # growth-only: one field under two names
+            snapshot = {key: record[key] for key in QOI_NAMES}
+        else:
+            snapshot_density, snapshot_zooms = _load_field(snapshot_path, wm.shape, wm_zooms)
+            snapshot = compute_qois(snapshot_density, snapshot_zooms, seed_voxel, wm, tau_core, tau_edema)
+        record.update({f"{prefix}{key}": value for key, value in snapshot.items()})
     record["success"] = True
     return record
 
@@ -2194,8 +2828,10 @@ ACCOUNTING_NOTE = (
     "n_blocks_dropped <= n_runs_nan + n_runs_failed. Extinct runs (mass at or "
     "below mass_floor) have a finite, floored log10_mass and non-finite "
     "mass-weighted QoIs, so they drop blocks for centroid_drift, R_g, "
-    "log10_anisotropy and wm_fraction only. QoIs prefixed pre_ are those of the "
-    "pre-resection field; a successful run without that file is NaN for all of them."
+    "the centroid components, log10_anisotropy and wm_fraction only. QoIs prefixed "
+    "pre_, mid_crt_ and end_crt_ are those of the pre-resection field and of the "
+    "treated stage's snapshots; a successful run without that file (an older "
+    "sweep, growth-only mode) is NaN for all of them."
 )
 
 
@@ -2289,10 +2925,11 @@ def qoi_summary(
     The qoi_summary.json record: the global run counts (successes, empty
     compartments per threshold, NaN mass-weighted QoIs, extinct runs at or
     below the mass floor, runs whose derived cavity is empty, successful
-    runs without a pre-resection field), the mean wall time of a run-one
-    subprocess (``mean_run_wall_time`` of the run_status.csv records) and,
-    per analysed QoI, ``response_accounting``. The counts other than the
-    pre-resection one are of the final field.
+    runs without a pre-resection field or without a treated-stage
+    snapshot field), the mean wall time of a run-one subprocess
+    (``mean_run_wall_time`` of the run_status.csv records) and, per
+    analysed QoI, ``response_accounting``. The counts other than the
+    snapshot ones are of the final field.
     """
     successes = [r for r in records if _is_success(r)]
     return {
@@ -2317,6 +2954,12 @@ def qoi_summary(
         "n_runs_without_pre_resection_field": sum(
             1 for r in successes if not np.isfinite(as_float(r.get(f"{PRE_PREFIX}voxel_volume")))
         ),
+        **{
+            f"n_runs_without_{name}_field": sum(
+                1 for r in successes if not np.isfinite(as_float(r.get(f"{name}_voxel_volume")))
+            )
+            for name in SNAPSHOT_FILES
+        },
         "per_qoi": {qoi: response_accounting(records, qoi, n_blocks, size) for qoi in ANALYSED_QOIS},
     }
 
@@ -2753,6 +3396,14 @@ def build_parser() -> argparse.ArgumentParser:
     one.add_argument("--config", required=True)
     one.add_argument("--run-dir", required=True)
     _add_treatment_args(one)
+    one.add_argument(
+        "--snapshots",
+        default="",
+        help=(
+            "the treated stage's snapshots as name=days after resection_time, comma-separated "
+            f"(names: {', '.join(SNAPSHOT_FILES)}; the run pass passes spec.json's); '' for none"
+        ),
+    )
     _add_keep_pre_resection_arg(one)
     _add_growth_only_arg(one)
     qoi = commands.add_parser("qoi", help="compute the QoIs of the finished runs")
@@ -2805,7 +3456,11 @@ def design_command(args: argparse.Namespace) -> Path:
     )
     print(f"factors: {', '.join(spec['factor_names'])}")
     for name, group in spec["derived_groups"].items():
-        print(f"derived group {name}: {', '.join(group['factors'])} -> {', '.join(group['derives'])}; {group['formula']}")
+        requires = f" (with {', '.join(group['requires'])})" if group.get("requires") else ""
+        print(f"derived group {name}: {', '.join(group['factors'])}{requires} -> {', '.join(group['derives'])}; {group['formula']}")
+        for key, value in group.items():
+            if key.endswith("_range"):
+                print(f"  implied {key[: -len('_range')]} in [{value[0]:.4g}, {value[1]:.4g}]")
     time_step = {key: value for key, value in spec["time_step"].items() if value is not None}
     print(f"time step: {time_step} (raised to the solver's stability estimate where that is stricter)")
     if spec["growth_only"]:
@@ -2814,6 +3469,13 @@ def design_command(args: argparse.Namespace) -> Path:
         f"seedable voxels: {spec['n_seedable_voxels']} in the box "
         f"{[round(v, 4) for v in spec['seed_bbox_lo']]} .. {[round(v, 4) for v in spec['seed_bbox_hi']]} "
         f"(fractions of the grid {spec['grid_shape']}; wm + gm >= {spec['seed_min_tissue_fraction']:g})"
+    )
+    schedule = spec["schedule"]
+    print(
+        f"horizon: resection_time + {schedule['time_after_resection']:g} days; schedule within it: "
+        f"{schedule['n_chemo_sessions']} chemotherapy sessions ({schedule['n_chemo_sessions_dropped']} dropped, "
+        f"{schedule['chemo_total_dose_dropped']:g} mg/m^2), {schedule['n_fractions']} fractions "
+        f"({schedule['n_fractions_dropped']} dropped)"
     )
     low, high = spec["chemo_log_kill_range"]
     print(
@@ -2826,6 +3488,10 @@ def design_command(args: argparse.Namespace) -> Path:
             f"treatment maps per run from the {spec['growth_solver']} growth stage at resection_time: cavity = "
             f"density >= {treatment['cavity_threshold']:g}, dose region = cavity + {treatment['rt_margin_mm']:g} mm at "
             f"{treatment['rt_total_dose_gy']:g} Gy ({treatment['n_fractions']} x {treatment['rt_dose_per_fraction_gy']:g} Gy)"
+        )
+        print(
+            "snapshots (end of the day, days after resection_time): "
+            + ", ".join(f"{name} +{offset:g}" for name, offset in spec["snapshots"].items())
         )
     return sweep_dir
 
@@ -2864,6 +3530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.rt_dose_per_fraction,
                 args.keep_pre_resection_field,
                 args.growth_only,
+                parse_snapshot_offsets(args.snapshots),
             )
         except Exception:  # noqa: BLE001 - the log gets the traceback, the parent the exit code
             traceback.print_exc()
