@@ -779,7 +779,7 @@ def test_truncate_schedule_and_snapshot_offsets():
     space = sa.load_search_space(SHIPPED_SEARCH_SPACE, CONFIG_KEYS)
     total, (low, high) = sa.chemo_log_kill_range(base, space)
     assert total == 4900.0
-    np.testing.assert_allclose([low, high], [1e-4 * 4900 / 9.24, 3e-3 * 4900 / 9.24])
+    np.testing.assert_allclose([low, high], [5e-4 * 4900 / 9.24, 1e-2 * 4900 / 9.24])
     # Snapshot offsets.
     assert sa.crt_snapshot_offsets(base["rt_times"], base["chemo_times"], base["resection_time"]) == {"mid_crt": 34.0, "end_crt": 55.0}
     assert sa.crt_snapshot_offsets(shipped["rt_times"], shipped["chemo_times"], 100.0) == {"mid_crt": 34.0, "end_crt": 55.0}
