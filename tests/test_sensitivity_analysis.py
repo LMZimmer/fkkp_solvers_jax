@@ -607,8 +607,10 @@ def test_seed_sigma_guard():
 
 
 def test_load_sigma_search_space():
-    """The shipped sigma search space loads with 11 factors in file order,
-    seed_sigma_mm log-scaled 6-20 mm and front_width_mm 1-3 mm, the same
+    """The shipped sigma search space loads with 12 factors in file order
+    (the 12 of stupp_fkpp_search_space.json with seed_relative_width
+    replaced by seed_sigma_mm), seed_sigma_mm log-scaled 6-20 mm and
+    front_width_mm 1-3 mm, the same
     overrides and the same other entries as stupp_fkpp_search_space.json,
     the seed group matched to the sigma derivation; the growth group
     implies D in [0.015, 0.375] and rho in [0.005, 0.125], the seed
@@ -619,7 +621,7 @@ def test_load_sigma_search_space():
         "front_speed_mm_per_day", "front_width_mm", "diffusivity_ratio", "resection_time", "chemo_kill_rate",
         "rt_alpha", "rt_alpha_beta_ratio", "seed_peak_density", "seed_sigma_mm", *SEED_KEYS,
     ]
-    assert len(space.names) == 11
+    assert len(space.names) == 12
     assert space.factors["seed_sigma_mm"] == sa.SearchSpaceParameter("seed_sigma_mm", 6.0, 20.0, "log")
     assert space.factors["front_width_mm"] == sa.SearchSpaceParameter("front_width_mm", 1.0, 3.0, "log")
     assert space.factors["seed_peak_density"] == sa.SearchSpaceParameter("seed_peak_density", 0.6, 1.0, "linear")
@@ -672,7 +674,7 @@ def test_mixed_seed_group_rejected():
     with pytest.raises(ValueError, match=both):
         swapped = {"derives": SEED_GROUP["derives"], "seed_sigma_mm": sigma, "seed_peak_density": SEED_GROUP["seed_peak_density"]}
         sa.load_search_space(_group_entries(seed=swapped), CONFIG_KEYS)
-    with pytest.raises(ValueError, match="seed_sigma_mm: min > 0"):
+    with pytest.raises(ValueError, match="seed: seed_sigma_mm: a log-scaled range needs min > 0"):
         sa.load_search_space(_group_entries(seed={**SIGMA_SEED_GROUP, "seed_sigma_mm": {"min": 0.0, "max": 20.0, "scale": "log"}}), CONFIG_KEYS)
     with pytest.raises(ValueError, match="is taken"):
         sa.load_search_space(_group_entries(seed_mm=SIGMA_SEED_GROUP), CONFIG_KEYS)
