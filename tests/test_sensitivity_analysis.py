@@ -8,7 +8,9 @@ verified against the installed version, (3) the factor transforms, the
 search-space checks, the derived groups (their parsing and evaluation
 order, the growth derivation and its implied-range validation, the seed
 derivation against the solver's own seed and its design-time
-validation), (4) the design bookkeeping on the 24^3 phantom with the
+validation, the seed derivation sampling the width in mm with its
+sigma_min >= 2 lambda_max guard and the shipped sigma search space, the
+rejection of a mixed seed group), (4) the design bookkeeping on the 24^3 phantom with the
 shipped search space (every AB run differs from its block's A run only
 through its factor, or through the derived parameters of its group,
 seeds lie on seedable tissue voxels, every config constructs a
@@ -47,6 +49,7 @@ SHIPPED_SEARCH_SPACE = (
     / "search_spaces"
     / "stupp_fkpp_search_space.json"
 )
+SIGMA_SEARCH_SPACE = SHIPPED_SEARCH_SPACE.with_name("stupp_fkpp_sigma_search_space.json")
 
 
 def _load_script():
@@ -84,6 +87,14 @@ SEED_GROUP = {
     "seed_peak_density": {"min": 0.6, "max": 1.0, "scale": "linear"},
     "seed_relative_width": {"min": 2.0, "max": 4.0, "scale": "log"},
 }
+# The groups of the sigma search space: the seed width in mm, the front
+# width capped at 3 mm so that sigma_min = 2 lambda_max.
+SIGMA_SEED_GROUP = {
+    "derives": ["gaussian_seed_mass", "gaussian_seed_diffusion_time"],
+    "seed_peak_density": {"min": 0.6, "max": 1.0, "scale": "linear"},
+    "seed_sigma_mm": {"min": 6.0, "max": 20.0, "scale": "log"},
+}
+SIGMA_GROWTH_GROUP = {**GROWTH_GROUP, "front_width_mm": {"min": 1.0, "max": 3.0, "scale": "log"}}
 
 
 def _group_entries(**overrides) -> dict:
@@ -379,8 +390,8 @@ def test_derived_group_parsing():
         swapped = {"derives": SEED_GROUP["derives"], "seed_relative_width": SEED_GROUP["seed_relative_width"], "seed_peak_density": SEED_GROUP["seed_peak_density"]}
         sa.load_search_space(_group_entries(seed=swapped), CONFIG_KEYS)
     with pytest.raises(ValueError, match="must be exactly"):
-        old = {"derives": SEED_GROUP["derives"], "seed_peak_density": SEED_GROUP["seed_peak_density"], "seed_sigma_mm": {"min": 1.0, "max": 5.0, "scale": "log"}}
-        sa.load_search_space(_group_entries(seed=old), CONFIG_KEYS)
+        widths = {"derives": SEED_GROUP["derives"], "seed_relative_width": SEED_GROUP["seed_relative_width"], "seed_sigma_mm": {"min": 6.0, "max": 20.0, "scale": "log"}}
+        sa.load_search_space(_group_entries(seed=widths), CONFIG_KEYS)
     with pytest.raises(ValueError, match="seed: seed_relative_width: min < max"):
         sa.load_search_space(_group_entries(seed={**SEED_GROUP, "seed_relative_width": {"min": 4.0, "max": 2.0, "scale": "log"}}), CONFIG_KEYS)
     with pytest.raises(ValueError, match="must not be a parameter name"):
@@ -496,6 +507,175 @@ def test_seed_derivation(tissue_phantom):
         validate({**factors, "seed_relative_width": sa.SearchSpaceParameter("seed_relative_width", -1.0, 5.0, "linear")}, params, required)
     with pytest.raises(ValueError, match="needs gaussian_seed_scale = 1"):
         validate(factors, {**params, "gaussian_seed_scale": 2.0}, required)
+
+
+def test_seed_sigma_derivation():
+    """The seed group sampling the width in mm: its derivation reproduces
+    ``seed_parameters`` for arrays of (peak, sigma) and writes the
+    enhancing radius and s = sigma / lambda (NaN without front_width_mm);
+    through a loaded search space the group is matched to the sigma
+    derivation by its factors, takes the growth group's front width as
+    an optional input and is evaluated after it whatever the file order,
+    stands alone without a growth group, and the relative-width
+    derivation is untouched."""
+    peak, sigma, width = np.array([0.6, 0.8, 1.0]), np.array([6.0, 10.0, 20.0]), np.array([3.0, 2.0, 1.0])
+    group = sa.seed_sigma_group_parameters({"seed_peak_density": peak, "seed_sigma_mm": sigma, "front_width_mm": width})
+    assert set(group) == {"gaussian_seed_mass", "gaussian_seed_diffusion_time", "seed_enhancing_radius_mm", "s"}
+    expected = sa.seed_parameters(peak, sigma)
+    np.testing.assert_allclose(group["gaussian_seed_mass"], expected["gaussian_seed_mass"])
+    np.testing.assert_allclose(group["gaussian_seed_diffusion_time"], [18.0, 50.0, 200.0])
+    np.testing.assert_allclose(group["s"], [2.0, 5.0, 20.0])
+    np.testing.assert_allclose(group["seed_enhancing_radius_mm"], sa.seed_enhancing_radius(peak, sigma))
+    np.testing.assert_allclose(sa.seed_peak_density(group["gaussian_seed_mass"], group["gaussian_seed_diffusion_time"]), peak)
+    alone = sa.seed_sigma_group_parameters({"seed_peak_density": peak, "seed_sigma_mm": sigma})
+    assert alone["s"].shape == (3,) and np.isnan(alone["s"]).all()
+    np.testing.assert_allclose(alone["gaussian_seed_mass"], expected["gaussian_seed_mass"])
+    # Through a search space, the seed group listed before the growth group.
+    space = sa.load_search_space(_seed_entries(seed=SIGMA_SEED_GROUP, growth=SIGMA_GROWTH_GROUP), CONFIG_KEYS)
+    assert space.names == ["seed_peak_density", "seed_sigma_mm", "front_speed_mm_per_day", "front_width_mm", *SEED_KEYS]
+    assert list(space.groups) == ["growth", "seed"]
+    seed = space.groups["seed"]
+    assert seed.derivation is sa.SEED_SIGMA_DERIVATION and list(seed.factors) == ["seed_peak_density", "seed_sigma_mm"]
+    assert seed.derivation.requires == () and seed.derivation.optional == ("front_width_mm",)
+    assert seed.derivation.extras == ("seed_enhancing_radius_mm", "s") and space.extra_keys == ["seed_enhancing_radius_mm", "s"]
+    assert space.derived_keys == ["white_matter_diffusivity", "rho", "gaussian_seed_mass", "gaussian_seed_diffusion_time"]
+    assert space.group_inputs(seed) == {"front_width_mm": space.factors["front_width_mm"]}
+    assert space.group_inputs(space.groups["growth"]) == {}
+    derived = space.derive({"front_speed_mm_per_day": 0.1, "front_width_mm": width, "seed_peak_density": peak, "seed_sigma_mm": sigma})
+    np.testing.assert_allclose(derived["s"], [2.0, 5.0, 20.0])
+    np.testing.assert_allclose(derived["rho"], 0.1 / (2 * width))
+    np.testing.assert_allclose(derived["gaussian_seed_mass"], expected["gaussian_seed_mass"])
+    record = {"seed_peak_density": 0.8, "seed_sigma_mm": 8.0, "front_speed_mm_per_day": 0.1, "front_width_mm": 2.0,
+              "white_matter_diffusivity": 0.1, "rho": 0.025, "gaussian_seed_mass": 1.0, "gaussian_seed_diffusion_time": 32.0,
+              "gaussian_seed_x_fraction": 0.5, "gaussian_seed_y_fraction": 0.5, "gaussian_seed_z_fraction": 0.5}
+    assert set(space.solver_values(record)) == {"white_matter_diffusivity", "rho", "gaussian_seed_mass", "gaussian_seed_diffusion_time", *SEED_KEYS}
+    # Without a growth group the seed group stands alone; s is NaN.
+    alone_space = sa.load_search_space(_seed_entries(seed=SIGMA_SEED_GROUP, rho=0.02, white_matter_diffusivity=0.1), CONFIG_KEYS)
+    assert list(alone_space.groups) == ["seed"] and alone_space.group_inputs(alone_space.groups["seed"]) == {}
+    assert np.isnan(alone_space.derive({"seed_peak_density": 0.8, "seed_sigma_mm": 8.0})["s"])
+    # The registry: the relative-width derivation is the seed entry, the sigma one its alternative.
+    relative = sa.DERIVATIONS[sa.SEED_DERIVED_KEYS]
+    assert relative.factor_names == ("seed_peak_density", "seed_relative_width") and relative.requires == ("front_width_mm",)
+    assert relative.alternatives == (sa.SEED_SIGMA_DERIVATION,) and sa.SEED_SIGMA_DERIVATION.derives == sa.SEED_DERIVED_KEYS
+    assert [d.factor_names for d in sa.registered_derivations()] == [
+        ("front_speed_mm_per_day", "front_width_mm"), ("seed_peak_density", "seed_relative_width"), ("seed_peak_density", "seed_sigma_mm"),
+    ]
+    assert sa.find_derivation(sa.SEED_DERIVED_KEYS, ["seed_peak_density", "seed_sigma_mm"], "x") is sa.SEED_SIGMA_DERIVATION
+    assert sa.find_derivation(sa.SEED_DERIVED_KEYS, ["seed_peak_density", "seed_relative_width"], "x") is relative
+
+
+def test_seed_sigma_guard():
+    """The design-time checks of the sigma seed group: with the growth
+    group present, seed_sigma_mm's min below 2 x front_width_mm's max
+    raises naming both numbers and the reason, equality passes, and the
+    record holds the implied s range [sigma_min / lambda_max,
+    sigma_max / lambda_min]; without a growth group there is no guard and
+    no s range; the floor, clip, positive-width and seed-scale checks
+    are those of the relative-width group."""
+    params = {"gaussian_seed_floor": 0.1, "gaussian_seed_scale": 1.0}
+    factors = {"seed_peak_density": sa.SearchSpaceParameter("seed_peak_density", 0.6, 1.0, "linear"),
+               "seed_sigma_mm": sa.SearchSpaceParameter("seed_sigma_mm", 6.0, 20.0, "log")}
+
+    def width(high: float) -> dict:
+        return {"front_width_mm": sa.SearchSpaceParameter("front_width_mm", 1.0, high, "log")}
+
+    validate = sa.SEED_SIGMA_DERIVATION.validate
+    assert sa.SEED_MIN_RELATIVE_WIDTH == 2.0
+    record = validate(factors, params, width(3.0))  # 6 = 2 x 3: equality passes
+    assert record["gaussian_seed_floor"] == 0.1 and record["gaussian_seed_scale"] == 1.0
+    np.testing.assert_allclose(record["s_range"], [2.0, 20.0])
+    assert record["s_min"] == 2.0
+    assert record["seed_sigma_mm_range"] == [6.0, 20.0] and record["seed_enhancing_threshold"] == 0.6
+    np.testing.assert_allclose(record["seed_enhancing_radius_mm_range"], [0.0, 20.0 * np.sqrt(2 * np.log(1 / 0.6))])
+    np.testing.assert_allclose(record["gaussian_seed_diffusion_time_range"], [18.0, 200.0])
+    np.testing.assert_allclose(record["gaussian_seed_mass_range"], [0.6 * (72 * np.pi) ** 1.5, (800 * np.pi) ** 1.5])
+    np.testing.assert_allclose(validate(factors, params, width(1.5))["s_range"], [4.0, 20.0])
+    with pytest.raises(ValueError, match=r"seed_sigma_mm: min 6 mm is below 2 x the front_width_mm max 3.5 mm \(7 mm\)"):
+        validate(factors, params, width(3.5))
+    with pytest.raises(ValueError, match="flattened by diffusion .* empty resection cavities"):
+        validate({**factors, "seed_sigma_mm": sa.SearchSpaceParameter("seed_sigma_mm", 5.9, 20.0, "log")}, params, width(3.0))
+    record = validate(factors, params, {})
+    assert "s_range" not in record and "s_min" not in record and record["seed_sigma_mm_range"] == [6.0, 20.0]
+    with pytest.raises(ValueError, match="min must exceed the config's gaussian_seed_floor 0.1"):
+        validate({**factors, "seed_peak_density": sa.SearchSpaceParameter("seed_peak_density", 0.1, 1.0, "linear")}, params, width(3.0))
+    with pytest.raises(ValueError, match="max must be at most 1"):
+        validate({**factors, "seed_peak_density": sa.SearchSpaceParameter("seed_peak_density", 0.6, 1.5, "linear")}, params, width(3.0))
+    with pytest.raises(ValueError, match="seed_sigma_mm: min must be positive"):
+        validate({**factors, "seed_sigma_mm": sa.SearchSpaceParameter("seed_sigma_mm", -1.0, 20.0, "linear")}, params, {})
+    with pytest.raises(ValueError, match="needs gaussian_seed_scale = 1"):
+        validate(factors, {**params, "gaussian_seed_scale": 2.0}, width(3.0))
+
+
+def test_load_sigma_search_space():
+    """The shipped sigma search space loads with 11 factors in file order,
+    seed_sigma_mm log-scaled 6-20 mm and front_width_mm 1-3 mm, the same
+    overrides and the same other entries as stupp_fkpp_search_space.json,
+    the seed group matched to the sigma derivation; the growth group
+    implies D in [0.015, 0.375] and rho in [0.005, 0.125], the seed
+    group passes the guard at equality with s in [2, 20], and the base
+    config lies inside the ranges."""
+    space = sa.load_search_space(SIGMA_SEARCH_SPACE, CONFIG_KEYS)
+    assert space.names == [
+        "front_speed_mm_per_day", "front_width_mm", "diffusivity_ratio", "resection_time", "chemo_kill_rate",
+        "rt_alpha", "rt_alpha_beta_ratio", "seed_peak_density", "seed_sigma_mm", *SEED_KEYS,
+    ]
+    assert len(space.names) == 11
+    assert space.factors["seed_sigma_mm"] == sa.SearchSpaceParameter("seed_sigma_mm", 6.0, 20.0, "log")
+    assert space.factors["front_width_mm"] == sa.SearchSpaceParameter("front_width_mm", 1.0, 3.0, "log")
+    assert space.factors["seed_peak_density"] == sa.SearchSpaceParameter("seed_peak_density", 0.6, 1.0, "linear")
+    assert space.overrides == {"gaussian_seed_scale": 1.0, "time_after_resection": 120.0, "chemo_decay_rate": 9.24}
+    assert list(space.groups) == ["growth", "seed"] and space.groups["seed"].derivation is sa.SEED_SIGMA_DERIVATION
+    assert space.derived_keys == ["white_matter_diffusivity", "rho", "gaussian_seed_mass", "gaussian_seed_diffusion_time"]
+    assert space.extra_keys == ["seed_enhancing_radius_mm", "s"]
+    assert "seed_relative_width" not in space.factors
+    shipped, old = json.loads(SIGMA_SEARCH_SPACE.read_text()), json.loads(SHIPPED_SEARCH_SPACE.read_text())
+    assert shipped["seed"] == SIGMA_SEED_GROUP and shipped["growth"] == SIGMA_GROWTH_GROUP
+    assert [key for key in shipped if not key.startswith("_")] == [key for key in old if not key.startswith("_")]
+    for key in old:
+        if not key.startswith("_") and key not in ("growth", "seed"):
+            assert shipped[key] == old[key], key
+    for key in ("_note", "_growth_band", "_seed_band", "_scales", "_units", "_sources", "_chemo", "_horizon"):
+        assert key in shipped
+    assert "2026-09-13" in shipped["_seed_band"] and "seed_relative_width" not in shipped["_units"]
+    params = {"gaussian_seed_floor": 0.1, "gaussian_seed_scale": 1.0}
+    seed = sa.SEED_SIGMA_DERIVATION.validate(space.groups["seed"].factors, params, space.group_inputs(space.groups["seed"]))
+    np.testing.assert_allclose(seed["s_range"], [2.0, 20.0])
+    np.testing.assert_allclose(seed["seed_enhancing_radius_mm_range"], [0.0, 20.0 * np.sqrt(2 * np.log(1 / 0.6))])
+    growth = sa.DERIVATIONS[sa.GROWTH_DERIVED_KEYS].validate(space.groups["growth"].factors, {}, {})
+    np.testing.assert_allclose(growth["white_matter_diffusivity_range"], [0.015, 0.375])
+    np.testing.assert_allclose(growth["rho_range"], [0.005, 0.125])
+    # The shipped base config lies inside the ranges without edits.
+    base = read_config(sa.DEFAULT_CONFIG)
+    front = sa.front_parameters(base["white_matter_diffusivity"], base["rho"])
+    sigma = np.sqrt(2 * base["gaussian_seed_diffusion_time"])
+    peak = sa.seed_peak_density(base["gaussian_seed_mass"], base["gaussian_seed_diffusion_time"])
+    for name, value in (("front_speed_mm_per_day", front["front_speed_mm_per_day"]), ("front_width_mm", front["front_width_mm"]),
+                        ("seed_sigma_mm", sigma), ("seed_peak_density", peak), ("chemo_kill_rate", base["chemo_kill_rate"])):
+        factor = space.factors[name]
+        assert factor.low <= value <= factor.high, (name, value)
+
+
+def test_mixed_seed_group_rejected():
+    """A seed group sampling seed_peak_density, seed_relative_width and
+    seed_sigma_mm together, one without the peak, one with the sigma
+    factors swapped, and one with seed_sigma_mm alone are rejected with
+    a message naming both registered factor sets; the two seed groups
+    cannot coexist."""
+    sigma = {"min": 6.0, "max": 20.0, "scale": "log"}
+    mixed = {"derives": SEED_GROUP["derives"], "seed_peak_density": SEED_GROUP["seed_peak_density"],
+             "seed_relative_width": SEED_GROUP["seed_relative_width"], "seed_sigma_mm": sigma}
+    both = r"must be exactly \['seed_peak_density', 'seed_relative_width'\] or \['seed_peak_density', 'seed_sigma_mm'\] in that order"
+    with pytest.raises(ValueError, match=both):
+        sa.load_search_space(_group_entries(seed=mixed), CONFIG_KEYS)
+    with pytest.raises(ValueError, match=both):
+        sa.load_search_space(_group_entries(seed={"derives": SEED_GROUP["derives"], "seed_sigma_mm": sigma}), CONFIG_KEYS)
+    with pytest.raises(ValueError, match=both):
+        swapped = {"derives": SEED_GROUP["derives"], "seed_sigma_mm": sigma, "seed_peak_density": SEED_GROUP["seed_peak_density"]}
+        sa.load_search_space(_group_entries(seed=swapped), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="seed_sigma_mm: min > 0"):
+        sa.load_search_space(_group_entries(seed={**SIGMA_SEED_GROUP, "seed_sigma_mm": {"min": 0.0, "max": 20.0, "scale": "log"}}), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="is taken"):
+        sa.load_search_space(_group_entries(seed_mm=SIGMA_SEED_GROUP), CONFIG_KEYS)
 
 
 # --- (4) design bookkeeping ---

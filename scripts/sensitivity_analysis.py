@@ -108,8 +108,11 @@ other key is either
     "seed") whose value has "derives": [<solver parameters>] and one
     {"min", "max", "scale"} sub-entry per sampled factor of the
     derivation registered for those parameters (DERIVATIONS, keyed by
-    the "derives" tuple; the sub-entries must be exactly its factors, in
-    order, and a group's factor names are not solver parameters). The
+    the "derives" tuple; where several factor sets are registered for
+    the same parameters, the group is matched to the one whose factors
+    it samples, find_derivation; the sub-entries must be exactly those
+    factors, in order, and a group's factor names are not solver
+    parameters). The
     design, design.csv, spec.json and the Sobol' analysis use the sampled
     factors, which take the group's position in the factor order; the run
     configs receive the derived parameters. A solver parameter appears at
@@ -118,7 +121,9 @@ other key is either
     (Derivation.requires): the groups are then evaluated in dependency
     order whatever their order in the file (group_evaluation_order), and
     a search space holding the dependent group without the group that
-    samples the required factor is refused with a message naming it. A
+    samples the required factor is refused with a message naming it; a
+    derivation may also take another group's factors only when the
+    search space samples them (Derivation.optional). A
     derivation may also return extra per-row quantities
     (Derivation.extras) that go into design.csv next to the derived
     parameters but not into the run configs. Every group's checks run at
@@ -126,9 +131,10 @@ other key is either
     (base config, overrides, defaults) and the required factors' ranges,
     and their record (the formula, the parameters the derivation depends
     on, the implied ranges) goes into spec.json under derived_groups. A
-    further group is one more DERIVATIONS entry; the design code does not
-    name any group.
-Two derivations are registered, and the shipped search space uses both:
+    further group is one more DERIVATIONS entry (a further factor set for
+    the same parameters one more alternative of that entry); the design
+    code does not name any group.
+Three derivations are registered, and each shipped search space uses two:
   - "growth" derives white_matter_diffusivity and rho from the front
     speed front_speed_mm_per_day = v and the front width front_width_mm =
     lambda of the Fisher-KPP travelling wave (v = 2 sqrt(D rho),
@@ -149,7 +155,28 @@ Two derivations are registered, and the shipped search space uses both:
     below. Its extras are seed_sigma_mm = s lambda and
     seed_enhancing_radius_mm = sigma sqrt(2 ln(c_peak / 0.6)), the
     radius of the seed's region at or above the 0.6 enhancing threshold
-    (0 for a peak below it).
+    (0 for a peak below it). This is the seed group of
+    stupp_fkpp_search_space.json.
+  - the same "seed" parameters from seed_peak_density and the width in
+    mm itself, seed_sigma_mm (a group whose sub-entries are these two
+    factors; fisher_kpp_jax/search_spaces/stupp_fkpp_sigma_search_space.json,
+    2026-09-13): sampling sigma in mm instead of s decouples the seed
+    size from the front width, so that the seed-size and the front-width
+    sensitivities are separately attributable (with sigma = s lambda the
+    seed size carries lambda, and part of its effect lands on
+    front_width_mm). The derivation does not take the growth group, but
+    the design step guards the coupling the relative width enforced:
+    with a growth group present, seed_sigma_mm's min must be at least
+    SEED_MIN_RELATIVE_WIDTH (2) times front_width_mm's max, so that
+    s = sigma / lambda >= 2 holds for every row by construction (seeds
+    narrower than about twice the front width are flattened by diffusion
+    before the front forms and leave empty resection cavities; the three
+    empty cavities of the 2026-09-12 sweep sat at s = 2.04-2.09), and it
+    is refused otherwise with a message naming both numbers. Its extras
+    are seed_enhancing_radius_mm and the diagnostic s = seed_sigma_mm /
+    front_width_mm (NaN without a growth group); spec.json records the
+    implied range of s, [sigma_min / lambda_max, sigma_max / lambda_min],
+    and the printed design summary reports it.
 Everything not listed comes from the base config (--config, default
 fisher_kpp_jax/configs/StuppFKPPSolver.json; read with
 fisher_kpp_jax.read_config so every run config carries absolute volume
@@ -264,8 +291,9 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
                          the tissue maps as replaced)
     spec.json            search space, base config path, seed, N, k, factor
                          order, the derived groups (derives, factors,
-                         requires, extras, formula, the parameters the
-                         derivation depends on, the implied ranges),
+                         requires, optional, extras, formula, the
+                         parameters the derivation depends on, the implied
+                         ranges),
                          derived_keys and extra_keys, the schedule within
                          the horizon, the snapshot offsets, the time
                          step, growth_only, SALib version, seed box,
@@ -278,8 +306,9 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
                          the derived solver parameters of the groups
                          (white_matter_diffusivity, rho, gaussian_seed_mass,
                          gaussian_seed_diffusion_time), their extras
-                         (seed_sigma_mm, seed_enhancing_radius_mm),
-                         seed_voxel_i/j/k
+                         (seed_sigma_mm and seed_enhancing_radius_mm; with
+                         the width sampled in mm, seed_enhancing_radius_mm
+                         and s), seed_voxel_i/j/k
     configs/<run>.json   the run configs (resection_cavity and rt_dose null,
                          the schedule truncated and shifted)
     logs/<run>.log       stdout/stderr of the runs
@@ -580,20 +609,32 @@ GROWTH_DERIVED_KEYS: tuple[str, ...] = ("white_matter_diffusivity", "rho")
 # directly); a growth group whose implied ranges leave them is refused.
 RHO_BOUNDS: tuple[float, float] = (0.001, 0.2)  # 1/day
 DIFFUSIVITY_BOUNDS: tuple[float, float] = (0.01, 2.0)  # mm^2/day
-# The derived factor group of the seed: the peak density and the width
+# The derived factor group of the seed: the peak density and a width are
+# sampled, the solver's mass and diffusion time derived (see
+# ``seed_parameters``). Two factor sets are registered for it: the width
 # relative to the front width (sigma = seed_relative_width * lambda, with
-# lambda the row's front_width_mm of the growth group, which the seed
-# group therefore requires) are sampled, the solver's mass and diffusion
-# time derived (see ``seed_parameters``).
+# lambda the row's front_width_mm of the growth group, which that
+# derivation therefore requires) or the width sigma in mm itself
+# (seed_sigma_mm, independent of the growth group).
 SEED_PEAK_FACTOR = "seed_peak_density"
 SEED_RELATIVE_WIDTH_FACTOR = "seed_relative_width"
 SEED_DERIVED_KEYS: tuple[str, ...] = ("gaussian_seed_mass", "gaussian_seed_diffusion_time")
-# The seed group's extra design.csv columns: the absolute width sigma in
-# mm and the radius of the seed's enhancing region, the density at or
-# above SEED_ENHANCING_THRESHOLD (0 when the peak is below it).
+# The seed groups' extra design.csv columns: the absolute width sigma in
+# mm (a factor itself, not an extra, when sampled directly), the radius
+# of the seed's enhancing region, the density at or above
+# SEED_ENHANCING_THRESHOLD (0 when the peak is below it), and, for the
+# width sampled in mm, the diagnostic ratio s = sigma / lambda (NaN
+# without a growth group).
 SEED_SIGMA_COLUMN = "seed_sigma_mm"
+SEED_SIGMA_FACTOR = SEED_SIGMA_COLUMN
 SEED_RADIUS_COLUMN = "seed_enhancing_radius_mm"
+SEED_RATIO_COLUMN = "s"
 SEED_ENHANCING_THRESHOLD = TAU_CORE
+# A seed narrower than about this many front widths is flattened by
+# diffusion before the front forms and leaves an empty cavity (the three
+# empty cavities of the 2026-09-12 sweep sat at s = 2.04-2.09); a seed
+# group sampling sigma in mm must keep sigma_min >= this times lambda_max.
+SEED_MIN_RELATIVE_WIDTH = 2.0
 # Event times shifted with the sampled resection time (and truncated to
 # the horizon, see ``truncate_schedule``).
 SHIFTED_TIME_KEYS: tuple[str, ...] = ("chemo_times", "rt_times")
@@ -715,29 +756,40 @@ class SearchSpaceParameter:
 class Derivation:
     """
     A registered derivation of solver parameters from sampled factors
-    (``DERIVATIONS``, keyed by ``derives``).
+    (``DERIVATIONS``, keyed by ``derives``; ``alternatives`` holds further
+    derivations of the same parameters from other factor sets, and a
+    group is matched to the one whose factors it samples,
+    ``find_derivation``).
 
     Attributes:
         derives: The solver parameters derived, in order.
         factor_names: The sampled factors the derivation takes, in order;
             a group's sub-entries must be exactly these.
         requires: Sampled factors of other groups the derivation takes as
-            well (e.g. the seed derivation takes the growth group's
-            front_width_mm); a search space must hold a group sampling
-            each of them, and that group is evaluated first.
+            well (e.g. the relative-width seed derivation takes the growth
+            group's front_width_mm); a search space must hold a group
+            sampling each of them, and that group is evaluated first.
+        optional: Sampled factors of other groups the derivation takes
+            when the search space samples them (e.g. the seed derivation
+            in mm takes front_width_mm for its diagnostic ratio); that
+            group, if present, is evaluated first, and ``derive`` and
+            ``validate`` receive the factor only then.
         extras: Further per-row quantities the derivation returns, written
             into design.csv next to the derived parameters but not into
             the run configs (e.g. the seed's width in mm).
-        derive: Maps the values of the factors and the required factors
-            (arrays by name, any common shape) to the derived parameter
-            values and the extras (arrays by name).
+        derive: Maps the values of the factors, the required factors and
+            the optional factors present (arrays by name, any common
+            shape) to the derived parameter values and the extras (arrays
+            by name).
         validate: Checks the group's factor ranges against the resolved
             parameters of the growth stage (the base config with the
             search space's overrides, defaults filled in) and the ranges
-            of the required factors, and returns the record spec.json
-            keeps under derived_groups (the parameter values the
-            derivation depends on, the implied ranges).
+            of the required and the present optional factors, and returns
+            the record spec.json keeps under derived_groups (the parameter
+            values the derivation depends on, the implied ranges).
         formula: The derivation in words, for spec.json.
+        alternatives: Other registered derivations of the same ``derives``
+            from other factor sets.
     """
 
     derives: tuple[str, ...]
@@ -748,7 +800,16 @@ class Derivation:
     ]
     formula: str
     requires: tuple[str, ...] = ()
+    optional: tuple[str, ...] = ()
     extras: tuple[str, ...] = ()
+    alternatives: tuple[Derivation, ...] = ()
+
+    def inputs(self, sampled: Iterable[str]) -> tuple[str, ...]:
+        """The other groups' factors the derivation takes from a search
+        space sampling the given factors: ``requires`` and the
+        ``optional`` factors among them."""
+        present = frozenset(sampled)
+        return (*self.requires, *(name for name in self.optional if name in present))
 
 
 @dataclass(frozen=True)
@@ -836,10 +897,15 @@ class SearchSpace:
         for group in self.groups.values():
             inputs = {
                 name: np.asarray(values[name], dtype=np.float64)
-                for name in (*group.factors, *group.derivation.requires)
+                for name in (*group.factors, *group.derivation.inputs(self.factors))
             }
             derived.update(group.derivation.derive(inputs))
         return derived
+
+    def group_inputs(self, group: DerivedGroup) -> dict[str, SearchSpaceParameter]:
+        """The other groups' factors a group's derivation takes from this
+        search space (``Derivation.inputs``), by name."""
+        return {name: self.factors[name] for name in group.derivation.inputs(self.factors)}
 
     def solver_values(self, record: Mapping[str, Any]) -> dict[str, float]:
         """
@@ -1096,10 +1162,137 @@ def _validate_seed_group(
     }
 
 
+def seed_sigma_group_parameters(values: Mapping[str, NDArray | float]) -> dict[str, NDArray]:
+    """
+    The derivation of the seed group sampling the width in mm: the
+    solver's parameters follow from seed_peak_density and seed_sigma_mm
+    by ``seed_parameters``, and the extras are the enhancing radius
+    (``SEED_RADIUS_COLUMN``, ``seed_enhancing_radius``) and the
+    diagnostic ratio s = seed_sigma_mm / front_width_mm
+    (``SEED_RATIO_COLUMN``; NaN when front_width_mm is not given, i.e.
+    the search space has no growth group).
+
+    Args:
+        values: seed_peak_density and seed_sigma_mm, and front_width_mm
+            when sampled (arrays of one common shape, or scalars).
+
+    Returns:
+        gaussian_seed_mass, gaussian_seed_diffusion_time,
+        seed_enhancing_radius_mm and s.
+    """
+    peak = np.asarray(values[SEED_PEAK_FACTOR], dtype=np.float64)
+    sigma = np.asarray(values[SEED_SIGMA_FACTOR], dtype=np.float64)
+    derived = seed_parameters(peak, sigma)
+    derived[SEED_RADIUS_COLUMN] = seed_enhancing_radius(peak, sigma)
+    if GROWTH_WIDTH_FACTOR in values:
+        derived[SEED_RATIO_COLUMN] = sigma / np.asarray(values[GROWTH_WIDTH_FACTOR], dtype=np.float64)
+    else:
+        derived[SEED_RATIO_COLUMN] = np.full(np.broadcast(peak, sigma).shape, np.nan)
+    return derived
+
+
+SEED_SIGMA_FORMULA = (
+    f"gaussian_seed_diffusion_time = {SEED_SIGMA_FACTOR}^2 / 2 (mm^2; the solver evaluates the profile "
+    "exp(-r^2 / (4 tau)) with r in mm, gaussian_seed_scale = 1); "
+    f"gaussian_seed_mass = {SEED_PEAK_FACTOR} * (4 pi gaussian_seed_diffusion_time)^(3/2), "
+    f"so the seed's peak equals {SEED_PEAK_FACTOR}, above gaussian_seed_floor and at most 1; "
+    f"{SEED_RADIUS_COLUMN} = {SEED_SIGMA_FACTOR} * sqrt(2 ln({SEED_PEAK_FACTOR} / {SEED_ENHANCING_THRESHOLD:g})), "
+    "the radius of the seed's region at or above that density (0 below it); "
+    f"{SEED_RATIO_COLUMN} = {SEED_SIGMA_FACTOR} / {GROWTH_WIDTH_FACTOR} (the row's front width of the growth "
+    "group, a diagnostic; NaN without a growth group), the width is sampled independently of the front width"
+)
+
+
+def _validate_seed_sigma_group(
+    factors: Mapping[str, SearchSpaceParameter], config: Mapping[str, Any], required: Mapping[str, SearchSpaceParameter]
+) -> dict[str, Any]:
+    """
+    The design-time checks of the seed group sampling the width in mm:
+    the peak range lies above the resolved gaussian_seed_floor (else a
+    seed would be erased) and at most at 1 (else clipped), the width
+    range is positive, gaussian_seed_scale is 1 (else sigma would not be
+    in mm), and, when the growth group is present, the width floor is at
+    least SEED_MIN_RELATIVE_WIDTH times the front width cap, so that
+    s = sigma / lambda >= SEED_MIN_RELATIVE_WIDTH holds for every row by
+    construction (a narrower seed is flattened by diffusion and leaves an
+    empty cavity).
+
+    Args:
+        factors: The group's factors.
+        config: The resolved parameters of the growth stage.
+        required: The optional front_width_mm of the growth group when
+            the search space samples it (empty otherwise).
+
+    Returns:
+        The spec.json record: gaussian_seed_floor, gaussian_seed_scale,
+        the range of sigma in mm and of the enhancing radius, the ranges
+        of the derived parameters and, with the growth group, the implied
+        range of s ([sigma_min / lambda_max, sigma_max / lambda_min]) and
+        the floor SEED_MIN_RELATIVE_WIDTH.
+    """
+    peak, sigma = factors[SEED_PEAK_FACTOR], factors[SEED_SIGMA_FACTOR]
+    floor = float(config["gaussian_seed_floor"])
+    if not peak.low > floor:
+        raise ValueError(
+            f"{SEED_PEAK_FACTOR}: min must exceed the config's gaussian_seed_floor {floor:g} "
+            f"(the solver zeroes the seed at or below it), got {peak.low!r}."
+        )
+    if peak.high > 1:
+        raise ValueError(f"{SEED_PEAK_FACTOR}: max must be at most 1 (the solver clips above 1), got {peak.high!r}.")
+    if sigma.low <= 0:
+        raise ValueError(f"{SEED_SIGMA_FACTOR}: min must be positive, got {sigma.low!r}.")
+    scale = float(config["gaussian_seed_scale"])
+    if scale != 1.0:
+        raise ValueError(
+            f"the seed derivation takes {SEED_SIGMA_FACTOR} in mm, which needs gaussian_seed_scale = 1 "
+            f"(a fixed override of the search space or the base config's value), got {scale!r}."
+        )
+    width = required.get(GROWTH_WIDTH_FACTOR)
+    ratio: dict[str, Any] = {}
+    if width is not None:
+        if sigma.low < SEED_MIN_RELATIVE_WIDTH * width.high:
+            raise ValueError(
+                f"{SEED_SIGMA_FACTOR}: min {sigma.low:g} mm is below {SEED_MIN_RELATIVE_WIDTH:g} x the "
+                f"{GROWTH_WIDTH_FACTOR} max {width.high:g} mm ({SEED_MIN_RELATIVE_WIDTH * width.high:g} mm): seeds "
+                f"narrower than about {SEED_MIN_RELATIVE_WIDTH:g} front widths are flattened by diffusion before the "
+                "front forms and leave empty resection cavities; raise the seed width floor or lower the front width cap."
+            )
+        ratio = {
+            f"{SEED_RATIO_COLUMN}_range": [sigma.low / width.high, sigma.high / width.low],
+            f"{SEED_RATIO_COLUMN}_min": SEED_MIN_RELATIVE_WIDTH,
+        }
+    corners = seed_parameters(np.array([peak.low, peak.high]), np.array([sigma.low, sigma.high]))
+    return {
+        "gaussian_seed_floor": floor,
+        "gaussian_seed_scale": scale,
+        f"{SEED_SIGMA_COLUMN}_range": [sigma.low, sigma.high],
+        f"{SEED_RADIUS_COLUMN}_range": [
+            float(seed_enhancing_radius(peak.low, sigma.low)),
+            float(seed_enhancing_radius(peak.high, sigma.high)),
+        ],
+        "seed_enhancing_threshold": SEED_ENHANCING_THRESHOLD,
+        "gaussian_seed_diffusion_time_range": [float(v) for v in corners["gaussian_seed_diffusion_time"]],
+        "gaussian_seed_mass_range": [float(v) for v in corners["gaussian_seed_mass"]],
+        **ratio,
+    }
+
+
 # The registered derivations by the tuple of solver parameters they derive
 # (a search-space entry's "derives" list). A new group is one more entry;
-# a derivation that takes another group's factors names them in
-# ``requires`` and is evaluated after that group.
+# a further factor set for parameters already derived is one more
+# ``alternatives`` entry of that derivation (a group is matched by its
+# sampled factors, ``find_derivation``); a derivation that takes another
+# group's factors names them in ``requires`` (or ``optional``) and is
+# evaluated after that group.
+SEED_SIGMA_DERIVATION = Derivation(
+    derives=SEED_DERIVED_KEYS,
+    factor_names=(SEED_PEAK_FACTOR, SEED_SIGMA_FACTOR),
+    derive=seed_sigma_group_parameters,
+    validate=_validate_seed_sigma_group,
+    formula=SEED_SIGMA_FORMULA,
+    optional=(GROWTH_WIDTH_FACTOR,),
+    extras=(SEED_RADIUS_COLUMN, SEED_RATIO_COLUMN),
+)
 DERIVATIONS: dict[tuple[str, ...], Derivation] = {
     GROWTH_DERIVED_KEYS: Derivation(
         derives=GROWTH_DERIVED_KEYS,
@@ -1116,8 +1309,40 @@ DERIVATIONS: dict[tuple[str, ...], Derivation] = {
         formula=SEED_FORMULA,
         requires=(GROWTH_WIDTH_FACTOR,),
         extras=(SEED_SIGMA_COLUMN, SEED_RADIUS_COLUMN),
+        alternatives=(SEED_SIGMA_DERIVATION,),
     ),
 }
+
+
+def registered_derivations() -> list[Derivation]:
+    """Every registered derivation: the ``DERIVATIONS`` entries and their
+    alternatives."""
+    return [d for entry in DERIVATIONS.values() for d in (entry, *entry.alternatives)]
+
+
+def find_derivation(derives: Sequence[str], factor_names: Sequence[str], where: str) -> Derivation:
+    """
+    The registered derivation of the given solver parameters that samples
+    the given factors (in that order).
+
+    Raises:
+        ValueError: No derivation is registered for the parameters, or
+            none of those registered samples that factor set; the message
+            names the registered factor sets.
+    """
+    entry = DERIVATIONS.get(tuple(derives))
+    if entry is None:
+        registered = ", ".join(str(list(key)) for key in DERIVATIONS)
+        raise ValueError(f"{where}: no derivation registered for {list(derives)}; registered: {registered}.")
+    candidates = (entry, *entry.alternatives)
+    for derivation in candidates:
+        if tuple(factor_names) == derivation.factor_names:
+            return derivation
+    factor_sets = " or ".join(str(list(d.factor_names)) for d in candidates)
+    raise ValueError(
+        f"{where}: the sampled factors of {list(derives)} must be exactly {factor_sets} in that order, "
+        f"got {list(factor_names)}."
+    )
 
 
 def group_evaluation_order(groups: Mapping[str, DerivedGroup], where: str = "search space") -> list[str]:
@@ -1134,18 +1359,21 @@ def group_evaluation_order(groups: Mapping[str, DerivedGroup], where: str = "sea
         for factor in group.derivation.requires:
             if factor not in provider:
                 registered = [
-                    f"{list(d.derives)} (factors {list(d.factor_names)})" for d in DERIVATIONS.values() if factor in d.factor_names
+                    f"{list(d.derives)} (factors {list(d.factor_names)})"
+                    for d in registered_derivations()
+                    if factor in d.factor_names
                 ]
                 raise ValueError(
                     f"{where}: {name}: the derivation of {list(group.derivation.derives)} takes {factor!r}, which no "
                     f"group of the search space samples; add the group deriving {', '.join(registered) or '?'}."
                 )
+    # The factors a group waits for: the required ones and the optional
+    # ones some group samples.
+    inputs = {name: group.derivation.inputs(provider) for name, group in groups.items()}
     order: list[str] = []
     pending = list(groups)
     while pending:
-        ready = [
-            name for name in pending if all(provider[f] in order for f in groups[name].derivation.requires)
-        ]
+        ready = [name for name in pending if all(provider[f] in order for f in inputs[name])]
         if not ready:
             raise ValueError(f"{where}: the derived groups {pending} require each other.")
         order.append(ready[0])
@@ -1164,16 +1392,8 @@ def _parse_group(name: str, entry: Mapping[str, Any], known: frozenset[str], whe
     volumes = [key for key in derives if key in DERIVED_VOLUME_KEYS]
     if volumes:
         raise ValueError(f"{where}: {name}: {volumes} are derived per run from the growth stage and cannot be in a group.")
-    derivation = DERIVATIONS.get(tuple(derives))
-    if derivation is None:
-        registered = ", ".join(str(list(key)) for key in DERIVATIONS)
-        raise ValueError(f"{where}: {name}: no derivation registered for {derives}; registered: {registered}.")
     sub_entries = {key: value for key, value in entry.items() if key != "derives" and not key.startswith("_")}
-    if list(sub_entries) != list(derivation.factor_names):
-        raise ValueError(
-            f"{where}: {name}: the sampled factors of {list(derives)} must be exactly "
-            f"{list(derivation.factor_names)} in that order, got {list(sub_entries)}."
-        )
+    derivation = find_derivation(derives, list(sub_entries), f"{where}: {name}")
     factors = {key: _parse_parameter(key, value, f"{where}: {name}") for key, value in sub_entries.items()}
     return DerivedGroup(name, derivation, factors)
 
@@ -1939,11 +2159,10 @@ def make_design(
             "derives": list(group.derivation.derives),
             "factors": list(group.factors),
             "requires": list(group.derivation.requires),
+            "optional": list(group.derivation.optional),
             "extras": list(group.derivation.extras),
             "formula": group.derivation.formula,
-            **group.derivation.validate(
-                group.factors, growth.params, {key: space.factors[key] for key in group.derivation.requires}
-            ),
+            **group.derivation.validate(group.factors, growth.params, space.group_inputs(group)),
         }
         for group in space.groups.values()
     }
@@ -3456,11 +3675,15 @@ def design_command(args: argparse.Namespace) -> Path:
     )
     print(f"factors: {', '.join(spec['factor_names'])}")
     for name, group in spec["derived_groups"].items():
-        requires = f" (with {', '.join(group['requires'])})" if group.get("requires") else ""
+        taken = [*group.get("requires", []), *(f for f in group.get("optional", []) if f in spec["factor_names"])]
+        requires = f" (with {', '.join(taken)})" if taken else ""
         print(f"derived group {name}: {', '.join(group['factors'])}{requires} -> {', '.join(group['derives'])}; {group['formula']}")
         for key, value in group.items():
             if key.endswith("_range"):
-                print(f"  implied {key[: -len('_range')]} in [{value[0]:.4g}, {value[1]:.4g}]")
+                label = key[: -len("_range")]
+                if label == SEED_RATIO_COLUMN:
+                    label = f"{SEED_RATIO_COLUMN} = {SEED_SIGMA_FACTOR} / {GROWTH_WIDTH_FACTOR}"
+                print(f"  implied {label} in [{value[0]:.4g}, {value[1]:.4g}]")
     time_step = {key: value for key, value in spec["time_step"].items() if value is not None}
     print(f"time step: {time_step} (raised to the solver's stability estimate where that is stricter)")
     if spec["growth_only"]:
