@@ -33,10 +33,12 @@ rule says it can when the growth is still linear (the seed grown for
 T_r - T_0 days is again a Gaussian), the logistic saturation and the
 tissue boundaries say it cannot for old tumors.
 
-Conventions. Every subcommand solves in one Python process (the jitted
-time scan is cached across solves of the same step count; ``--gpu``
-picks the CUDA device like the sensitivity script's slots, '' the CPU)
-at precision f64. The parameters of the growth band are the front speed
+Conventions. A subcommand solves in one Python process (the jitted
+time scan is cached across solves of the same step count) at precision
+f64; ``--gpus`` names the CUDA devices like the sensitivity script's
+slots ('' the CPU): with one device the subcommand solves in this
+process, with several the fisher and substitute subcommands dispatch
+one worker process per device (see Devices below). The parameters of the growth band are the front speed
 v = front_speed_mm_per_day and the front width lambda = front_width_mm;
 D = v lambda / 2 and rho = v / (2 lambda) follow from the script's growth
 derivation (``growth_parameters``). The fit and the derivatives are in
@@ -59,9 +61,13 @@ the seed derivation requires the peak above the floor) and, with
 --smoke, its resolution_factor to 0.25 (the solver's zoom factor: 4 mm
 voxels; the results are upsampled to the 1 mm grid). The seed voxel is
 one fixed seedable voxel for every patient (--seed-voxel i,j,k; default
-the base config's fractions, i.e. the grid centre; snapped to the
-nearest voxel with wm + gm >= min_tissue_fraction, ``seed_geometry``);
-its fractions (v + 0.5) / n go into every config. The time step is the
+DEFAULT_SEED_VOXEL = (132, 103, 90), right-hemisphere deep white matter
+on the atlas, the voxel scripts/run_stupp_synthetic.py uses; snapped to
+the nearest voxel with wm + gm >= min_tissue_fraction,
+``seed_geometry``, which leaves it where it is on the atlas; a grid too
+small to hold it, such as the tests' 24^3 phantom, falls back to the
+base config's fractions, the grid centre); its fractions (v + 0.5) / n
+go into every config. The time step is the
 base config's 12 steps/day (dt = 1/12 day; the solver raises a coarser
 request to its stability estimate, which never binds in the growth band
 on the atlas but does for short horizons on small test grids: every run
@@ -191,7 +197,11 @@ experiment 1 (fd_check).
                 resolution_factor, smoke and the smoke settings, the
                 design seed and candidate count, the cells and splits,
                 the factors' ranges, the fixed parameters, the seed
-                voxel (target, snapped, distance, fractions), the tissue
+                voxel (seed_target_voxel and seed_target_source: "default"
+                for DEFAULT_SEED_VOXEL, "base_config_fractions" for the
+                fallback, "argument" for --seed-voxel; the snapped
+                seed_voxel, seed_snap_distance_voxels, seed_fractions,
+                default_seed_voxel), the tissue
                 threshold and seedable count, the time step, the
                 treatment derivation settings, the schedules within both
                 horizons (``truncate_schedule`` records), the log-kill
@@ -380,6 +390,9 @@ Subcommand fisher (experiment 1). Per patient (``fisher_patient``):
                        for the scaled_dt column: cr_log_T_r, cr7_log_T_r
                        (log10 colour), resid_frac_T_r, resid7_frac_T_r,
                        We_ratio (log10 colour)
+  fisher_summary.json  the assembly record: the patients and cells with
+                       a record, the row counts and the device split of
+                       the last dispatch (Devices below)
 
 Subcommand substitute (experiment 2). The horizon is 180 days after
 surgery for the truth and the substitutes (the base config's six-cycle
@@ -430,10 +443,34 @@ frames, and compared with the truth's frames by ``compare_fields``.
                    observation.json, T0_<T_0>/<objective>/ (fit.json,
                    row.json, run/ with the substitute's treated run),
                    substitute.json
+  substitute_summary.json   the assembly record, as fisher_summary.json
 
 Subcommand all runs design (skipped when spec.json exists), invariance,
 fisher and substitute in order. --patients restricts fisher and
-substitute to ids or ranges (p03, p00-p07, all). --smoke uses
+substitute to ids or ranges (p03, p00-p07, all).
+
+Devices. --gpus is a comma-separated list of CUDA device ids, '' the
+CPU (the default is the sensitivity script's slots, 1,2,3,6; ','
+names two CPU workers). The invariance experiment runs on one device
+(the first of the list under all; the invariance subcommand refuses
+more). With one device, or one selected patient, fisher and substitute
+solve in this process. With several devices they dispatch
+(``dispatch``): the selected patients, in design order, are cut into
+contiguous blocks of sizes differing by at most one, one block per
+device (``patient_blocks``; more devices than patients leave the
+surplus idle), and one worker process per device runs the same
+subcommand with --gpus <device> --patients <block> and the other
+options, with the sensitivity script's environment handling
+(XLA_PYTHON_CLIENT_PREALLOCATE=false and CUDA_VISIBLE_DEVICES=<device>,
+or JAX_PLATFORMS=cpu for ''), its output in
+logs/<experiment>_<device>.log (cpu for ''; a repeated device gets a
+_<k> suffix). The dispatcher waits for every worker, assembles the CSVs,
+figures and summary JSON from every record present (as a plain pass
+does; the workers skip that step) and then fails, naming the logs, when
+any worker returned nonzero. The device split (devices, blocks, return
+codes, logs, wall times) goes into <experiment>_summary.json; a later
+single-process pass keeps the last split. Workers are ordinary passes,
+so a dispatch is resumable like any other. --smoke uses
 resolution_factor 0.25, the first patient of each cell (4 patients),
 K = 8, maxfev 20 and the CPU, so that the whole pipeline finishes in
 minutes; the design records it (spec.json: smoke) and the later
@@ -476,9 +513,9 @@ steps (experiment 1) or 12 (T_r + 180) (experiment 2).
                T_0 = 30, 3.1 s at T_0 = 150; a fit that converges earlier
                stops earlier) plus 8 treated runs: measured 34.7 min for
                p16 (T_r = 94 days), so about 35 min per patient and
-               about 19 h for the cohort on one GPU; split the cohort
-               over GPUs with --patients (e.g. --patients p00-p07 --gpu 1,
-               ..., resumable) to bring it to 5 h. About 33 MB per patient.
+               about 19 h for the cohort on one GPU; --gpus 1,2,3,6
+               dispatches 8 patients to each of four devices (5 h). About
+               33 MB per patient.
   --smoke      the whole pipeline on the CPU (K = 8, maxfev 20, 4 mm
                voxels): measured 30 min on 2026-09-13, the invariance in
                1 min, the four fisher patients in 15 min (3.4-4.5 min
@@ -488,11 +525,10 @@ steps (experiment 1) or 12 (T_r + 180) (experiment 2).
 
 Run from the project root, e.g. (ID = /mnt/Drive4/lucas/stupp_identifiability):
   python scripts/identifiability_experiments.py design --name id_2026-09-13
-  python scripts/identifiability_experiments.py invariance --name id_2026-09-13 --gpu 2
-  python scripts/identifiability_experiments.py fisher --name id_2026-09-13 --gpu 2
-  python scripts/identifiability_experiments.py substitute --name id_2026-09-13 --gpu 3 --patients p00-p15
-  python scripts/identifiability_experiments.py substitute --name id_2026-09-13 --gpu 5 --patients p16-p31
-  python scripts/identifiability_experiments.py all --name id_2026-09-13 --gpu 2
+  python scripts/identifiability_experiments.py invariance --name id_2026-09-13 --gpus 1
+  python scripts/identifiability_experiments.py fisher --name id_2026-09-13 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py substitute --name id_2026-09-13 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py all --name id_2026-09-13 --gpus 1,2,3,6
   python scripts/identifiability_experiments.py all --smoke --output-dir runs/ --name smoke
 Every subcommand but design needs the design directory; the CSVs and
 figures are reassembled from the records present at the end of each
@@ -506,6 +542,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -570,7 +607,14 @@ sa = load_sensitivity_analysis()
 
 EXPERIMENTS: tuple[str, ...] = ("design", "invariance", "fisher", "substitute")
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_identifiability")
-DEFAULT_GPU: str = str(sa.DEFAULT_GPUS).split(",")[0]  # the first slot of the sensitivity script
+DEFAULT_GPUS: str = str(sa.DEFAULT_GPUS)  # the sensitivity script's slots, "1,2,3,6"
+# The seed voxel of every patient: right-hemisphere deep white matter on
+# the atlas, the voxel scripts/run_stupp_synthetic.py uses (snapped to the
+# nearest seedable voxel; a grid too small to hold it falls back to the
+# base config's fractions, see ``make_design``).
+DEFAULT_SEED_VOXEL: tuple[int, int, int] = (132, 103, 90)
+LOG_DIR = "logs"  # the dispatcher's worker logs, <experiment>_<device>.log
+NO_ASSEMBLE_FLAG = "--no-assemble"  # the workers skip the assembly
 PRECISION = "f64"
 SEED_FLOOR = 0.0  # gaussian_seed_floor of the whole cohort (the base config's 0.1 is replaced)
 DESIGN_SEED = 1
@@ -1133,8 +1177,8 @@ def make_design(
             white_matter_pbmap / gray_matter_pbmap (None or '' keeps the
             base config's).
         seed_voxel: The seed voxel (i, j, k) of every patient, snapped to
-            the nearest seedable voxel; default the base config's
-            fractions.
+            the nearest seedable voxel; default DEFAULT_SEED_VOXEL where
+            the grid holds it, else the base config's fractions.
         log2_candidates: 2 ** log2_candidates Sobol' points to fill the
             cells from.
         seed: Seed of the scrambled Sobol' sequence.
@@ -1190,11 +1234,16 @@ def make_design(
     geometry = sa.seed_geometry(wm, gm, min_tissue_fraction)
     shape = np.asarray(geometry.shape, dtype=np.float64)
     if seed_voxel is None:
-        target = [int(float(base[key]) * n) for key, n in zip(sa.SEED_KEYS, geometry.shape)]
+        if all(0 <= v < n for v, n in zip(DEFAULT_SEED_VOXEL, geometry.shape)):
+            target, target_source = list(DEFAULT_SEED_VOXEL), "default"
+        else:
+            target = [int(float(base[key]) * n) for key, n in zip(sa.SEED_KEYS, geometry.shape)]
+            target_source = "base_config_fractions"
     else:
         target = [int(v) for v in seed_voxel]
         if len(target) != 3 or any(v < 0 or v >= n for v, n in zip(target, geometry.shape)):
             raise ValueError(f"--seed-voxel must be three indices within the grid {geometry.shape}, got {seed_voxel!r}.")
+        target_source = "argument"
     voxel, snap_distance = nearest_seedable_voxel(geometry, target)
     fractions = tuple(float(v) for v in (np.asarray(voxel, dtype=np.float64) + 0.5) / shape)
     for key, fraction in zip(sa.SEED_KEYS, fractions):
@@ -1238,6 +1287,8 @@ def make_design(
         "seed_voxel": list(voxel),
         "seed_fractions": list(fractions),
         "seed_target_voxel": target,
+        "seed_target_source": target_source,
+        "default_seed_voxel": list(DEFAULT_SEED_VOXEL),
         "seed_snap_distance_voxels": snap_distance,
         "min_tissue_fraction": min_tissue_fraction,
         "n_seedable_voxels": geometry.n_voxels,
@@ -2575,14 +2626,40 @@ def _save_figure(figure: Any, stem: Path) -> None:
     plt.close(figure)
 
 
-def assemble_fisher(root: Path) -> list[dict[str, Any]]:
-    """fisher.csv, fisher_regions.csv, fisher_fd_check.csv, fisher_runs.csv
-    and the heatmaps from the patient records present."""
+def write_summary(root: Path, experiment: str, records: Sequence[Mapping[str, Any]], n_rows: int, dispatch: Mapping[str, Any] | None) -> dict[str, Any]:
+    """
+    <root>/<experiment>_summary.json: the patients and cells with a
+    record, the CSV row count, the assembly time and the device split of
+    the last dispatch (the given one, else the previous summary's).
+    """
+    path = root / f"{experiment}_summary.json"
+    previous = read_record(path) if path.is_file() else {}
+    cells: dict[str, int] = {}
+    for record in records:
+        cells[str(record["cell"])] = cells.get(str(record["cell"]), 0) + 1
+    summary = {
+        "experiment": experiment,
+        "assembled": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "n_patients": len(records),
+        "patients": [str(record["patient"]) for record in records],
+        "cells": cells,
+        "n_rows": int(n_rows),
+        "dispatch": dict(dispatch) if dispatch is not None else previous.get("dispatch"),
+    }
+    write_record(path, summary)
+    return summary
+
+
+def assemble_fisher(root: Path, dispatch: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """fisher.csv, fisher_regions.csv, fisher_fd_check.csv, fisher_runs.csv,
+    the heatmaps and fisher_summary.json from the patient records
+    present (``write_summary``; dispatch: the device split to record)."""
     rows: list[dict[str, Any]] = []
     regions: list[dict[str, Any]] = []
     checks: list[dict[str, Any]] = []
     runs: list[dict[str, Any]] = []
-    for record in patient_records(root, "fisher"):
+    records = patient_records(root, "fisher")
+    for record in records:
         head = {"patient": record["patient"], "cell": record["cell"]}
         for variant, sets in record["analysis"].items():
             for set_name, analysis in sets.items():
@@ -2608,6 +2685,7 @@ def assemble_fisher(root: Path) -> list[dict[str, Any]]:
     sa.write_csv(root / "fisher_runs.csv", runs, FISHER_RUN_COLUMNS)
     if rows:
         fisher_heatmaps(rows, root / "figures")
+    write_summary(root, "fisher", records, len(rows), dispatch)
     return rows
 
 
@@ -2690,14 +2768,17 @@ def invariance_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path) -> N
         _save_figure(figure, figure_dir / stem)
 
 
-def assemble_substitute(root: Path) -> list[dict[str, Any]]:
-    """substitute.csv and its figures from the patient records present."""
+def assemble_substitute(root: Path, dispatch: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """substitute.csv, its figures and substitute_summary.json from the
+    patient records present (``write_summary``)."""
     rows: list[dict[str, Any]] = []
-    for record in patient_records(root, "substitute"):
+    records = patient_records(root, "substitute")
+    for record in records:
         rows.extend(record["rows"])
     sa.write_csv(root / "substitute.csv", rows, SUBSTITUTE_COLUMNS)
     if rows:
         substitute_figures(rows, root / "figures")
+    write_summary(root, "substitute", records, len(rows), dispatch)
     return rows
 
 
@@ -2806,13 +2887,131 @@ def invariance_command(root: Path, args: argparse.Namespace) -> None:
     assemble_invariance(root)
 
 
-def fisher_command(root: Path, args: argparse.Namespace, smoke: bool) -> None:
+def parse_devices(text: str) -> list[str]:
+    """--gpus as a list of devices: comma-separated CUDA ids, '' the CPU
+    ('' alone is one CPU process, ',' two)."""
+    return [item.strip() for item in str(text).split(",")]
+
+
+def patient_blocks(patients: Sequence[Patient], n_blocks: int) -> list[list[Patient]]:
+    """Contiguous blocks of the patients in their order, one per device,
+    of sizes differing by at most one (the first blocks longer); the
+    empty blocks of more devices than patients are dropped."""
+    if not patients:
+        return []
+    pieces = np.array_split(np.arange(len(patients)), max(1, int(n_blocks)))
+    return [[patients[int(i)] for i in piece] for piece in pieces if len(piece)]
+
+
+def worker_command(root: Path, experiment: str, device: str, patients: Sequence[Patient], args: argparse.Namespace) -> list[str]:
+    """The command line of one dispatched worker: this script's
+    experiment subcommand on one device and one block of patients, the
+    other options passed through, the assembly skipped."""
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        experiment,
+        "--output-dir",
+        str(root.parent),
+        "--name",
+        root.name,
+        "--gpus",
+        device,
+        "--patients",
+        ",".join(patient.id for patient in patients),
+        NO_ASSEMBLE_FLAG,
+    ]
+    if getattr(args, "smoke", False):
+        command.append("--smoke")
+    if experiment == "fisher" and getattr(args, "draws", None) is not None:
+        command += ["--draws", str(args.draws)]
+    if experiment == "substitute":
+        if getattr(args, "maxfev", None) is not None:
+            command += ["--maxfev", str(args.maxfev)]
+        if getattr(args, "t0", None):
+            command += ["--t0", str(args.t0)]
+    return command
+
+
+def dispatch(root: Path, experiment: str, devices: Sequence[str], patients: Sequence[Patient], args: argparse.Namespace) -> dict[str, Any]:
+    """
+    Run an experiment over several devices: the patients cut into
+    contiguous blocks (``patient_blocks``), one worker process per
+    device (``worker_command``) with the sensitivity script's
+    environment handling (XLA_PYTHON_CLIENT_PREALLOCATE=false and
+    CUDA_VISIBLE_DEVICES=<device>, or JAX_PLATFORMS=cpu for ''), its
+    output in <root>/logs/<experiment>_<device>.log (cpu for ''; a
+    repeated device gets a _<k> suffix); waits for every worker.
+
+    Returns:
+        The dispatch record: devices, started, finished, wall_time_s,
+        n_failed and blocks (device, log, patients, returncode,
+        wall_time_s per worker). The caller assembles and then raises
+        on failures (``check_dispatch``).
+    """
+    blocks = patient_blocks(patients, len(devices))
+    log_dir = root / LOG_DIR
+    log_dir.mkdir(exist_ok=True)
+    started = datetime.now(timezone.utc)
+    start = time.perf_counter()
+    workers: list[dict[str, Any]] = []
+    used: dict[str, int] = {}
+    for device, block in zip(devices, blocks):
+        label = device or "cpu"
+        count = used.get(label, 0)
+        used[label] = count + 1
+        log_path = log_dir / f"{experiment}_{label}{'' if count == 0 else f'_{count}'}.log"
+        env = dict(os.environ)
+        env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+        if device:
+            env["CUDA_VISIBLE_DEVICES"] = device
+        else:
+            env["JAX_PLATFORMS"] = "cpu"
+        handle = open(log_path, "w", encoding="utf-8")
+        process = subprocess.Popen(worker_command(root, experiment, device, block, args), stdout=handle, stderr=subprocess.STDOUT, env=env)
+        workers.append({"device": device, "log": str(log_path), "patients": [p.id for p in block], "process": process, "handle": handle, "start": time.perf_counter()})
+        print(f"{experiment}: worker on {label} for {', '.join(p.id for p in block)} -> {log_path}", flush=True)
+    records: list[dict[str, Any]] = []
+    for worker in workers:
+        code = int(worker["process"].wait())
+        worker["handle"].close()
+        wall = time.perf_counter() - worker["start"]
+        records.append({"device": worker["device"], "log": worker["log"], "patients": worker["patients"], "returncode": code, "wall_time_s": wall})
+        print(f"{experiment}: worker on {worker['device'] or 'cpu'} {'ok' if code == 0 else f'FAILED (exit {code})'} in {wall / 60:.1f} min", flush=True)
+    return {
+        "experiment": experiment,
+        "devices": list(devices),
+        "started": started.isoformat(timespec="seconds"),
+        "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "wall_time_s": time.perf_counter() - start,
+        "n_failed": sum(1 for r in records if r["returncode"] != 0),
+        "blocks": records,
+    }
+
+
+def check_dispatch(record: Mapping[str, Any]) -> None:
+    """Raise when a worker of a dispatch failed, naming its log."""
+    failed = [block for block in record["blocks"] if block["returncode"] != 0]
+    if failed:
+        raise RuntimeError(
+            f"{record['experiment']}: {len(failed)} of {len(record['blocks'])} workers failed: "
+            + "; ".join(f"{block['device'] or 'cpu'} (exit {block['returncode']}, see {block['log']})" for block in failed)
+        )
+
+
+def fisher_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
     cohort = load_cohort(root)
+    patients = select_patients(cohort, args.patients, smoke)
+    if min(len(devices), len(patients)) > 1:
+        record = dispatch(root, "fisher", devices, patients, args)
+        assemble_fisher(root, record)
+        check_dispatch(record)
+        return
     draws = int(args.draws) if args.draws is not None else (SMOKE.draws if smoke else NOISE_DRAWS)
     out_dir = root / "runs" / "fisher"
     fd_flags = {r["patient"]: r.get("fd_check") == "True" for r in sa.read_csv(root / "design.csv")}
     start = time.perf_counter()
-    for index, patient in enumerate(select_patients(cohort, args.patients, smoke)):
+    for index, patient in enumerate(patients):
         marker = out_dir / patient.id / PATIENT_FILE.format(experiment="fisher")
         if marker.is_file():
             print(f"fisher {patient.id}: {marker} exists, skipped", flush=True)
@@ -2827,16 +3026,23 @@ def fisher_command(root: Path, args: argparse.Namespace, smoke: bool) -> None:
             flush=True,
         )
     print(f"fisher: {(time.perf_counter() - start) / 60:.1f} min", flush=True)
-    assemble_fisher(root)
+    if not getattr(args, "no_assemble", False):
+        assemble_fisher(root)
 
 
-def substitute_command(root: Path, args: argparse.Namespace, smoke: bool) -> None:
+def substitute_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
     cohort = load_cohort(root)
+    patients = select_patients(cohort, args.patients, smoke)
+    if min(len(devices), len(patients)) > 1:
+        record = dispatch(root, "substitute", devices, patients, args)
+        assemble_substitute(root, record)
+        check_dispatch(record)
+        return
     maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else MAXFEV)
     t0_values = [float(v) for v in args.t0.split(",")] if args.t0 else list(SUBSTITUTE_T0)
     out_dir = root / "runs" / "substitute"
     start = time.perf_counter()
-    for index, patient in enumerate(select_patients(cohort, args.patients, smoke)):
+    for index, patient in enumerate(patients):
         marker = out_dir / patient.id / PATIENT_FILE.format(experiment="substitute")
         if marker.is_file():
             print(f"substitute {patient.id}: {marker} exists, skipped", flush=True)
@@ -2845,7 +3051,8 @@ def substitute_command(root: Path, args: argparse.Namespace, smoke: bool) -> Non
         record = substitute_patient(cohort, patient, out_dir, maxfev, t0_values)
         print(f"substitute {patient.id}: {record['wall_time_s'] / 60:.1f} min ({index + 1} done)", flush=True)
     print(f"substitute: {(time.perf_counter() - start) / 60:.1f} min", flush=True)
-    assemble_substitute(root)
+    if not getattr(args, "no_assemble", False):
+        assemble_substitute(root)
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -2854,8 +3061,19 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--smoke", action="store_true", help=f"smoke settings: resolution_factor {SMOKE.resolution_factor:g}, {SMOKE.n_patients} patients, K = {SMOKE.draws}, maxfev {SMOKE.maxfev}, CPU")
 
 
-def _add_device_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--gpu", default=DEFAULT_GPU, help="CUDA device id of this process; '' = CPU")
+def _add_device_arg(parser: argparse.ArgumentParser, single: bool = False) -> None:
+    if single:
+        parser.add_argument("--gpus", default=DEFAULT_GPUS.split(",")[0], help="the CUDA device id of this process; '' = CPU")
+    else:
+        parser.add_argument(
+            "--gpus",
+            default=DEFAULT_GPUS,
+            help="comma-separated CUDA device ids ('' = CPU; ',' = two CPU workers): one device solves in this process, several dispatch one worker per device",
+        )
+
+
+def _add_worker_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(NO_ASSEMBLE_FLAG, dest="no_assemble", action="store_true", help="skip the CSV and figure assembly at the end (the dispatcher's workers)")
 
 
 def _add_design_args(parser: argparse.ArgumentParser) -> None:
@@ -2863,7 +3081,11 @@ def _add_design_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--search-space", default=str(sa.DEFAULT_SEARCH_SPACE), help="search-space JSON")
     for key, path in sa.DEFAULT_TISSUE_MAPS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", default=str(path), help=f"NIfTI replacing the base config's {key} ('' keeps the base config's)")
-    parser.add_argument("--seed-voxel", default=None, help="the seed voxel i,j,k of every patient (snapped to the nearest seedable voxel); default the base config's fractions")
+    parser.add_argument(
+        "--seed-voxel",
+        default=None,
+        help=f"the seed voxel i,j,k of every patient (snapped to the nearest seedable voxel); default {','.join(str(v) for v in DEFAULT_SEED_VOXEL)}, the base config's fractions on a grid too small for it",
+    )
     parser.add_argument("--log2-candidates", type=int, default=DEFAULT_LOG2_CANDIDATES, help="2 ** it Sobol' points to fill the cells from")
     parser.add_argument("--design-seed", type=int, default=DESIGN_SEED, help="seed of the scrambled Sobol' sequence")
     parser.add_argument("--cavity-threshold", type=float, default=sa.CAVITY_THRESHOLD, help="cell density at or above which a voxel at resection_time is resected")
@@ -2899,18 +3121,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_design_args(design)
     invariance = commands.add_parser("invariance", help="experiment 0")
     _add_common_args(invariance)
-    _add_device_arg(invariance)
+    _add_device_arg(invariance, single=True)
     _add_invariance_args(invariance)
     fisher = commands.add_parser("fisher", help="experiment 1")
     _add_common_args(fisher)
     _add_device_arg(fisher)
     _add_patient_args(fisher)
     _add_fisher_args(fisher)
+    _add_worker_arg(fisher)
     substitute = commands.add_parser("substitute", help="experiment 2")
     _add_common_args(substitute)
     _add_device_arg(substitute)
     _add_patient_args(substitute)
     _add_substitute_args(substitute)
+    _add_worker_arg(substitute)
     everything = commands.add_parser("all", help="design, invariance, fisher and substitute in order")
     _add_common_args(everything)
     _add_device_arg(everything)
@@ -2935,13 +3159,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not (root / "spec.json").is_file():
         raise FileNotFoundError(f"{root / 'spec.json'} not found; run the design first.")
     smoke = bool(args.smoke) or bool(sa.read_json(root / "spec.json").get("smoke", False))
-    configure_device(None if smoke else args.gpu)
+    devices = parse_devices(args.gpus)
+    if smoke:
+        devices = ["" for _ in devices]  # the CPU, as many workers as devices given
+    if args.command == "invariance" and len(devices) > 1:
+        raise ValueError(f"invariance runs on one device; give --gpus one entry, not {args.gpus!r}.")
+    configure_device(devices[0])
     if args.command in ("invariance", "all"):
         invariance_command(root, args)
     if args.command in ("fisher", "all"):
-        fisher_command(root, args, smoke)
+        fisher_command(root, args, smoke, devices)
     if args.command in ("substitute", "all"):
-        substitute_command(root, args, smoke)
+        substitute_command(root, args, smoke, devices)
     return 0
 
 

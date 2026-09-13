@@ -357,7 +357,10 @@ def test_design_fills_the_cells(cohort, phantom_root):
     assert list(records[0]) == ide.DESIGN_COLUMNS
     assert base["gaussian_seed_floor"] == 0.0 and base["precision"] == "f64" and base["resolution_factor"] == 1.0
     assert spec["gaussian_seed_floor"] == 0.0 and spec["smoke"] is False and spec["n_candidates"] == 256
+    # The phantom is too small for the default voxel: the base config's fractions, the grid centre.
     assert spec["seed_voxel"] == [12, 12, 12] and spec["seed_snap_distance_voxels"] == 0.0
+    assert spec["seed_target_source"] == "base_config_fractions" and spec["default_seed_voxel"] == [132, 103, 90]
+    assert spec["seed_target_voxel"] == [12, 12, 12]
     assert spec["log_kill"]["chemo_total_dose"] == 4900.0 and spec["schedules"]["substitute"]["chemo_total_dose"] == 6900.0
     assert spec["crt_snapshots"] == {"mid_crt": 34.0, "end_crt": 55.0}
     for cell, (old, strong) in ide.CELLS.items():
@@ -388,6 +391,35 @@ def test_design_fills_the_cells(cohort, phantom_root):
     assert (phantom_root / "search_space.json").is_file() and (phantom_root / "figures").is_dir()
     with pytest.raises(FileExistsError):
         ide.make_design(spec["base_config"], sa.DEFAULT_SEARCH_SPACE, phantom_root.parent, phantom_root.name)
+
+
+ATLAS_PRESENT = all(Path(path).is_file() for path in sa.DEFAULT_TISSUE_MAPS.values())
+
+
+@pytest.mark.skipif(not ATLAS_PRESENT, reason="the atlas tissue maps are not present")
+def test_default_seed_voxel_on_atlas(tmp_path):
+    """On the atlas geometry the default seed voxel (132, 103, 90) is
+    seedable itself, so the design resolves to it without snapping and
+    records its source; an explicit --seed-voxel is snapped and recorded
+    as an argument."""
+    assert ide.DEFAULT_SEED_VOXEL == (132, 103, 90)
+    wm, gm, zooms, _ = ide.load_tissue({key: str(path) for key, path in sa.DEFAULT_TISSUE_MAPS.items()})
+    geometry = sa.seed_geometry(wm, gm, 0.1)
+    assert ide.nearest_seedable_voxel(geometry, ide.DEFAULT_SEED_VOXEL) == ((132, 103, 90), 0.0)
+    root = ide.make_design(sa.DEFAULT_CONFIG, sa.DEFAULT_SEARCH_SPACE, tmp_path, "atlas", tissue_maps=sa.DEFAULT_TISSUE_MAPS, log2_candidates=8)
+    spec = json.loads((root / "spec.json").read_text())
+    assert spec["seed_voxel"] == [132, 103, 90] and spec["seed_target_voxel"] == [132, 103, 90]
+    assert spec["seed_target_source"] == "default" and spec["seed_snap_distance_voxels"] == 0.0
+    n = spec["grid_shape"]
+    assert spec["seed_fractions"] == pytest.approx([(v + 0.5) / n_i for v, n_i in zip((132, 103, 90), n)])
+    cohort = ide.load_cohort(root)
+    assert cohort.seed_voxel == (132, 103, 90) and cohort.tissue[132, 103, 90]
+    config = read_config(root / "configs" / "p00.json", solver=StuppFKPPSolver)
+    assert config["gaussian_seed_x_fraction"] == pytest.approx(132.5 / n[0])
+    # An explicit voxel in the CSF is snapped to tissue and recorded as an argument.
+    root = ide.make_design(sa.DEFAULT_CONFIG, sa.DEFAULT_SEARCH_SPACE, tmp_path, "explicit", tissue_maps=sa.DEFAULT_TISSUE_MAPS, seed_voxel=(91, 109, 91), log2_candidates=8)
+    spec = json.loads((root / "spec.json").read_text())
+    assert spec["seed_target_source"] == "argument" and spec["seed_target_voxel"] == [91, 109, 91]
 
 
 # --- (7) the smaller pieces ---
@@ -427,6 +459,60 @@ def test_frame_days_and_log_kill_and_selection(cohort):
     assert np.linalg.norm(residual) < 1e-9 * np.linalg.norm(columns[:, 2])
 
 
+def test_patient_blocks_and_devices(cohort):
+    """The device list: '' one CPU, ',' two CPU workers, ids stripped;
+    the patient blocks: contiguous in design order, sizes differing by at
+    most one with the first blocks longer, surplus devices idle, a single
+    device one block."""
+    assert ide.parse_devices("") == [""] and ide.parse_devices(",") == ["", ""] and ide.parse_devices("1, 2,6") == ["1", "2", "6"]
+    patients = cohort.patients
+    blocks = ide.patient_blocks(patients, 4)
+    assert [len(b) for b in blocks] == [8, 8, 8, 8] and [p.id for b in blocks for p in b] == [p.id for p in patients]
+    assert [p.id for p in blocks[1]] == [f"p{i:02d}" for i in range(8, 16)]
+    assert [len(b) for b in ide.patient_blocks(patients[:5], 4)] == [2, 1, 1, 1]
+    assert [len(b) for b in ide.patient_blocks(patients[:2], 4)] == [1, 1]
+    assert [len(b) for b in ide.patient_blocks(patients, 1)] == [32] and ide.patient_blocks([], 3) == []
+    assert [len(b) for b in ide.patient_blocks(patients[:7], 3)] == [3, 2, 2]
+    command = ide.worker_command(cohort.root, "fisher", "3", patients[:2], ide.build_parser().parse_args(["fisher", "--name", "x", "--smoke", "--draws", "5"]))
+    assert command[2:] == ["fisher", "--output-dir", str(cohort.root.parent), "--name", cohort.root.name, "--gpus", "3", "--patients", "p00,p01", "--no-assemble", "--smoke", "--draws", "5"]
+    command = ide.worker_command(cohort.root, "substitute", "", patients[:1], ide.build_parser().parse_args(["substitute", "--name", "x", "--maxfev", "3", "--t0", "30,60"]))
+    assert command[-7:] == ["--patients", "p00", "--no-assemble", "--maxfev", "3", "--t0", "30,60"] and command[7:9] == ["--gpus", ""]
+
+
+def test_dispatch_two_cpu_workers_on_phantom(phantom_root):
+    """fisher --smoke --gpus ',' over two patients: two CPU worker
+    processes with their logs under logs/, the CSVs and figures
+    assembled from both records by the dispatcher, the device split in
+    fisher_summary.json; a plain in-process pass afterwards skips both
+    patients and keeps the split; a dispatch whose workers fail
+    (substitute at a negative T_0) raises after assembling and records
+    the return codes."""
+    base = ["--smoke", "--output-dir", str(phantom_root.parent), "--name", phantom_root.name]
+    assert ide.main(["fisher", *base, "--gpus", ",", "--patients", "p01,p09", "--draws", "2"]) == 0
+    logs = phantom_root / "logs"
+    assert (logs / "fisher_cpu.log").is_file() and (logs / "fisher_cpu_1.log").is_file()
+    assert "fisher p01" in (logs / "fisher_cpu.log").read_text() and "fisher p09" in (logs / "fisher_cpu_1.log").read_text()
+    for patient in ("p01", "p09"):
+        assert (phantom_root / "runs" / "fisher" / patient / "fisher.json").is_file()
+    rows = _read_csv(phantom_root / "fisher.csv")
+    assert {r["patient"] for r in rows} >= {"p01", "p09"}
+    summary = ide.read_record(phantom_root / "fisher_summary.json")
+    assert {"p01", "p09"} <= set(summary["patients"]) and summary["n_rows"] == len(rows)
+    split = summary["dispatch"]
+    assert split["devices"] == ["", ""] and split["n_failed"] == 0 and [b["patients"] for b in split["blocks"]] == [["p01"], ["p09"]]
+    assert all(b["returncode"] == 0 and Path(b["log"]).is_file() for b in split["blocks"])
+    assert (phantom_root / "figures" / "fisher_heatmap_cr_log_T_r.png").is_file()
+    # A plain pass over the same patients skips them and keeps the split.
+    assert ide.main(["fisher", *base, "--gpus", "", "--patients", "p01,p09"]) == 0
+    assert ide.read_record(phantom_root / "fisher_summary.json")["dispatch"]["blocks"] == split["blocks"]
+    # Failing workers: the dispatcher assembles, then raises naming the logs.
+    with pytest.raises(RuntimeError, match="2 of 2 workers failed"):
+        ide.main(["substitute", *base, "--gpus", ",", "--patients", "p01,p09", "--maxfev", "2", "--t0", "-5"])
+    summary = ide.read_record(phantom_root / "substitute_summary.json")
+    assert summary["dispatch"]["n_failed"] == 2 and all(b["returncode"] != 0 for b in summary["dispatch"]["blocks"])
+    assert (logs / "substitute_cpu.log").is_file() and "Traceback" in (logs / "substitute_cpu_1.log").read_text()
+
+
 def test_figures_tolerate_empty_iso_surfaces(tmp_path):
     """A metric that is NaN for every row (an empty iso-surface at every
     lambda, at every substitute) still gives a figure: the panels' log
@@ -463,12 +549,14 @@ def test_smoke_pipeline_on_phantom(phantom_root):
     assert ide.main(args) == 0
     for name in ("invariance.csv", "fisher.csv", "fisher_regions.csv", "fisher_fd_check.csv", "fisher_runs.csv", "substitute.csv"):
         assert (phantom_root / name).is_file(), name
-    fisher = _read_csv(phantom_root / "fisher.csv")
-    assert {r["patient"] for r in fisher} == {"p00"} and len(fisher) == len(ide.OBSERVATION_SETS) * len(ide.T_R_VARIANTS)
+    # The CSVs hold every record of the shared design directory (other
+    # tests add patients), so the checks look at p00's rows.
+    fisher = [r for r in _read_csv(phantom_root / "fisher.csv") if r["patient"] == "p00"]
+    assert len(fisher) == len(ide.OBSERVATION_SETS) * len(ide.T_R_VARIANTS)
     assert all(r["frames"] for r in fisher)
-    checks = _read_csv(phantom_root / "fisher_fd_check.csv")
+    checks = [r for r in _read_csv(phantom_root / "fisher_fd_check.csv") if r["patient"] == "p00"]
     assert [r["column"] for r in checks] == list(ide.THETA_NAMES)
-    substitute = _read_csv(phantom_root / "substitute.csv")
+    substitute = [r for r in _read_csv(phantom_root / "substitute.csv") if r["patient"] == "p00"]
     assert len(substitute) == 1 + 2 * len(ide.OBJECTIVES) and list(substitute[0]) == ide.SUBSTITUTE_COLUMNS
     assert all(int(r["n_evaluations"]) <= ide.SMOKE.maxfev for r in substitute if r["objective"] != "truth")
     for stem in ("fisher_heatmap_cr_log_T_r", "fisher_heatmap_resid7_frac_T_r", "substitute_d120_objective_A", "substitute_d180_objective_B", "invariance_qois"):
