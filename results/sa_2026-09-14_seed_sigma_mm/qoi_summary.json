@@ -1,0 +1,688 @@
+{
+  "_note": "Counts prefixed n_runs_ are runs (the unprefixed global counts are runs as well); counts prefixed n_blocks_ are Saltelli blocks of block_size runs. A block is dropped from a QoI's Sobol' analysis when any of its runs is failed or non-finite for that QoI, so ceil(n_runs_nan / block_size) <= n_blocks_dropped <= n_runs_nan + n_runs_failed. Extinct runs (mass at or below mass_floor) have a finite, floored log10_mass and non-finite mass-weighted QoIs, so they drop blocks for centroid_drift, R_g, the centroid components, log10_anisotropy and wm_fraction only. QoIs prefixed pre_, mid_crt_ and end_crt_ are those of the pre-resection field and of the treated stage's snapshots; a successful run without that file (an older sweep, growth-only mode) is NaN for all of them.",
+  "n_runs": 28672,
+  "n_success": 28672,
+  "n_failed": 0,
+  "mean_run_wall_time_s": 14.696,
+  "block_size": 14,
+  "n_blocks_total": 2048,
+  "tau_core": 0.6,
+  "tau_edema": 0.3,
+  "n_empty_core": 24677,
+  "n_empty_edema": 20741,
+  "n_nan_mass_weighted": 32,
+  "n_nan_anisotropy": 32,
+  "mass_floor_voxels": 0.001,
+  "n_runs_extinct": 32,
+  "n_runs_empty_cavity": 0,
+  "n_runs_without_pre_resection_field": 0,
+  "n_runs_without_mid_crt_field": 0,
+  "n_runs_without_end_crt_field": 0,
+  "per_qoi": {
+    "log10_mass": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "V_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "V_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "log10_V_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "log10_V_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "r95_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "r95_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "centroid_drift": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 32,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 8,
+      "n_blocks_used": 2040,
+      "dropped_blocks": [
+        247,
+        409,
+        507,
+        639,
+        743,
+        1095,
+        1335,
+        1831
+      ]
+    },
+    "centroid_x_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 32,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 8,
+      "n_blocks_used": 2040,
+      "dropped_blocks": [
+        247,
+        409,
+        507,
+        639,
+        743,
+        1095,
+        1335,
+        1831
+      ]
+    },
+    "centroid_y_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 32,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 8,
+      "n_blocks_used": 2040,
+      "dropped_blocks": [
+        247,
+        409,
+        507,
+        639,
+        743,
+        1095,
+        1335,
+        1831
+      ]
+    },
+    "centroid_z_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 32,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 8,
+      "n_blocks_used": 2040,
+      "dropped_blocks": [
+        247,
+        409,
+        507,
+        639,
+        743,
+        1095,
+        1335,
+        1831
+      ]
+    },
+    "R_g": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 32,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 8,
+      "n_blocks_used": 2040,
+      "dropped_blocks": [
+        247,
+        409,
+        507,
+        639,
+        743,
+        1095,
+        1335,
+        1831
+      ]
+    },
+    "log10_anisotropy": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 32,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 8,
+      "n_blocks_used": 2040,
+      "dropped_blocks": [
+        247,
+        409,
+        507,
+        639,
+        743,
+        1095,
+        1335,
+        1831
+      ]
+    },
+    "wm_fraction": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 32,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 8,
+      "n_blocks_used": 2040,
+      "dropped_blocks": [
+        247,
+        409,
+        507,
+        639,
+        743,
+        1095,
+        1335,
+        1831
+      ]
+    },
+    "pre_log10_mass": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_V_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_V_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_log10_V_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_log10_V_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_r95_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_r95_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_centroid_drift": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_centroid_x_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_centroid_y_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_centroid_z_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_R_g": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_log10_anisotropy": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "pre_wm_fraction": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_log10_mass": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_V_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_V_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_log10_V_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_log10_V_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_r95_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_r95_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_centroid_drift": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_centroid_x_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_centroid_y_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_centroid_z_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_R_g": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_log10_anisotropy": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "mid_crt_wm_fraction": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "end_crt_log10_mass": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "end_crt_V_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "end_crt_V_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "end_crt_log10_V_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "end_crt_log10_V_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "end_crt_r95_core": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "end_crt_r95_edema": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 0,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 0,
+      "n_blocks_used": 2048,
+      "dropped_blocks": []
+    },
+    "end_crt_centroid_drift": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 35,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 13,
+      "n_blocks_used": 2035,
+      "dropped_blocks": [
+        247,
+        409,
+        419,
+        507,
+        610,
+        743,
+        847,
+        923,
+        1095,
+        1335,
+        1646,
+        1831,
+        1935
+      ]
+    },
+    "end_crt_centroid_x_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 35,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 13,
+      "n_blocks_used": 2035,
+      "dropped_blocks": [
+        247,
+        409,
+        419,
+        507,
+        610,
+        743,
+        847,
+        923,
+        1095,
+        1335,
+        1646,
+        1831,
+        1935
+      ]
+    },
+    "end_crt_centroid_y_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 35,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 13,
+      "n_blocks_used": 2035,
+      "dropped_blocks": [
+        247,
+        409,
+        419,
+        507,
+        610,
+        743,
+        847,
+        923,
+        1095,
+        1335,
+        1646,
+        1831,
+        1935
+      ]
+    },
+    "end_crt_centroid_z_mm": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 35,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 13,
+      "n_blocks_used": 2035,
+      "dropped_blocks": [
+        247,
+        409,
+        419,
+        507,
+        610,
+        743,
+        847,
+        923,
+        1095,
+        1335,
+        1646,
+        1831,
+        1935
+      ]
+    },
+    "end_crt_R_g": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 35,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 13,
+      "n_blocks_used": 2035,
+      "dropped_blocks": [
+        247,
+        409,
+        419,
+        507,
+        610,
+        743,
+        847,
+        923,
+        1095,
+        1335,
+        1646,
+        1831,
+        1935
+      ]
+    },
+    "end_crt_log10_anisotropy": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 35,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 13,
+      "n_blocks_used": 2035,
+      "dropped_blocks": [
+        247,
+        409,
+        419,
+        507,
+        610,
+        743,
+        847,
+        923,
+        1095,
+        1335,
+        1646,
+        1831,
+        1935
+      ]
+    },
+    "end_crt_wm_fraction": {
+      "n_runs_total": 28672,
+      "n_runs_failed": 0,
+      "n_runs_nan": 35,
+      "n_blocks_total": 2048,
+      "n_blocks_dropped": 13,
+      "n_blocks_used": 2035,
+      "dropped_blocks": [
+        247,
+        409,
+        419,
+        507,
+        610,
+        743,
+        847,
+        923,
+        1095,
+        1335,
+        1646,
+        1831,
+        1935
+      ]
+    }
+  }
+}
