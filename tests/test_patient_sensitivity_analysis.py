@@ -13,7 +13,8 @@ thresholds and the row thresholds on a synthetic field, (5) the
 cheap-factor dedup (N (k_dyn + 2) distinct solves, every row mapped to a
 run of equal dynamics) and edema_threshold < core_threshold on every
 sampled row, (6) the shipped search space in both modes (factor order,
-cheap factors, the refusal of timeline keys) and the snapshot-day rule.
+cheap factors, the refusal of timeline keys, the shared ranges equal to
+sigma_v2's, the script's defaults) and the snapshot-day rule.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from fisher_kpp_jax import StuppFKPPSolver, read_config
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "patient_sensitivity_analysis.py"
 SEARCH_SPACE = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_search_space.json"
 BASE_CONFIG = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "configs" / "StuppFKPPSolver.json"
+SIGMA_V2_SEARCH_SPACE = SEARCH_SPACE.with_name("stupp_fkpp_sigma_v2_search_space.json")
 
 
 def _load_script():
@@ -399,7 +401,7 @@ def test_search_space_modes():
     assert set(meta["threshold_factors"]) == {"core_threshold", "edema_threshold_ratio"}
     assert profiled.overrides == {"chemo_decay_rate": 9.24, "gaussian_seed_scale": 1.0}
     assert list(profiled.groups) == ["growth", "seed"]
-    assert profiled.factors["seed_sigma_mm"].high == 14.0 and profiled.factors["preop_time"].low == 30.0
+    assert profiled.factors["seed_sigma_mm"].high == 16.0 and profiled.factors["preop_time"].low == 30.0
     sampled, meta = psa.read_patient_search_space(SEARCH_SPACE, "sampled")
     assert sampled.names == FACTOR_ORDER_SAMPLED
     assert meta["cheap_factors"] == ["core_threshold", "edema_threshold_ratio"]
@@ -409,6 +411,37 @@ def test_search_space_modes():
     assert len(psa.analysed_qois(["ses01_"], "sampled")) == 10 + 4 + 10 + 5 + 1
     with pytest.raises(ValueError, match="threshold mode"):
         psa.read_patient_search_space(SEARCH_SPACE, "fixed")
+
+
+def test_shared_ranges_equal_sigma_v2():
+    """Every range and scale the patient space shares with the sigma_v2
+    atlas space (growth, seed, diffusivity_ratio, chemo_kill_rate,
+    chemo_decay_rate, rt_alpha, rt_alpha_beta_ratio, the seed fractions,
+    gaussian_seed_scale) equals it; preop_time stands in for
+    resection_time with its range, and only the threshold factors are
+    the patient space's own."""
+    patient = {k: v for k, v in json.loads(SEARCH_SPACE.read_text()).items() if not k.startswith("_")}
+    atlas = {k: v for k, v in json.loads(SIGMA_V2_SEARCH_SPACE.read_text()).items() if not k.startswith("_")}
+    shared = set(patient) & set(atlas)
+    assert shared == set(atlas) - {"resection_time", "time_after_resection"}
+    for key in shared:
+        assert patient[key] == atlas[key], key
+    assert patient["preop_time"] == atlas["resection_time"]
+    assert set(patient) - shared == {"preop_time", "core_threshold", "edema_threshold_ratio"}
+    space, _ = psa.read_patient_search_space(SEARCH_SPACE, "sampled")
+    assert space.factors["front_width_mm"].high == 4.0 and space.factors["seed_sigma_mm"].low == 5.0
+    assert space.factors["chemo_kill_rate"].low == 1e-3 and space.factors["chemo_kill_rate"].high == 3.5e-2
+    assert space.factors["rt_alpha"].low == 5e-3
+
+
+def test_defaults():
+    assert psa.DEFAULT_SESSIONS == "02-08"
+    assert psa.DEFAULT_LOG2_N == 10 and psa.DEFAULT_LOG2_N != sa.DEFAULT_LOG2_N
+    assert psa.DEFAULT_THRESHOLD_MODE == "sampled"
+    args = psa.build_parser().parse_args(["design", "--name", "x"])
+    assert args.sessions == "02-08" and args.log2_n == 10 and args.threshold_mode == "sampled"
+    assert args.search_space == str(psa.DEFAULT_SEARCH_SPACE) and args.patient == "sub-01"
+    assert psa.parse_sessions(args.sessions) == [f"ses-{n:02d}" for n in range(2, 9)]
 
 
 def test_search_space_refusals(tmp_path: Path):

@@ -94,7 +94,7 @@ recorded. It is meant for a cheaper identifiability sweep over the
 growth factors (with --second-order).
 
 Search-space file (JSON, --search-space; default
-fisher_kpp_jax/search_spaces/stupp_fkpp_search_space.json). It reads like
+fisher_kpp_jax/search_spaces/stupp_fkpp_sigma_v2_search_space.json). It reads like
 a config: "solver" names StuppFKPPSolver (checked against the class the
 script uses), keys starting with '_' are comments and are dropped, every
 other key is either
@@ -542,7 +542,7 @@ SOLVER_NAME = "StuppFKPPSolver"
 # The solver of the growth stage (seed to resection_time, no treatment).
 GROWTH_SOLVER_NAME = "FKPPSolver"
 SOLVER_KEY = "solver"
-DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_fkpp_search_space.json"
+DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_fkpp_sigma_v2_search_space.json"
 DEFAULT_CONFIG = _ROOT / "fisher_kpp_jax" / "configs" / "StuppFKPPSolver.json"
 # The tissue maps every design uses in place of the base config's (the
 # defaults of --white-matter-pbmap / --gray-matter-pbmap): the BraTS

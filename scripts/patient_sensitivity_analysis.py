@@ -13,7 +13,7 @@ the run/block accounting, the figures. What differs is below.
 
 Patient data (--patient, --patient-root, --session-labels, --sessions;
 defaults sub-01 of /mnt/Drive4/lucas/SAILOR/processed and
-/mnt/Drive4/lucas/SAILOR/session_labels.tsv, sessions ses-02 to ses-06).
+/mnt/Drive4/lucas/SAILOR/session_labels.tsv, sessions ses-02 to ses-08, DEFAULT_SESSIONS).
 Everything is in the patient's pre-op space at 1 mm, preprocessed:
   tissue:   <root>/<patient>/<pre-op session>/tissue_segmentation/{gm,wm}_pbmap.nii.gz
   pre-op:   <root>/<patient>/<pre-op session>/tumor_segmentation/tumor_seg.nii.gz
@@ -98,7 +98,13 @@ the atlas script reads its files (``load_search_space``) with three
 script factors that are not solver parameters: preop_time and the two
 threshold factors core_threshold and edema_threshold_ratio, which carry
 "cheap": true (the solve does not depend on them; the flag is stripped
-before the file is handed to ``load_search_space``). The timeline
+before the file is handed to ``load_search_space``). Its ranges follow
+fisher_kpp_jax/search_spaces/stupp_fkpp_sigma_v2_search_space.json
+(2026-09-15): with front_width_mm up to 4 mm and seed_sigma_mm from
+5 mm the atlas loader warns that the seed width floor is below twice the
+front width cap, which is expected (a seed diffusion flattens shows as
+an empty model mask, counted per session in qoi_summary.json). The
+default design is --log2-n DEFAULT_LOG2_N (10, N = 1024). The timeline
 entries (resection_time, time_after_resection, chemo_times,
 chemo_doses, rt_times, snapshot_times), the tissue maps,
 resection_cavity and rt_dose may not appear in it. The derived groups'
@@ -106,7 +112,8 @@ design-time checks run against the resolved parameters of a
 StuppFKPPSolver built from the base config with the patient's volumes
 and the timeline at the midpoint of preop_time (no solve).
 
-Threshold modes (--threshold-mode, THRESHOLD_MODES, default profiled):
+Threshold modes (--threshold-mode, THRESHOLD_MODES, default sampled,
+DEFAULT_THRESHOLD_MODE):
   profiled  the cheap factors are dropped from the design (k = 12 with
             the shipped search space). Per session and region the Dice
             is evaluated on the fixed grid THRESHOLD_GRID_CORE
@@ -116,7 +123,8 @@ Threshold modes (--threshold-mode, THRESHOLD_MODES, default profiled):
             thresholds of the best pair (below) as well as the Dice at
             the fixed pair TAU_CORE / TAU_EDEMA = 0.6 / 0.3 (the row
             thresholds of this mode).
-  sampled   the two cheap factors are in the design (k = 14), with
+  sampled   (the default) the two cheap factors are in the design
+            (k = 14 with the shipped search space), with
             edema_threshold = edema_threshold_ratio * core_threshold
             (a deterministic map, no rejection; edema < core on every
             row). The run list is DEDUPLICATED on the non-cheap columns
@@ -207,7 +215,7 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR; --name required):
     sobol.csv, sobol_summary.json, figures/   as the atlas script writes them
 
 Run from the project root, e.g.:
-  python scripts/patient_sensitivity_analysis.py design --name sa_sub01 --log2-n 3 --threshold-mode sampled
+  python scripts/patient_sensitivity_analysis.py design --name sa_sub01 --log2-n 3 --threshold-mode profiled
   python scripts/patient_sensitivity_analysis.py run --sweep-dir <output-dir>/sa_sub01 --gpus 2,3
   python scripts/patient_sensitivity_analysis.py qoi --sweep-dir <output-dir>/sa_sub01
   python scripts/patient_sensitivity_analysis.py analyze --sweep-dir <output-dir>/sa_sub01
@@ -258,7 +266,6 @@ from sensitivity_analysis import (  # noqa: E402
     DEFAULT_DESIGN_SEED,
     DEFAULT_GPUS,
     DEFAULT_JOBS_PER_GPU,
-    DEFAULT_LOG2_N,
     DEFAULT_N_BOOTSTRAP,
     DERIVED_VOLUME_KEYS,
     MASS_FLOOR_VOXELS,
@@ -305,7 +312,10 @@ DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_patient"
 DEFAULT_PATIENT = "sub-01"
 DEFAULT_PATIENT_ROOT = Path("/mnt/Drive4/lucas/SAILOR/processed")
 DEFAULT_SESSION_LABELS = Path("/mnt/Drive4/lucas/SAILOR/session_labels.tsv")
-DEFAULT_SESSIONS = "02-06"  # the later sessions analysed (``parse_sessions``)
+DEFAULT_SESSIONS = "02-08"  # the later sessions analysed (``parse_sessions``)
+# N = 1024 base points: 16 384 rows and 14 336 distinct solves in sampled mode
+# with the shipped search space (the atlas script defaults to 11).
+DEFAULT_LOG2_N = 10
 DEFAULT_QOI_WORKERS = min(16, os.cpu_count() or 1)
 
 # Patient file layout below <root>/<patient>/<session>/.
@@ -366,7 +376,7 @@ TIMELINE_KEYS: tuple[str, ...] = (
 PATIENT_VOLUME_KEYS: tuple[str, ...] = (*TISSUE_FILES, *DERIVED_VOLUME_KEYS)
 
 THRESHOLD_MODES: tuple[str, ...] = ("profiled", "sampled")
-DEFAULT_THRESHOLD_MODE = "profiled"
+DEFAULT_THRESHOLD_MODE = "sampled"
 FIXED_THRESHOLDS: tuple[float, float] = (TAU_CORE, TAU_EDEMA)  # 0.6 / 0.3
 THRESHOLD_GRID_CORE: tuple[float, ...] = tuple(round(0.30 + 0.05 * i, 2) for i in range(12))  # 0.30..0.85
 THRESHOLD_GRID_EDEMA: tuple[float, ...] = tuple(round(0.10 + 0.05 * i, 2) for i in range(11))  # 0.10..0.60
@@ -471,8 +481,8 @@ def read_session_labels(path: str | Path, patient: str) -> list[Session]:
 
 def parse_sessions(text: str) -> list[str]:
     """
-    The session ids of a --sessions argument: a range "02-06" (ses-02 to
-    ses-06) or a comma-separated list of ids ("ses-02,ses-04") or numbers
+    The session ids of a --sessions argument: a range "02-08" (ses-02 to
+    ses-08) or a comma-separated list of ids ("ses-02,ses-04") or numbers
     ("2,4").
     """
     text = text.strip()
@@ -2244,18 +2254,18 @@ def _add_design_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="base config JSON")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="parent of the sweep directory")
     parser.add_argument("--name", required=True, help="sweep directory name")
-    parser.add_argument("--log2-n", type=int, default=DEFAULT_LOG2_N, help="N = 2 ** log2_n base points")
+    parser.add_argument("--log2-n", type=int, default=DEFAULT_LOG2_N, help=f"N = 2 ** log2_n base points (default {DEFAULT_LOG2_N})")
     parser.add_argument("--seed", type=int, default=DEFAULT_DESIGN_SEED, help="seed of the Sobol' sequence")
     parser.add_argument(
         "--threshold-mode", choices=THRESHOLD_MODES, default=DEFAULT_THRESHOLD_MODE,
-        help="profiled: thresholds on a fixed grid, k = 12; sampled: the two cheap threshold factors in the design, k = 14, runs deduplicated",
+        help=f"profiled: thresholds on a fixed grid, k = 12; sampled (default): the two cheap threshold factors in the design, k = 14, runs deduplicated (default {DEFAULT_THRESHOLD_MODE})",
     )
     parser.add_argument("--patient", default=DEFAULT_PATIENT, help="subject id")
     parser.add_argument("--patient-root", default=str(DEFAULT_PATIENT_ROOT), help="processed data root")
     parser.add_argument("--session-labels", default=str(DEFAULT_SESSION_LABELS), help="session labels tsv")
     parser.add_argument(
         "--sessions", default=DEFAULT_SESSIONS,
-        help="later sessions analysed: a range '02-06' or a list 'ses-02,ses-03'; must hold the post-op session",
+        help=f"later sessions analysed: a range '02-08' or a list 'ses-02,ses-03'; must hold the post-op session (default {DEFAULT_SESSIONS})",
     )
 
 

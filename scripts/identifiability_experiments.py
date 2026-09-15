@@ -452,11 +452,13 @@ frames, and compared with the truth's frames by ``compare_fields``.
   substitute_summary.json   the assembly record, as fisher_summary.json
 
 Subcommand seedfix (experiment 3). The mirror of experiment 2: the seed
-is held at the base config's (gaussian_seed_mass and
-gaussian_seed_diffusion_time of the design's base_config.json, as
-(peak, sigma) through the script's seed derivation, ``base_seed``;
-recorded per row as seed_peak and seed_sigma_mm) and the growth time is
-fitted instead. Per patient (``seedfix_patient``): the truth as in
+is held at the solver's class default (GAUSSIAN_SEED_MASS 1500 and
+GAUSSIAN_SEED_DIFFUSION_TIME 15 mm^2 of fisher_kpp_jax.operators, as
+(peak, sigma) = (0.58, 5.48 mm) through the script's seed derivation,
+``base_seed``; not the base config's 0.8 and 6.3 mm; recorded as
+"class default" in spec.json's seedfix entry and in
+seedfix_summary.json, and per row as seed_peak and seed_sigma_mm) and
+the growth time is fitted instead. Per patient (``seedfix_patient``): the truth as in
 experiment 2 (runs/substitute/<patient>/truth is read back when it
 holds the six frames, ``load_truth_run``, its stored fields being the
 float32 ones rounded for storage; otherwise the truth is solved into
@@ -470,7 +472,8 @@ growth-only field at T_r from the fixed seed (FKPPSolver at 12
 steps/day, the solve path of ``fit_seed``: n_steps = ceil(12 T_r), so
 every evaluation has its own step count and compiles its own scan)
 matches the truth's density at resection on the region's voxels
-(``fit_growth_time``); the best evaluation is the fitted T_r. The
+(``fit_growth_time``); the best evaluation is the fitted T_r, and
+bound_hit flags a fit whose log T_r lies within 1e-2 of a bound. The
 treated stage is then run from the fixed seed with resection_time the
 fitted T_r, the truth's cavity, dose, alpha and k_ct, the schedule
 truncated to 180 days and shifted for the fitted T_r (``patient_config``,
@@ -482,16 +485,21 @@ recording the six frames, and compared with the truth's frames by
                    itself, fitted_T_r = T_r, the truth's own seed):
                    patient, cell, fitted_T_r, rho_T_r_fitted, rho_T_r,
                    objective, seed_peak, seed_sigma_mm, n_evaluations,
-                   objective_initial, objective_achieved, growth_n_steps,
-                   dt, wall_time_s (the fit), and <frame>_<metric> for
-                   the six frames
+                   objective_initial, objective_achieved, bound_hit,
+                   growth_n_steps, dt, wall_time_s (the fit), and
+                   <frame>_<metric> for the six frames, the metrics
+                   followed by mass_rel = mass / ref_mass - 1 and
+                   mass_out_of_field_rel (NaN for a zero reference)
   seedfix_summary.json   the assembly record (as substitute_summary.json)
-                   with medians: per objective and cell (and "all") the
-                   median over the patients of every d120_ and d180_
-                   metric and of |rho (T_r_fitted - T_r)|
+                   with the seed's record and medians: per objective and
+                   cell (and "all") the patient count, n_bound_hit and,
+                   over the patients whose fit did not hit a bound, the
+                   median of every d120_ and d180_ metric (the relative
+                   masses included) and of |rho (T_r_fitted - T_r)|
                    (abs_rho_T_r_error)
   figures/seedfix_<frame>_objective_<A|B>.{png,pdf}   for d120 and d180:
-                   every comparison metric against rho T_r of the truth
+                   every comparison metric and, next to the mass pair,
+                   the two relative masses against rho T_r of the truth
                    (log axis), one marker per patient coloured by cell
   runs/seedfix/<patient>/   truth/ (unless experiment 2's is reused),
                    observation.json, <objective>/ (fit.json: fitted_T_r,
@@ -638,6 +646,7 @@ from scipy.stats import qmc  # noqa: E402
 
 from fisher_kpp_jax import SOLVER_KEY, FKPPSolver, Result, StuppFKPPSolver, read_config, write_config  # noqa: E402
 from fisher_kpp_jax.config import jsonable  # noqa: E402
+from fisher_kpp_jax.operators import GAUSSIAN_SEED_DIFFUSION_TIME, GAUSSIAN_SEED_MASS  # noqa: E402
 
 SENSITIVITY_SCRIPT = _ROOT / "scripts" / "sensitivity_analysis.py"
 
@@ -797,6 +806,8 @@ LOG_EPS = 1e-6  # log(u + LOG_EPS) in the log metrics and objective A
 # Experiment 3.
 TR_BOUNDS: tuple[float, float] = (5.0, 600.0)  # the fitted growth time's range in days (--tr-bounds)
 SCALAR_XATOL = 1e-3  # the bounded search's tolerance in log T_r
+SEED_SOURCE = "class default"  # the fixed seed: the solver's GAUSSIAN_SEED_MASS and GAUSSIAN_SEED_DIFFUSION_TIME, not the base config's
+BOUND_TOLERANCE = 1e-2  # a fitted log T_r within it of a bound counts as a bound hit
 
 # Metrics (``compare_fields``).
 METRIC_NAMES: list[str] = [
@@ -817,6 +828,10 @@ METRIC_NAMES: list[str] = [
 # second figure).
 PLOTTED_METRICS: list[str] = [name for name in METRIC_NAMES if not name.startswith("qoi_") and not name.startswith("ref_")]
 PLOTTED_QOIS: list[str] = [f"qoi_{name}" for name in sa.FINAL_ANALYSED_QOIS]
+# Experiment 3 adds the relative masses mass / ref_mass - 1 and
+# mass_out_of_field / ref_mass_out_of_field - 1 (NaN for a zero reference).
+SEEDFIX_METRIC_NAMES: list[str] = [*METRIC_NAMES, "mass_rel", "mass_out_of_field_rel"]
+SEEDFIX_PLOTTED_METRICS: list[str] = [*PLOTTED_METRICS, "mass_rel", "mass_out_of_field_rel"]
 
 COLOR_CELLS: dict[str, str] = {"young_weak": "#2a78d6", "young_strong": "#eb6834", "old_weak": "#2a9d8f", "old_strong": "#8a4fbf"}
 COLOR_TEXT = "#0b0b0b"
@@ -1393,6 +1408,13 @@ def make_design(
             "peak_range": [PEAK_MIN, PEAK_MAX],
             "objectives": list(OBJECTIVES),
             "simplex_steps": list(SIMPLEX_STEPS),
+        },
+        "seedfix": {
+            "seed": seed_record(),
+            "T_r_bounds": list(TR_BOUNDS),
+            "maxfev": SMOKE.maxfev if smoke else MAXFEV,
+            "objectives": list(OBJECTIVES),
+            "bound_tolerance": BOUND_TOLERANCE,
         },
         "n_patients": len(records),
     }
@@ -2534,12 +2556,25 @@ def substitute_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: 
 # --- fixed-seed substitution (experiment 3) ---
 
 
-def base_seed(cohort: Cohort) -> tuple[float, float]:
-    """The base config's seed as (peak density, sigma in mm): the
-    gaussian_seed_mass and gaussian_seed_diffusion_time of the design's
-    base_config.json through the script's seed derivation."""
-    tau = float(cohort.base["gaussian_seed_diffusion_time"])
-    return float(sa.seed_peak_density(float(cohort.base["gaussian_seed_mass"]), tau)), float(np.sqrt(2.0 * tau))
+def base_seed() -> tuple[float, float]:
+    """The fixed seed of experiment 3 as (peak density, sigma in mm): the
+    solver's class defaults GAUSSIAN_SEED_MASS and
+    GAUSSIAN_SEED_DIFFUSION_TIME (1500, 15 mm^2: peak 0.58, sigma 5.48 mm)
+    through the script's seed derivation; not the base config's values."""
+    tau = float(GAUSSIAN_SEED_DIFFUSION_TIME)
+    return float(sa.seed_peak_density(float(GAUSSIAN_SEED_MASS), tau)), float(np.sqrt(2.0 * tau))
+
+
+def seed_record() -> dict[str, Any]:
+    """The fixed seed's record for spec.json and seedfix_summary.json."""
+    peak, sigma = base_seed()
+    return {
+        "source": SEED_SOURCE,
+        "gaussian_seed_mass": float(GAUSSIAN_SEED_MASS),
+        "gaussian_seed_diffusion_time": float(GAUSSIAN_SEED_DIFFUSION_TIME),
+        "seed_peak": peak,
+        "seed_sigma_mm": sigma,
+    }
 
 
 def load_truth_run(cohort: Cohort, patient: Patient, horizon: float, frames: Sequence[str], run_dir: Path) -> TruthRun | None:
@@ -2590,6 +2625,7 @@ class TimeFit:
     seed_sigma: float
     bounds: tuple[float, float]
     t_r: float
+    bound_hit: bool
     rho: float
     t_r_truth: float
     n_evaluations: int
@@ -2609,6 +2645,7 @@ class TimeFit:
             "objective_initial": self.value_initial,
             "objective_achieved": self.value,
             "n_evaluations": self.n_evaluations,
+            "bound_hit": self.bound_hit,
             "T_r_bounds": [self.bounds[0], self.bounds[1]],
             "seed_peak": self.seed_peak,
             "seed_sigma_mm": self.seed_sigma,
@@ -2641,7 +2678,8 @@ def fit_growth_time(
     days (at most maxfev evaluations, xatol SCALAR_XATOL in log T_r). The
     search starts from the bracket's golden-section point, not from the
     truth's T_r. The best evaluation is the fitted T_r; its step count
-    and dt are the grid of the treated stage run from it.
+    and dt are the grid of the treated stage run from it; bound_hit says
+    whether its log lies within BOUND_TOLERANCE of a bound.
     """
     lo, hi = float(bounds[0]), float(bounds[1])
     if not 0.0 < lo < hi:
@@ -2662,12 +2700,15 @@ def fit_growth_time(
     start = time.perf_counter()
     optimum = minimize_scalar(evaluate, bounds=(float(np.log(lo)), float(np.log(hi))), method="bounded", options={"maxiter": int(maxfev), "xatol": SCALAR_XATOL})
     best = min(history, key=lambda h: h["value"])
+    log_t_r = float(np.log(best["T_r"]))
+    bound_hit = bool(abs(log_t_r - np.log(lo)) < BOUND_TOLERANCE or abs(log_t_r - np.log(hi)) < BOUND_TOLERANCE)
     return TimeFit(
         objective=objective,
         seed_peak=float(seed_peak),
         seed_sigma=float(seed_sigma),
         bounds=(lo, hi),
         t_r=best["T_r"],
+        bound_hit=bound_hit,
         rho=patient.rho,
         t_r_truth=patient.resection_time,
         n_evaluations=int(optimum.nfev),
@@ -2682,8 +2723,11 @@ def fit_growth_time(
 
 def seedfix_row(cohort: Cohort, patient: Patient, objective: str, fit: TimeFit | None, metrics: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
     """A seedfix.csv record: the patient, the fitted T_r (the truth's for
-    the "truth" row), rho T_r fitted and true, the seed, the fit and the
-    metrics per frame as <frame>_<metric>."""
+    the "truth" row), rho T_r fitted and true, the seed, the fit (with
+    bound_hit; False for the truth row) and the metrics per frame as
+    <frame>_<metric>, plus <frame>_mass_rel and
+    <frame>_mass_out_of_field_rel (SEEDFIX_METRIC_NAMES: the mass over
+    the reference's minus 1, NaN when the reference is 0)."""
     t_r = fit.t_r if fit is not None else patient.resection_time
     row: dict[str, Any] = {
         "patient": patient.id,
@@ -2697,9 +2741,12 @@ def seedfix_row(cohort: Cohort, patient: Patient, objective: str, fit: TimeFit |
         skipped = ("history", "objective", "fitted_T_r", "rho_T_r_fitted", "rho_T_r_truth", "T_r_bounds")
         row.update({key: value for key, value in fit.record().items() if key not in skipped})
     else:
-        row.update({"seed_peak": patient.seed_peak, "seed_sigma_mm": patient.seed_sigma})
+        row.update({"seed_peak": patient.seed_peak, "seed_sigma_mm": patient.seed_sigma, "bound_hit": False})
     for frame, values in metrics.items():
         row.update({f"{frame}_{name}": value for name, value in values.items()})
+        for name in ("mass", "mass_out_of_field"):
+            reference = float(values[f"ref_{name}"])
+            row[f"{frame}_{name}_rel"] = float(values[name]) / reference - 1.0 if reference > 0 else float("nan")
     return row
 
 
@@ -2715,10 +2762,11 @@ SEEDFIX_COLUMNS: list[str] = [
     "n_evaluations",
     "objective_initial",
     "objective_achieved",
+    "bound_hit",
     "growth_n_steps",
     "dt",
     "wall_time_s",
-    *(f"{frame}_{name}" for frame in SUBSTITUTE_FRAMES for name in METRIC_NAMES),
+    *(f"{frame}_{name}" for frame in SUBSTITUTE_FRAMES for name in SEEDFIX_METRIC_NAMES),
 ]
 
 
@@ -2728,7 +2776,7 @@ def seedfix_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: int
     the frames SUBSTITUTE_FRAMES (experiment 2's, runs/substitute/
     <patient>/truth, read back when complete, ``load_truth_run``; else
     solved into <patient>/truth), then per objective the fitted growth
-    time of the base config's seed (``fit_growth_time``;
+    time of the fixed seed (``base_seed``, ``fit_growth_time``;
     <objective>/fit.json), the treated run from that seed with
     resection_time the fitted T_r, the truth's maps, alpha and k_ct and
     the schedule shifted for it (<objective>/run/) and the metrics
@@ -2747,7 +2795,7 @@ def seedfix_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: int
     region = observation_region(truth.run.frames, cohort.tissue, cohort.zooms)
     patient_dir.mkdir(parents=True, exist_ok=True)
     sa.write_json(patient_dir / "observation.json", {**region.record(), "margin_mm": OBSERVATION_MARGIN_MM})
-    peak, sigma = base_seed(cohort)
+    peak, sigma = base_seed()
     dose = truth.maps.dose
     rows: list[dict[str, Any]] = []
     truth_metrics = {name: compare_to(cohort, truth.run.frames[name], truth.run.frames[name], dose) for name in SUBSTITUTE_FRAMES}
@@ -2786,6 +2834,7 @@ def seedfix_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: int
         "dose_volume_mm3": truth.maps.record["dose_volume_mm3"],
         "truth_dir": str(truth.run.run_dir),
         "truth_reused": reused,
+        "seed_source": SEED_SOURCE,
         "seed_peak": peak,
         "seed_sigma_mm": sigma,
         "T_r_bounds": [float(tr_bounds[0]), float(tr_bounds[1])],
@@ -3170,10 +3219,12 @@ def substitute_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path, fram
 
 def seedfix_medians(rows: Sequence[Mapping[str, Any]], frames: Sequence[str] = ("d120", "d180")) -> dict[str, dict[str, dict[str, Any]]]:
     """Per objective and cell ("all" for every cell): the patient count,
-    the median over the patients of |rho (T_r_fitted - T_r)|
+    the number of fits that hit a bound (n_bound_hit) and, over the
+    patients whose fit did not, the median of |rho (T_r_fitted - T_r)|
     (abs_rho_T_r_error) and of every <frame>_<metric> of the frames
-    (NaN entries left out; None when no value is finite)."""
-    keys = [f"{frame}_{name}" for frame in frames for name in METRIC_NAMES]
+    (SEEDFIX_METRIC_NAMES; NaN entries left out; None when no value is
+    finite)."""
+    keys = [f"{frame}_{name}" for frame in frames for name in SEEDFIX_METRIC_NAMES]
     medians: dict[str, dict[str, dict[str, Any]]] = {}
     for objective in OBJECTIVES:
         selected = [row for row in rows if row["objective"] == objective]
@@ -3182,10 +3233,12 @@ def seedfix_medians(rows: Sequence[Mapping[str, Any]], frames: Sequence[str] = (
             cell_rows = [row for row in selected if cell == "all" or row["cell"] == cell]
             if not cell_rows:
                 continue
-            errors = np.array([abs(float(row["rho_T_r_fitted"]) - float(row["rho_T_r"])) for row in cell_rows])
-            entry: dict[str, Any] = {"n_patients": len(cell_rows), "abs_rho_T_r_error": float(np.median(errors))}
+            kept = [row for row in cell_rows if str(row.get("bound_hit")) != "True"]
+            entry: dict[str, Any] = {"n_patients": len(cell_rows), "n_bound_hit": len(cell_rows) - len(kept)}
+            errors = np.array([abs(float(row["rho_T_r_fitted"]) - float(row["rho_T_r"])) for row in kept])
+            entry["abs_rho_T_r_error"] = float(np.median(errors)) if errors.size else None
             for key in keys:
-                values = np.array([sa.as_float(row.get(key)) for row in cell_rows], dtype=np.float64)
+                values = np.array([sa.as_float(row.get(key)) for row in kept], dtype=np.float64)
                 finite = values[np.isfinite(values)]
                 entry[key] = float(np.median(finite)) if finite.size else None
             medians[objective][cell] = entry
@@ -3204,21 +3257,23 @@ def assemble_seedfix(root: Path, dispatch: Mapping[str, Any] | None = None) -> l
     if rows:
         seedfix_figures(rows, root / "figures")
     summary = write_summary(root, "seedfix", records, len(rows), dispatch)
+    summary["seed"] = seed_record()
     summary["medians"] = seedfix_medians(rows)
     write_record(root / "seedfix_summary.json", summary)
     return rows
 
 
 def seedfix_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path, frames: Sequence[str] = ("d120", "d180")) -> None:
-    """Per frame and objective: every comparison metric against rho T_r
-    of the truth, one marker per patient coloured by cell."""
+    """Per frame and objective: every comparison metric and the two
+    relative masses (SEEDFIX_PLOTTED_METRICS) against rho T_r of the
+    truth, one marker per patient coloured by cell."""
     figure_dir.mkdir(exist_ok=True)
     for frame in frames:
         for objective in OBJECTIVES:
             selected = [row for row in rows if row["objective"] == objective]
             if not selected:
                 continue
-            names = [name for name in PLOTTED_METRICS if not name.startswith("ref_")]
+            names = [name for name in SEEDFIX_PLOTTED_METRICS if not name.startswith("ref_")]
             n_cols = 4
             n_rows = int(np.ceil(len(names) / n_cols))
             figure, axes = plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 2.6 * n_rows), squeeze=False)
@@ -3496,7 +3551,7 @@ def seedfix_command(root: Path, args: argparse.Namespace, smoke: bool, devices: 
         return
     maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else MAXFEV)
     tr_bounds = parse_tr_bounds(getattr(args, "tr_bounds", None))
-    peak, sigma = base_seed(cohort)
+    peak, sigma = base_seed()
     out_dir = root / "runs" / "seedfix"
     start = time.perf_counter()
     for index, patient in enumerate(patients):
