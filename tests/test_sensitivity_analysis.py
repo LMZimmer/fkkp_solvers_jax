@@ -34,6 +34,7 @@ import gzip
 import importlib.util
 import json
 import sys
+import warnings
 from pathlib import Path
 
 import nibabel as nib
@@ -50,6 +51,7 @@ SHIPPED_SEARCH_SPACE = (
     / "stupp_fkpp_search_space.json"
 )
 SIGMA_SEARCH_SPACE = SHIPPED_SEARCH_SPACE.with_name("stupp_fkpp_sigma_search_space.json")
+SIGMA_V2_SEARCH_SPACE = SHIPPED_SEARCH_SPACE.with_name("stupp_fkpp_sigma_v2_search_space.json")
 
 
 def _load_script():
@@ -567,7 +569,8 @@ def test_seed_sigma_derivation():
 def test_seed_sigma_guard():
     """The design-time checks of the sigma seed group: with the growth
     group present, seed_sigma_mm's min below 2 x front_width_mm's max
-    raises naming both numbers and the reason, equality passes, and the
+    warns naming both numbers and the reason (the record is still
+    returned, its s range below 2), equality passes silently, and the
     record holds the implied s range [sigma_min / lambda_max,
     sigma_max / lambda_min]; without a growth group there is no guard and
     no s range; the floor, clip, positive-width and seed-scale checks
@@ -590,10 +593,16 @@ def test_seed_sigma_guard():
     np.testing.assert_allclose(record["gaussian_seed_diffusion_time_range"], [18.0, 200.0])
     np.testing.assert_allclose(record["gaussian_seed_mass_range"], [0.6 * (72 * np.pi) ** 1.5, (800 * np.pi) ** 1.5])
     np.testing.assert_allclose(validate(factors, params, width(1.5))["s_range"], [4.0, 20.0])
-    with pytest.raises(ValueError, match=r"seed_sigma_mm: min 6 mm is below 2 x the front_width_mm max 3.5 mm \(7 mm\)"):
-        validate(factors, params, width(3.5))
-    with pytest.raises(ValueError, match="flattened by diffusion .* empty resection cavities"):
-        validate({**factors, "seed_sigma_mm": sa.SearchSpaceParameter("seed_sigma_mm", 5.9, 20.0, "log")}, params, width(3.0))
+    with pytest.warns(UserWarning, match=r"seed_sigma_mm: min 6 mm is below 2 x the front_width_mm max 3.5 mm \(7 mm\)"):
+        record = validate(factors, params, width(3.5))
+    np.testing.assert_allclose(record["s_range"], [6.0 / 3.5, 20.0])
+    assert record["s_min"] == 2.0
+    with pytest.warns(UserWarning, match="flattened by diffusion .* empty resection cavities"):
+        record = validate({**factors, "seed_sigma_mm": sa.SearchSpaceParameter("seed_sigma_mm", 5.9, 20.0, "log")}, params, width(3.0))
+    np.testing.assert_allclose(record["s_range"], [5.9 / 3.0, 20.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        validate(factors, params, width(3.0))  # equality: no warning
     record = validate(factors, params, {})
     assert "s_range" not in record and "s_min" not in record and record["seed_sigma_mm_range"] == [6.0, 20.0]
     with pytest.raises(ValueError, match="min must exceed the config's gaussian_seed_floor 0.1"):
@@ -655,6 +664,42 @@ def test_load_sigma_search_space():
                         ("seed_sigma_mm", sigma), ("seed_peak_density", peak), ("chemo_kill_rate", base["chemo_kill_rate"])):
         factor = space.factors[name]
         assert factor.low <= value <= factor.high, (name, value)
+
+
+def test_design_of_sigma_v2_search_space(phantom_base):
+    """The third sigma search space (2026-09-15) differs from
+    stupp_fkpp_sigma_search_space.json only in chemo_kill_rate 1e-3-3.5e-2,
+    rt_alpha 0.005-0.2, front_width_mm 1-4 mm and seed_sigma_mm 5-16 mm
+    (scales kept); its seed floor lies below 2 x the front width cap, so
+    the design step warns instead of refusing it and writes the design
+    with s in [1.25, 16] (s_min 2 kept in the record), D in [0.015, 0.5]
+    and rho in [0.00375, 0.125]; every row's s is within that range."""
+    v2, v1 = json.loads(SIGMA_V2_SEARCH_SPACE.read_text()), json.loads(SIGMA_SEARCH_SPACE.read_text())
+    assert [key for key in v2 if not key.startswith("_")] == [key for key in v1 if not key.startswith("_")]
+    assert v2["chemo_kill_rate"] == {"min": 1.0e-3, "max": 3.5e-2, "scale": "log"}
+    assert v2["rt_alpha"] == {"min": 0.005, "max": 0.2, "scale": "log"}
+    assert v2["growth"] == {**SIGMA_GROWTH_GROUP, "front_width_mm": {"min": 1.0, "max": 4.0, "scale": "log"}}
+    assert v2["seed"] == {**SIGMA_SEED_GROUP, "seed_sigma_mm": {"min": 5.0, "max": 16.0, "scale": "log"}}
+    for key in v1:
+        if not key.startswith("_") and key not in ("growth", "seed", "chemo_kill_rate", "rt_alpha"):
+            assert v2[key] == v1[key], key
+    assert "2026-09-15" in v2["_seed_band"] and "1.25" in v2["_seed_band"]
+    tmp_path = phantom_base["tmp_path"]
+    with pytest.warns(UserWarning, match=r"seed_sigma_mm: min 5 mm is below 2 x the front_width_mm max 4 mm \(8 mm\)"):
+        sweep_dir = sa.make_design(SIGMA_V2_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "v2", log2_n=1, seed=3)
+    spec = json.loads((sweep_dir / "spec.json").read_text())
+    assert spec["k"] == 12 and spec["n_runs"] == 28 and spec["factor_names"][8] == "seed_sigma_mm"
+    seed_group, growth_group = spec["derived_groups"]["seed"], spec["derived_groups"]["growth"]
+    np.testing.assert_allclose(seed_group["s_range"], [1.25, 16.0])
+    assert seed_group["s_min"] == 2.0 and seed_group["seed_sigma_mm_range"] == [5.0, 16.0]
+    np.testing.assert_allclose(growth_group["white_matter_diffusivity_range"], [0.015, 0.5])
+    np.testing.assert_allclose(growth_group["rho_range"], [0.00375, 0.125])
+    with (sweep_dir / "design.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 28
+    ratios = np.array([float(row["s"]) for row in rows])
+    np.testing.assert_allclose(ratios, [float(r["seed_sigma_mm"]) / float(r["front_width_mm"]) for r in rows])
+    assert ratios.min() >= 1.25 and ratios.max() <= 16.0
 
 
 def test_mixed_seed_group_rejected():

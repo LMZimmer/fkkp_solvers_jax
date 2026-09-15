@@ -165,14 +165,16 @@ Three derivations are registered, and each shipped search space uses two:
     sensitivities are separately attributable (with sigma = s lambda the
     seed size carries lambda, and part of its effect lands on
     front_width_mm). The derivation does not take the growth group, but
-    the design step guards the coupling the relative width enforced:
-    with a growth group present, seed_sigma_mm's min must be at least
-    SEED_MIN_RELATIVE_WIDTH (2) times front_width_mm's max, so that
-    s = sigma / lambda >= 2 holds for every row by construction (seeds
-    narrower than about twice the front width are flattened by diffusion
-    before the front forms and leave empty resection cavities; the three
-    empty cavities of the 2026-09-12 sweep sat at s = 2.04-2.09), and it
-    is refused otherwise with a message naming both numbers. Its extras
+    the design step checks the coupling the relative width enforced:
+    with a growth group present, a seed_sigma_mm min below
+    SEED_MIN_RELATIVE_WIDTH (2) times front_width_mm's max lets
+    s = sigma / lambda fall below 2 for some rows (seeds narrower than
+    about twice the front width are flattened by diffusion before the
+    front forms and leave empty resection cavities; the three empty
+    cavities of the 2026-09-12 sweep sat at s = 2.04-2.09), and the
+    design step then warns with a message naming both numbers (since
+    2026-09-15; it refused the space before) and counts the empty
+    cavities in qoi_summary.json. Its extras
     are seed_enhancing_radius_mm and the diagnostic s = seed_sigma_mm /
     front_width_mm (NaN without a growth group); spec.json records the
     implied range of s, [sigma_min / lambda_max, sigma_max / lambda_min],
@@ -502,6 +504,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -1211,11 +1214,11 @@ def _validate_seed_sigma_group(
     the peak range lies above the resolved gaussian_seed_floor (else a
     seed would be erased) and at most at 1 (else clipped), the width
     range is positive, gaussian_seed_scale is 1 (else sigma would not be
-    in mm), and, when the growth group is present, the width floor is at
-    least SEED_MIN_RELATIVE_WIDTH times the front width cap, so that
-    s = sigma / lambda >= SEED_MIN_RELATIVE_WIDTH holds for every row by
-    construction (a narrower seed is flattened by diffusion and leaves an
-    empty cavity).
+    in mm), and, when the growth group is present, a warning (not an
+    error) when the width floor is below SEED_MIN_RELATIVE_WIDTH times
+    the front width cap, i.e. when s = sigma / lambda can fall below
+    SEED_MIN_RELATIVE_WIDTH for some rows (a narrower seed is flattened by
+    diffusion and leaves an empty cavity, a logged outcome).
 
     Args:
         factors: The group's factors.
@@ -1251,11 +1254,12 @@ def _validate_seed_sigma_group(
     ratio: dict[str, Any] = {}
     if width is not None:
         if sigma.low < SEED_MIN_RELATIVE_WIDTH * width.high:
-            raise ValueError(
+            warnings.warn(
                 f"{SEED_SIGMA_FACTOR}: min {sigma.low:g} mm is below {SEED_MIN_RELATIVE_WIDTH:g} x the "
                 f"{GROWTH_WIDTH_FACTOR} max {width.high:g} mm ({SEED_MIN_RELATIVE_WIDTH * width.high:g} mm): seeds "
                 f"narrower than about {SEED_MIN_RELATIVE_WIDTH:g} front widths are flattened by diffusion before the "
-                "front forms and leave empty resection cavities; raise the seed width floor or lower the front width cap."
+                "front forms and leave empty resection cavities; raise the seed width floor or lower the front width cap.",
+                stacklevel=2,
             )
         ratio = {
             f"{SEED_RATIO_COLUMN}_range": [sigma.low / width.high, sigma.high / width.low],

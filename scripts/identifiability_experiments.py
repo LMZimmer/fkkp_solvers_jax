@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Three identifiability experiments on the pre-resection growth time of
+"""Four identifiability experiments on the pre-resection growth time of
 the Stupp-protocol forward model, fisher_kpp_jax.StuppFKPPSolver, on
 atlas tissue maps.
 
@@ -31,13 +31,17 @@ reproduce the state the truth reaches at T_r, and how the treated frames
 of that substitute then differ from the truth's: the linear composition
 rule says it can when the growth is still linear (the seed grown for
 T_r - T_0 days is again a Gaussian), the logistic saturation and the
-tissue boundaries say it cannot for old tumors.
+tissue boundaries say it cannot for old tumors. Experiment 3 is its
+mirror: the seed is held at the base config's and the growth time is
+fitted, so that the fitted T_r says what age a standard seed needs to
+reach the truth's pre-operative state, and the treated frames say what
+that wrong age costs.
 
 Conventions. A subcommand solves in one Python process (the jitted
 time scan is cached across solves of the same step count) at precision
 f64; ``--gpus`` names the CUDA devices like the sensitivity script's
 slots ('' the CPU): with one device the subcommand solves in this
-process, with several the fisher and substitute subcommands dispatch
+process, with several the fisher, substitute and seedfix subcommands dispatch
 one worker process per device (see Devices below). The parameters of the growth band are the front speed
 v = front_speed_mm_per_day and the front width lambda = front_width_mm;
 D = v lambda / 2 and rho = v / (2 lambda) follow from the script's growth
@@ -88,8 +92,9 @@ NIfTI rounded for storage (``round_field``: 7 mantissa bits, values
 below 1e-10 zeroed) with the atlas affine; every Jacobian, objective and
 metric is computed from the unrounded fields in memory. Runs are
 resumable: a patient whose result JSON exists (runs/fisher/<patient>/
-fisher.json, runs/substitute/<patient>/substitute.json; within
-experiment 2 also a (T_0, objective) whose row.json exists), an
+fisher.json, runs/substitute/<patient>/substitute.json,
+runs/seedfix/<patient>/seedfix.json; within experiments 2 and 3 also
+a (T_0, objective) or objective whose row.json exists), an
 invariance experiment whose invariance.json exists, are skipped, and the
 CSVs and figures are assembled from every record present. Nothing is
 written outside <output-dir>/<name>/.
@@ -118,6 +123,7 @@ resection_time + offset + 1, so it receives moment - 1).
          day of it)
   d180   the moment resection_time + 180, the horizon of experiment 2
 Experiment 1 records pre, d34, d55, d80, d120; experiment 2 also d180.
+Experiment 3 records the six frames of experiment 2.
 Each frame is saved as <name>_cell_density.nii.gz and frames.json holds
 the requested and the recorded days.
 
@@ -445,16 +451,68 @@ frames, and compared with the truth's frames by ``compare_fields``.
                    substitute.json
   substitute_summary.json   the assembly record, as fisher_summary.json
 
+Subcommand seedfix (experiment 3). The mirror of experiment 2: the seed
+is held at the base config's (gaussian_seed_mass and
+gaussian_seed_diffusion_time of the design's base_config.json, as
+(peak, sigma) through the script's seed derivation, ``base_seed``;
+recorded per row as seed_peak and seed_sigma_mm) and the growth time is
+fitted instead. Per patient (``seedfix_patient``): the truth as in
+experiment 2 (runs/substitute/<patient>/truth is read back when it
+holds the six frames, ``load_truth_run``, its stored fields being the
+float32 ones rounded for storage; otherwise the truth is solved into
+runs/seedfix/<patient>/truth) and the observation region of its six
+frames; then per objective A and B, with v, lambda and the seed voxel at
+the truth, log T_r is fitted on [log 5, log 600] (--tr-bounds, days) by
+scipy's bounded Brent search (minimize_scalar; at most --maxfev
+evaluations, xatol 1e-3 in log T_r; the search starts from the
+bracket's golden-section point, never from the truth's T_r) so that the
+growth-only field at T_r from the fixed seed (FKPPSolver at 12
+steps/day, the solve path of ``fit_seed``: n_steps = ceil(12 T_r), so
+every evaluation has its own step count and compiles its own scan)
+matches the truth's density at resection on the region's voxels
+(``fit_growth_time``); the best evaluation is the fitted T_r. The
+treated stage is then run from the fixed seed with resection_time the
+fitted T_r, the truth's cavity, dose, alpha and k_ct, the schedule
+truncated to 180 days and shifted for the fitted T_r (``patient_config``,
+as experiment 2 shifts it for T_0), on its growth stage's grid,
+recording the six frames, and compared with the truth's frames by
+``compare_fields``.
+  seedfix.csv      one row per patient x objective, plus one row per
+                   patient with objective "truth" (the truth against
+                   itself, fitted_T_r = T_r, the truth's own seed):
+                   patient, cell, fitted_T_r, rho_T_r_fitted, rho_T_r,
+                   objective, seed_peak, seed_sigma_mm, n_evaluations,
+                   objective_initial, objective_achieved, growth_n_steps,
+                   dt, wall_time_s (the fit), and <frame>_<metric> for
+                   the six frames
+  seedfix_summary.json   the assembly record (as substitute_summary.json)
+                   with medians: per objective and cell (and "all") the
+                   median over the patients of every d120_ and d180_
+                   metric and of |rho (T_r_fitted - T_r)|
+                   (abs_rho_T_r_error)
+  figures/seedfix_<frame>_objective_<A|B>.{png,pdf}   for d120 and d180:
+                   every comparison metric against rho T_r of the truth
+                   (log axis), one marker per patient coloured by cell
+  runs/seedfix/<patient>/   truth/ (unless experiment 2's is reused),
+                   observation.json, <objective>/ (fit.json: fitted_T_r,
+                   rho_T_r_fitted, rho_T_r_truth, objective_initial,
+                   objective_achieved, n_evaluations, the bounds, the
+                   seed, the stepping and the history; row.json; run/
+                   with the treated run), seedfix.json (the record with
+                   wall_time_s, the resume marker; an objective whose
+                   row.json exists is reused)
+
 Subcommand all runs design (skipped when spec.json exists), invariance,
-fisher and substitute in order. --patients restricts fisher and
-substitute to ids or ranges (p03, p00-p07, all).
+fisher, substitute and seedfix in order (--maxfev bounds both fits).
+--patients restricts fisher, substitute and seedfix to ids or ranges
+(p03, p00-p07, all).
 
 Devices. --gpus is a comma-separated list of CUDA device ids, '' the
 CPU (the default is the sensitivity script's slots, 1,2,3,6; ','
 names two CPU workers). The invariance experiment runs on one device
 (the first of the list under all; the invariance subcommand refuses
-more). With one device, or one selected patient, fisher and substitute
-solve in this process. With several devices they dispatch
+more). With one device, or one selected patient, fisher, substitute and
+seedfix solve in this process. With several devices they dispatch
 (``dispatch``): the selected patients, in design order, are cut into
 contiguous blocks of sizes differing by at most one, one block per
 device (``patient_blocks``; more devices than patients leave the
@@ -482,9 +540,10 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
   <output-dir>/<name>/
     spec.json, base_config.json, search_space.json, design.csv
     configs/<patient>.json
-    runs/invariance/, runs/fisher/<patient>/, runs/substitute/<patient>/
+    runs/invariance/, runs/fisher/<patient>/, runs/substitute/<patient>/,
+    runs/seedfix/<patient>/
     invariance.csv, fisher.csv, fisher_regions.csv, fisher_fd_check.csv,
-    fisher_runs.csv, substitute.csv
+    fisher_runs.csv, substitute.csv, seedfix.csv
     figures/
 
 Cost (an estimate). The sensitivity script's fit for a two-stage run in
@@ -528,6 +587,7 @@ Run from the project root, e.g. (ID = /mnt/Drive4/lucas/stupp_identifiability):
   python scripts/identifiability_experiments.py invariance --name id_2026-09-13 --gpus 1
   python scripts/identifiability_experiments.py fisher --name id_2026-09-13 --gpus 1,2,3,6
   python scripts/identifiability_experiments.py substitute --name id_2026-09-13 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py seedfix --name id_2026-09-13 --gpus 1,2,3,6
   python scripts/identifiability_experiments.py all --name id_2026-09-13 --gpus 1,2,3,6
   python scripts/identifiability_experiments.py all --smoke --output-dir runs/ --name smoke
 Every subcommand but design needs the design directory; the CSVs and
@@ -572,7 +632,7 @@ import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from numpy.typing import NDArray  # noqa: E402
 from scipy.ndimage import binary_erosion, distance_transform_edt, gaussian_filter, map_coordinates  # noqa: E402
-from scipy.optimize import minimize  # noqa: E402
+from scipy.optimize import minimize, minimize_scalar  # noqa: E402
 from scipy.special import expit  # noqa: E402
 from scipy.stats import qmc  # noqa: E402
 
@@ -605,7 +665,7 @@ sa = load_sensitivity_analysis()
 
 # --- settings ---
 
-EXPERIMENTS: tuple[str, ...] = ("design", "invariance", "fisher", "substitute")
+EXPERIMENTS: tuple[str, ...] = ("design", "invariance", "fisher", "substitute", "seedfix")
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_identifiability")
 DEFAULT_GPUS: str = str(sa.DEFAULT_GPUS)  # the sensitivity script's slots, "1,2,3,6"
 # The seed voxel of every patient: right-hemisphere deep white matter on
@@ -733,6 +793,10 @@ NELDER_MEAD_XATOL = 1e-3
 NELDER_MEAD_FATOL = 1e-6
 OBJECTIVES: tuple[str, ...] = ("A", "B")
 LOG_EPS = 1e-6  # log(u + LOG_EPS) in the log metrics and objective A
+
+# Experiment 3.
+TR_BOUNDS: tuple[float, float] = (5.0, 600.0)  # the fitted growth time's range in days (--tr-bounds)
+SCALAR_XATOL = 1e-3  # the bounded search's tolerance in log T_r
 
 # Metrics (``compare_fields``).
 METRIC_NAMES: list[str] = [
@@ -2467,6 +2531,272 @@ def substitute_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: 
     return record
 
 
+# --- fixed-seed substitution (experiment 3) ---
+
+
+def base_seed(cohort: Cohort) -> tuple[float, float]:
+    """The base config's seed as (peak density, sigma in mm): the
+    gaussian_seed_mass and gaussian_seed_diffusion_time of the design's
+    base_config.json through the script's seed derivation."""
+    tau = float(cohort.base["gaussian_seed_diffusion_time"])
+    return float(sa.seed_peak_density(float(cohort.base["gaussian_seed_mass"]), tau)), float(np.sqrt(2.0 * tau))
+
+
+def load_truth_run(cohort: Cohort, patient: Patient, horizon: float, frames: Sequence[str], run_dir: Path) -> TruthRun | None:
+    """
+    A truth written by ``truth_run`` read back from run_dir: the maps
+    (resection_cavity.nii.gz as the boolean mask, rt_dose.nii.gz,
+    treatment.json), the density at resection
+    (pre_resection_cell_density.nii.gz), the frames
+    (<frame>_cell_density.nii.gz) and the stepping (frames.json,
+    result.json). The fields are the stored ones, float32 rounded for
+    storage (``round_field``), not the unrounded fields ``truth_run``
+    keeps in memory. None when the directory lacks frames.json,
+    result.json or one of the frames.
+    """
+    frames_path, result_path = run_dir / FRAMES_FILE, run_dir / "result.json"
+    if not (frames_path.is_file() and result_path.is_file()):
+        return None
+    frames_record = sa.read_json(frames_path)
+    recorded = frames_record["frames"]
+    if any(name not in recorded or not (run_dir / recorded[name]["file"]).is_file() for name in frames):
+        return None
+    result = sa.read_json(result_path)
+    cavity_path, dose_path = run_dir / sa.CAVITY_FILE, run_dir / sa.DOSE_FILE
+    cavity = np.asarray(load_image(cavity_path).get_fdata()) == sa.CAVITY_LABEL
+    dose = np.asarray(load_image(dose_path).get_fdata(), dtype=np.float32)
+    maps = TreatmentMaps(cavity=cavity, dose=dose, cavity_path=cavity_path, dose_path=dose_path, record=dict(sa.read_json(run_dir / sa.TREATMENT_FILE)))
+    density = np.asarray(load_image(run_dir / sa.PRE_RESECTION_FILE).get_fdata(), dtype=np.float64)
+    fields = {name: np.asarray(load_image(run_dir / recorded[name]["file"]).get_fdata(), dtype=np.float64) for name in frames}
+    run = RunOutput(
+        run_dir=run_dir,
+        config=dict(sa.read_json(run_dir / "config.json")),
+        frames=fields,
+        days={name: float(recorded[name]["recorded_day"]) for name in frames},
+        n_growth=int(frames_record["n_growth"]),
+        dt=float(frames_record["dt"]),
+        n_steps=int(result["n_steps"]),
+        wall_time_s=float(result["wall_time_s"]),
+    )
+    return TruthRun(patient=patient, config=patient_config(cohort, patient, horizon), run=run, maps=maps, density=density)
+
+
+@dataclass
+class TimeFit:
+    """The result of ``fit_growth_time``."""
+
+    objective: str
+    seed_peak: float
+    seed_sigma: float
+    bounds: tuple[float, float]
+    t_r: float
+    rho: float
+    t_r_truth: float
+    n_evaluations: int
+    value_initial: float
+    value: float
+    growth_n_steps: int
+    dt: float
+    history: list[dict[str, float]]
+    wall_time_s: float
+
+    def record(self) -> dict[str, Any]:
+        return {
+            "objective": self.objective,
+            "fitted_T_r": self.t_r,
+            "rho_T_r_fitted": self.rho * self.t_r,
+            "rho_T_r_truth": self.rho * self.t_r_truth,
+            "objective_initial": self.value_initial,
+            "objective_achieved": self.value,
+            "n_evaluations": self.n_evaluations,
+            "T_r_bounds": [self.bounds[0], self.bounds[1]],
+            "seed_peak": self.seed_peak,
+            "seed_sigma_mm": self.seed_sigma,
+            "growth_n_steps": self.growth_n_steps,
+            "dt": self.dt,
+            "wall_time_s": self.wall_time_s,
+            "history": self.history,
+        }
+
+
+def fit_growth_time(
+    cohort: Cohort,
+    patient: Patient,
+    seed_peak: float,
+    seed_sigma: float,
+    reference: NDArray,
+    region: Region,
+    objective: str,
+    maxfev: int,
+    bounds: tuple[float, float] = TR_BOUNDS,
+    horizon: float = SUBSTITUTE_HORIZON,
+) -> TimeFit:
+    """
+    Fit log T_r of a growth-only run from the fixed seed (peak, sigma in
+    mm; the patient's v, lambda, the cohort's seed voxel, the base
+    config's time step: the solve path of ``fit_seed``, one step count
+    per T_r) to the truth's density at resection (reference) on the
+    region's voxels, by the bounded Brent search of
+    scipy.optimize.minimize_scalar on [log lo, log hi] of the bounds in
+    days (at most maxfev evaluations, xatol SCALAR_XATOL in log T_r). The
+    search starts from the bracket's golden-section point, not from the
+    truth's T_r. The best evaluation is the fitted T_r; its step count
+    and dt are the grid of the treated stage run from it.
+    """
+    lo, hi = float(bounds[0]), float(bounds[1])
+    if not 0.0 < lo < hi:
+        raise ValueError(f"the T_r bounds must be 0 < lo < hi days, got {bounds}.")
+    index = tuple(region.voxels.T)
+    reference_values = np.asarray(reference, dtype=np.float64)[index]
+    history: list[dict[str, float]] = []
+
+    def evaluate(x: float) -> float:
+        t_r = float(np.exp(x))
+        candidate = replace(patient, seed_peak=seed_peak, seed_sigma=seed_sigma, resection_time=t_r)
+        result = solve_growth(cohort, growth_config(patient_config(cohort, candidate, horizon)))
+        assert result.n_steps is not None and result.dt is not None
+        value = fit_objective(objective, np.asarray(result.final_state["cell_density"], dtype=np.float64)[index], reference_values)
+        history.append({"T_r": t_r, "value": value, "n_steps": float(result.n_steps), "dt": float(result.dt)})
+        return value
+
+    start = time.perf_counter()
+    optimum = minimize_scalar(evaluate, bounds=(float(np.log(lo)), float(np.log(hi))), method="bounded", options={"maxiter": int(maxfev), "xatol": SCALAR_XATOL})
+    best = min(history, key=lambda h: h["value"])
+    return TimeFit(
+        objective=objective,
+        seed_peak=float(seed_peak),
+        seed_sigma=float(seed_sigma),
+        bounds=(lo, hi),
+        t_r=best["T_r"],
+        rho=patient.rho,
+        t_r_truth=patient.resection_time,
+        n_evaluations=int(optimum.nfev),
+        value_initial=history[0]["value"],
+        value=best["value"],
+        growth_n_steps=int(best["n_steps"]),
+        dt=best["dt"],
+        history=history,
+        wall_time_s=time.perf_counter() - start,
+    )
+
+
+def seedfix_row(cohort: Cohort, patient: Patient, objective: str, fit: TimeFit | None, metrics: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
+    """A seedfix.csv record: the patient, the fitted T_r (the truth's for
+    the "truth" row), rho T_r fitted and true, the seed, the fit and the
+    metrics per frame as <frame>_<metric>."""
+    t_r = fit.t_r if fit is not None else patient.resection_time
+    row: dict[str, Any] = {
+        "patient": patient.id,
+        "cell": patient.cell,
+        "fitted_T_r": float(t_r),
+        "rho_T_r_fitted": patient.rho * float(t_r),
+        "rho_T_r": patient.rho * patient.resection_time,
+        "objective": objective,
+    }
+    if fit is not None:
+        skipped = ("history", "objective", "fitted_T_r", "rho_T_r_fitted", "rho_T_r_truth", "T_r_bounds")
+        row.update({key: value for key, value in fit.record().items() if key not in skipped})
+    else:
+        row.update({"seed_peak": patient.seed_peak, "seed_sigma_mm": patient.seed_sigma})
+    for frame, values in metrics.items():
+        row.update({f"{frame}_{name}": value for name, value in values.items()})
+    return row
+
+
+SEEDFIX_COLUMNS: list[str] = [
+    "patient",
+    "cell",
+    "fitted_T_r",
+    "rho_T_r_fitted",
+    "rho_T_r",
+    "objective",
+    "seed_peak",
+    "seed_sigma_mm",
+    "n_evaluations",
+    "objective_initial",
+    "objective_achieved",
+    "growth_n_steps",
+    "dt",
+    "wall_time_s",
+    *(f"{frame}_{name}" for frame in SUBSTITUTE_FRAMES for name in METRIC_NAMES),
+]
+
+
+def seedfix_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: int, tr_bounds: tuple[float, float] = TR_BOUNDS) -> dict[str, Any]:
+    """
+    Experiment 3 for one patient: the truth over SUBSTITUTE_HORIZON with
+    the frames SUBSTITUTE_FRAMES (experiment 2's, runs/substitute/
+    <patient>/truth, read back when complete, ``load_truth_run``; else
+    solved into <patient>/truth), then per objective the fitted growth
+    time of the base config's seed (``fit_growth_time``;
+    <objective>/fit.json), the treated run from that seed with
+    resection_time the fitted T_r, the truth's maps, alpha and k_ct and
+    the schedule shifted for it (<objective>/run/) and the metrics
+    against the truth per frame; an objective whose row.json exists is
+    reused. Writes seedfix.json (the record returned).
+    """
+    patient_dir = out_dir / patient.id
+    start = time.perf_counter()
+    substitute_dir = out_dir.parent / "substitute" / patient.id / "truth"
+    truth = load_truth_run(cohort, patient, SUBSTITUTE_HORIZON, SUBSTITUTE_FRAMES, substitute_dir)
+    reused = truth is not None
+    if truth is None:
+        truth = truth_run(cohort, patient, SUBSTITUTE_HORIZON, SUBSTITUTE_FRAMES, patient_dir / "truth")
+    else:
+        print(f"  {patient.id}: truth read from {substitute_dir}", flush=True)
+    region = observation_region(truth.run.frames, cohort.tissue, cohort.zooms)
+    patient_dir.mkdir(parents=True, exist_ok=True)
+    sa.write_json(patient_dir / "observation.json", {**region.record(), "margin_mm": OBSERVATION_MARGIN_MM})
+    peak, sigma = base_seed(cohort)
+    dose = truth.maps.dose
+    rows: list[dict[str, Any]] = []
+    truth_metrics = {name: compare_to(cohort, truth.run.frames[name], truth.run.frames[name], dose) for name in SUBSTITUTE_FRAMES}
+    rows.append(seedfix_row(cohort, patient, "truth", None, truth_metrics))
+    for objective in OBJECTIVES:
+        fit_dir = patient_dir / objective
+        row_path = fit_dir / "row.json"
+        if row_path.is_file():
+            rows.append(read_record(row_path))
+            print(f"  {patient.id} {objective}: row exists, kept", flush=True)
+            continue
+        fit = fit_growth_time(cohort, patient, peak, sigma, truth.density, region, objective, maxfev, tr_bounds)
+        fit_dir.mkdir(parents=True, exist_ok=True)
+        write_record(fit_dir / "fit.json", fit.record())
+        substitute = replace(patient, seed_peak=peak, seed_sigma=sigma, resection_time=fit.t_r)
+        config = patient_config(cohort, substitute, SUBSTITUTE_HORIZON)
+        run = treated_run(cohort, config, truth.maps, fit.growth_n_steps, fit.dt, SUBSTITUTE_FRAMES, fit_dir / "run")
+        metrics = {name: compare_to(cohort, run.frames[name], truth.run.frames[name], dose) for name in SUBSTITUTE_FRAMES}
+        row = seedfix_row(cohort, patient, objective, fit, metrics)
+        write_record(row_path, row)
+        rows.append(row)
+        print(
+            f"  {patient.id} {objective}: T_r {fit.t_r:.1f} (truth {patient.resection_time:.1f}), rho T_r {patient.rho * fit.t_r:.2f} "
+            f"(truth {patient.rho * patient.resection_time:.2f}), objective {fit.value_initial:.4f} -> {fit.value:.4f} in {fit.n_evaluations} "
+            f"evaluations ({fit.wall_time_s:.0f} s); d120 Dice {metrics['d120']['dice_edema']:.3f}",
+            flush=True,
+        )
+    record = {
+        "patient": patient.id,
+        "cell": patient.cell,
+        "resection_time": patient.resection_time,
+        "rho": patient.rho,
+        "n_growth": truth.n_growth,
+        "dt": truth.dt,
+        "cavity_volume_mm3": truth.maps.record["cavity_volume_mm3"],
+        "dose_volume_mm3": truth.maps.record["dose_volume_mm3"],
+        "truth_dir": str(truth.run.run_dir),
+        "truth_reused": reused,
+        "seed_peak": peak,
+        "seed_sigma_mm": sigma,
+        "T_r_bounds": [float(tr_bounds[0]), float(tr_bounds[1])],
+        "observation": region.record(),
+        "rows": rows,
+        "wall_time_s": time.perf_counter() - start,
+    }
+    write_record(patient_dir / PATIENT_FILE.format(experiment="seedfix"), record)
+    return record
+
+
 # --- invariance (experiment 0) ---
 
 
@@ -2838,6 +3168,92 @@ def substitute_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path, fram
             _save_figure(figure, figure_dir / f"substitute_{frame}_objective_{objective}")
 
 
+def seedfix_medians(rows: Sequence[Mapping[str, Any]], frames: Sequence[str] = ("d120", "d180")) -> dict[str, dict[str, dict[str, Any]]]:
+    """Per objective and cell ("all" for every cell): the patient count,
+    the median over the patients of |rho (T_r_fitted - T_r)|
+    (abs_rho_T_r_error) and of every <frame>_<metric> of the frames
+    (NaN entries left out; None when no value is finite)."""
+    keys = [f"{frame}_{name}" for frame in frames for name in METRIC_NAMES]
+    medians: dict[str, dict[str, dict[str, Any]]] = {}
+    for objective in OBJECTIVES:
+        selected = [row for row in rows if row["objective"] == objective]
+        medians[objective] = {}
+        for cell in (*CELLS, "all"):
+            cell_rows = [row for row in selected if cell == "all" or row["cell"] == cell]
+            if not cell_rows:
+                continue
+            errors = np.array([abs(float(row["rho_T_r_fitted"]) - float(row["rho_T_r"])) for row in cell_rows])
+            entry: dict[str, Any] = {"n_patients": len(cell_rows), "abs_rho_T_r_error": float(np.median(errors))}
+            for key in keys:
+                values = np.array([sa.as_float(row.get(key)) for row in cell_rows], dtype=np.float64)
+                finite = values[np.isfinite(values)]
+                entry[key] = float(np.median(finite)) if finite.size else None
+            medians[objective][cell] = entry
+    return medians
+
+
+def assemble_seedfix(root: Path, dispatch: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """seedfix.csv, its figures and seedfix_summary.json (``write_summary``
+    plus the medians, ``seedfix_medians``) from the patient records
+    present."""
+    rows: list[dict[str, Any]] = []
+    records = patient_records(root, "seedfix")
+    for record in records:
+        rows.extend(record["rows"])
+    sa.write_csv(root / "seedfix.csv", rows, SEEDFIX_COLUMNS)
+    if rows:
+        seedfix_figures(rows, root / "figures")
+    summary = write_summary(root, "seedfix", records, len(rows), dispatch)
+    summary["medians"] = seedfix_medians(rows)
+    write_record(root / "seedfix_summary.json", summary)
+    return rows
+
+
+def seedfix_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path, frames: Sequence[str] = ("d120", "d180")) -> None:
+    """Per frame and objective: every comparison metric against rho T_r
+    of the truth, one marker per patient coloured by cell."""
+    figure_dir.mkdir(exist_ok=True)
+    for frame in frames:
+        for objective in OBJECTIVES:
+            selected = [row for row in rows if row["objective"] == objective]
+            if not selected:
+                continue
+            names = [name for name in PLOTTED_METRICS if not name.startswith("ref_")]
+            n_cols = 4
+            n_rows = int(np.ceil(len(names) / n_cols))
+            figure, axes = plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 2.6 * n_rows), squeeze=False)
+            ages = np.array([float(row["rho_T_r"]) for row in selected])
+            for axis, name in zip(axes.flat, names):
+                key = f"{frame}_{name}"
+                for cell, color in COLOR_CELLS.items():
+                    cell_rows = [row for row in selected if row["cell"] == cell]
+                    if not cell_rows:
+                        continue
+                    x = np.array([float(row["rho_T_r"]) for row in cell_rows])
+                    y = np.array([sa.as_float(row.get(key)) for row in cell_rows])
+                    finite = np.isfinite(y)
+                    axis.scatter(x[finite], y[finite], s=16, color=color, alpha=0.7, linewidths=0, label=cell)
+                # Limits by hand: a panel whose values are all NaN (an empty
+                # iso-surface for every patient) has no data to scale.
+                low, high = float(ages.min()) / 1.5, float(ages.max()) * 1.5
+                axis.set_xlim(low, high)
+                axis.set_xscale("log")
+                ticks = [t for t in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50) if low <= t <= high]
+                axis.set_xticks(ticks, [f"{t:g}" for t in ticks])
+                axis.set_xticks([], minor=True)
+                axis.set_xlabel("rho T_r (truth)", fontsize=8)
+                axis.set_title(f"{frame} {name}", fontsize=8)
+                axis.tick_params(labelsize=7)
+                axis.spines[["top", "right"]].set_visible(False)
+            for axis in axes.flat[len(names):]:
+                axis.set_visible(False)
+            handles, labels = axes.flat[0].get_legend_handles_labels()
+            figure.legend(handles, labels, loc="lower right", fontsize=7, frameon=False, ncol=2)
+            figure.suptitle(f"experiment 3, objective {objective}: fixed seed with fitted T_r against truth at {frame}; one marker per patient", fontsize=10)
+            figure.tight_layout()
+            _save_figure(figure, figure_dir / f"seedfix_{frame}_objective_{objective}")
+
+
 # --- commands ---
 
 
@@ -2925,11 +3341,12 @@ def worker_command(root: Path, experiment: str, device: str, patients: Sequence[
         command.append("--smoke")
     if experiment == "fisher" and getattr(args, "draws", None) is not None:
         command += ["--draws", str(args.draws)]
-    if experiment == "substitute":
-        if getattr(args, "maxfev", None) is not None:
-            command += ["--maxfev", str(args.maxfev)]
-        if getattr(args, "t0", None):
-            command += ["--t0", str(args.t0)]
+    if experiment in ("substitute", "seedfix") and getattr(args, "maxfev", None) is not None:
+        command += ["--maxfev", str(args.maxfev)]
+    if experiment == "substitute" and getattr(args, "t0", None):
+        command += ["--t0", str(args.t0)]
+    if experiment == "seedfix" and getattr(args, "tr_bounds", None):
+        command += ["--tr-bounds", str(args.tr_bounds)]
     return command
 
 
@@ -3055,6 +3472,50 @@ def substitute_command(root: Path, args: argparse.Namespace, smoke: bool, device
         assemble_substitute(root)
 
 
+def parse_tr_bounds(text: str | None) -> tuple[float, float]:
+    """--tr-bounds as (lo, hi) days: two comma-separated values with
+    0 < lo < hi; TR_BOUNDS when not given."""
+    if text is None or str(text).strip() == "":
+        return TR_BOUNDS
+    parts = [part.strip() for part in str(text).split(",")]
+    if len(parts) != 2:
+        raise ValueError(f"--tr-bounds: expected lo,hi in days, got {text!r}.")
+    lo, hi = float(parts[0]), float(parts[1])
+    if not 0.0 < lo < hi:
+        raise ValueError(f"--tr-bounds: need 0 < lo < hi, got {text!r}.")
+    return lo, hi
+
+
+def seedfix_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
+    cohort = load_cohort(root)
+    patients = select_patients(cohort, args.patients, smoke)
+    if min(len(devices), len(patients)) > 1:
+        record = dispatch(root, "seedfix", devices, patients, args)
+        assemble_seedfix(root, record)
+        check_dispatch(record)
+        return
+    maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else MAXFEV)
+    tr_bounds = parse_tr_bounds(getattr(args, "tr_bounds", None))
+    peak, sigma = base_seed(cohort)
+    out_dir = root / "runs" / "seedfix"
+    start = time.perf_counter()
+    for index, patient in enumerate(patients):
+        marker = out_dir / patient.id / PATIENT_FILE.format(experiment="seedfix")
+        if marker.is_file():
+            print(f"seedfix {patient.id}: {marker} exists, skipped", flush=True)
+            continue
+        print(
+            f"seedfix {patient.id} ({patient.cell}): T_r {patient.resection_time:.1f}, rho T_r {patient.rho * patient.resection_time:.2f}, "
+            f"seed peak {peak:.3f} sigma {sigma:.2f} mm, T_r in [{tr_bounds[0]:g}, {tr_bounds[1]:g}], maxfev {maxfev}",
+            flush=True,
+        )
+        record = seedfix_patient(cohort, patient, out_dir, maxfev, tr_bounds)
+        print(f"seedfix {patient.id}: {record['wall_time_s'] / 60:.1f} min ({index + 1} done)", flush=True)
+    print(f"seedfix: {(time.perf_counter() - start) / 60:.1f} min", flush=True)
+    if not getattr(args, "no_assemble", False):
+        assemble_seedfix(root)
+
+
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="parent of the design directory")
     parser.add_argument("--name", required=True, help="design directory name")
@@ -3113,6 +3574,12 @@ def _add_substitute_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--t0", default=None, help=f"comma-separated T_0 values in days; default {','.join(f'{v:g}' for v in SUBSTITUTE_T0)}")
 
 
+def _add_seedfix_args(parser: argparse.ArgumentParser, maxfev: bool = True) -> None:
+    if maxfev:
+        parser.add_argument("--maxfev", type=int, default=None, help=f"bounded-search evaluations per fit (default {MAXFEV}, {SMOKE.maxfev} with --smoke)")
+    parser.add_argument("--tr-bounds", default=None, help=f"the fitted growth time's range lo,hi in days; default {TR_BOUNDS[0]:g},{TR_BOUNDS[1]:g}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3135,7 +3602,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_patient_args(substitute)
     _add_substitute_args(substitute)
     _add_worker_arg(substitute)
-    everything = commands.add_parser("all", help="design, invariance, fisher and substitute in order")
+    seedfix = commands.add_parser("seedfix", help="experiment 3")
+    _add_common_args(seedfix)
+    _add_device_arg(seedfix)
+    _add_patient_args(seedfix)
+    _add_seedfix_args(seedfix)
+    _add_worker_arg(seedfix)
+    everything = commands.add_parser("all", help="design, invariance, fisher, substitute and seedfix in order")
     _add_common_args(everything)
     _add_device_arg(everything)
     _add_design_args(everything)
@@ -3143,6 +3616,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_patient_args(everything)
     _add_fisher_args(everything)
     _add_substitute_args(everything)
+    _add_seedfix_args(everything, maxfev=False)
     return parser
 
 
@@ -3171,6 +3645,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         fisher_command(root, args, smoke, devices)
     if args.command in ("substitute", "all"):
         substitute_command(root, args, smoke, devices)
+    if args.command in ("seedfix", "all"):
+        seedfix_command(root, args, smoke, devices)
     return 0
 
 
