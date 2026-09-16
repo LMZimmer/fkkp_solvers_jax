@@ -491,7 +491,7 @@ def test_shared_ranges_equal_sigma_v2():
     space, _ = psa.read_patient_search_space(SEARCH_SPACE_V1, "sampled")
     assert space.factors["front_width_mm"].high == 4.0 and space.factors["seed_sigma_mm"].low == 5.0
     assert space.factors["chemo_kill_rate"].low == 1e-3 and space.factors["chemo_kill_rate"].high == 3.5e-2
-    assert space.factors["rt_alpha"].low == 5e-3
+    assert space.factors["rt_alpha"].low == 1e-3 and space.factors["rt_alpha"].high == 0.2
 
 
 def _flat_entries(path: Path) -> dict[str, object]:

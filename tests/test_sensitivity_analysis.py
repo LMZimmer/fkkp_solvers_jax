@@ -620,8 +620,9 @@ def test_load_sigma_search_space():
     (the 12 of stupp_fkpp_search_space.json with seed_relative_width
     replaced by seed_sigma_mm), seed_sigma_mm log-scaled 6-20 mm and
     front_width_mm 1-3 mm, the same
-    overrides and the same other entries as stupp_fkpp_search_space.json,
-    the seed group matched to the sigma derivation; the growth group
+    overrides and the same other entries as stupp_fkpp_search_space.json
+    except rt_alpha (0.01-0.2 here, 0.001-0.2 there), the seed group
+    matched to the sigma derivation; the growth group
     implies D in [0.015, 0.375] and rho in [0.005, 0.125], the seed
     group passes the guard at equality with s in [2, 20], and the base
     config lies inside the ranges."""
@@ -643,8 +644,10 @@ def test_load_sigma_search_space():
     assert shipped["seed"] == SIGMA_SEED_GROUP and shipped["growth"] == SIGMA_GROWTH_GROUP
     assert [key for key in shipped if not key.startswith("_")] == [key for key in old if not key.startswith("_")]
     for key in old:
-        if not key.startswith("_") and key not in ("growth", "seed"):
+        if not key.startswith("_") and key not in ("growth", "seed", "rt_alpha"):
             assert shipped[key] == old[key], key
+    assert shipped["rt_alpha"] == {"min": 0.01, "max": 0.2, "scale": "log"}
+    assert old["rt_alpha"] == {"min": 0.001, "max": 0.2, "scale": "log"}
     for key in ("_note", "_growth_band", "_seed_band", "_scales", "_units", "_sources", "_chemo", "_horizon"):
         assert key in shipped
     assert "2026-09-13" in shipped["_seed_band"] and "seed_relative_width" not in shipped["_units"]
@@ -669,7 +672,7 @@ def test_load_sigma_search_space():
 def test_design_of_sigma_v2_search_space(phantom_base):
     """The third sigma search space (2026-09-15) differs from
     stupp_fkpp_sigma_search_space.json only in chemo_kill_rate 1e-3-3.5e-2,
-    rt_alpha 0.005-0.2, front_width_mm 1-4 mm and seed_sigma_mm 5-16 mm
+    rt_alpha 0.001-0.2, front_width_mm 1-4 mm and seed_sigma_mm 5-16 mm
     (scales kept); its seed floor lies below 2 x the front width cap, so
     the design step warns instead of refusing it and writes the design
     with s in [1.25, 16] (s_min 2 kept in the record), D in [0.015, 0.5]
@@ -677,7 +680,7 @@ def test_design_of_sigma_v2_search_space(phantom_base):
     v2, v1 = json.loads(SIGMA_V2_SEARCH_SPACE.read_text()), json.loads(SIGMA_SEARCH_SPACE.read_text())
     assert [key for key in v2 if not key.startswith("_")] == [key for key in v1 if not key.startswith("_")]
     assert v2["chemo_kill_rate"] == {"min": 1.0e-3, "max": 3.5e-2, "scale": "log"}
-    assert v2["rt_alpha"] == {"min": 0.005, "max": 0.2, "scale": "log"}
+    assert v2["rt_alpha"] == {"min": 0.001, "max": 0.2, "scale": "log"}
     assert v2["growth"] == {**SIGMA_GROWTH_GROUP, "front_width_mm": {"min": 1.0, "max": 4.0, "scale": "log"}}
     assert v2["seed"] == {**SIGMA_SEED_GROUP, "seed_sigma_mm": {"min": 5.0, "max": 16.0, "scale": "log"}}
     for key in v1:
