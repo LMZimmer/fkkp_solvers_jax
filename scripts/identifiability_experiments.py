@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-"""Four identifiability experiments on the pre-resection growth time of
+"""Five identifiability experiments on the pre-resection growth time of
 the Stupp-protocol forward model, fisher_kpp_jax.StuppFKPPSolver, on
-atlas tissue maps.
+atlas tissue maps, over a cohort of formed-front, patient-sized tumours
+grown from small seeds.
 
 Background. The plain Fisher-KPP model du/dt = D lap u + rho u (1 - u)
 maps the parameters (D, rho, T) to the same field as (lambda D,
@@ -26,23 +27,28 @@ seed's peak and width) cannot reproduce: the Fisher information of the
 observations with a noise model of threshold and registration
 uncertainty, its weakest direction and the Cramer-Rao error of log T_r
 per set of observed days. Experiment 2 asks, globally, whether a seed of
-a different mass and width grown for a fixed, wrong time T_0 can
-reproduce the state the truth reaches at T_r, and how the treated frames
-of that substitute then differ from the truth's: the linear composition
-rule says it can when the growth is still linear (the seed grown for
-T_r - T_0 days is again a Gaussian), the logistic saturation and the
-tissue boundaries say it cannot for old tumors. Experiment 3 is its
-mirror: the seed is held at the base config's and the growth time is
-fitted, so that the fitted T_r says what age a standard seed needs to
-reach the truth's pre-operative state, and the treated frames say what
-that wrong age costs.
+a different mass and width grown for a wrong time T_0 = T_r - delta_a /
+rho (a deficit of delta_a e-folds against the truth's age a = rho T_r)
+can reproduce the state the truth reaches at T_r, and how the treated
+frames of that substitute then differ from the truth's: the linear
+composition rule says it can when the growth is still linear (the seed
+grown for T_r - T_0 days is again a Gaussian), the logistic saturation
+and the tissue boundaries say it cannot for old tumors. Experiment 3 is
+its mirror: the seed is held at a small standard seed and the growth
+time is fitted, with the front width at the truth's or fitted along, so
+that the fitted T_r says what age a standard seed needs to reach the
+truth's pre-operative state, and the treated frames say what that wrong
+age costs. Experiment 4 profiles that fit over the standard seed's
+width.
 
 Conventions. A subcommand solves in one Python process (the jitted
 time scan is cached across solves of the same step count) at precision
 f64; ``--gpus`` names the CUDA devices like the sensitivity script's
 slots ('' the CPU): with one device the subcommand solves in this
-process, with several the fisher, substitute and seedfix subcommands dispatch
-one worker process per device (see Devices below). The parameters of the growth band are the front speed
+process, with several the fisher, substitute, seedfix and profile
+subcommands dispatch one worker process per device (see Devices below);
+the design and the invariance take one device. The parameters of the
+growth band are the front speed
 v = front_speed_mm_per_day and the front width lambda = front_width_mm;
 D = v lambda / 2 and rho = v / (2 lambda) follow from the script's growth
 derivation (``growth_parameters``). The fit and the derivatives are in
@@ -93,11 +99,13 @@ below 1e-10 zeroed) with the atlas affine; every Jacobian, objective and
 metric is computed from the unrounded fields in memory. Runs are
 resumable: a patient whose result JSON exists (runs/fisher/<patient>/
 fisher.json, runs/substitute/<patient>/substitute.json,
-runs/seedfix/<patient>/seedfix.json; within experiments 2 and 3 also
-a (T_0, objective) or objective whose row.json exists), an
-invariance experiment whose invariance.json exists, are skipped, and the
-CSVs and figures are assembled from every record present. Nothing is
-written outside <output-dir>/<name>/.
+runs/seedfix/<patient>/seedfix.json, runs/profile/<patient>/
+profile.json; within experiments 2-4 also a T_0, lambda mode or sigma_0
+whose row.json exists), an invariance experiment whose invariance.json
+exists, are skipped, and the CSVs and figures are assembled from every
+record present; the design's size screening resumes from its screen/
+records (a design directory holding spec.json is never overwritten).
+Nothing is written outside <output-dir>/<name>/.
 
 Frames. A treated run records the state at named moments after the
 resection (FRAME_MOMENTS; ``frame_days``): each frame is the state after
@@ -123,11 +131,11 @@ resection_time + offset + 1, so it receives moment - 1).
          day of it)
   d180   the moment resection_time + 180, the horizon of experiment 2
 Experiment 1 records pre, d34, d55, d80, d120; experiment 2 also d180.
-Experiment 3 records the six frames of experiment 2.
+Experiments 3 and 4 record the six frames of experiment 2.
 Each frame is saved as <name>_cell_density.nii.gz and frames.json holds
 the requested and the recorded days.
 
-Metrics (``compare_fields``, one function for the three experiments),
+Metrics (``compare_fields``, one function for every experiment),
 between a field u and a reference u* on the tissue mask (wm + gm >=
 min_tissue_fraction), with dV the voxel volume:
   dice_core, dice_edema        Dice of {u >= 0.6} and of {u >= 0.3}
@@ -148,8 +156,18 @@ min_tissue_fraction), with dV the voxel volume:
   mass                         dV sum u (the total mass of u)
   mass_out_of_field            dV sum u over the voxels where the dose
                                map is zero (the out-of-field tail)
-  ref_mass, ref_mass_out_of_field
-                               the same two of u*
+  mass_beyond_edema            dV sum u over the tissue voxels where
+                               u* < 0.3 (the mass outside the
+                               reference's edema)
+  ref_mass, ref_mass_out_of_field, ref_mass_beyond_edema
+                               the same three of u*
+  mass_rel, mass_out_of_field_rel, mass_beyond_edema_rel
+                               <name> / ref_<name> - 1 (NaN for a zero
+                               reference)
+  log_vol_ratio_core, log_vol_ratio_edema
+                               log10(V + dV) - log10(V* + dV) of the
+                               volumes of {u >= 0.6} / {u >= 0.3} and of
+                               the same sets of u*
   qoi_<name>                   the script's QoIs of u (``compute_qois``:
                                mass, log10_mass, V_core, V_edema,
                                log10_V_core, log10_V_edema, r95_core,
@@ -159,61 +177,101 @@ min_tissue_fraction), with dV the voxel volume:
                                with the cohort's seed voxel and the atlas
                                white-matter map
 
-Subcommand design (the cohort). The sampled factors are those of the
-shipped search space (--search-space, fisher_kpp_jax/search_spaces/
-stupp_fkpp_search_space.json) that vary here: the growth group
-(front_speed_mm_per_day 0.03-0.25 mm/day, front_width_mm 1-5 mm, both
-log-uniform), resection_time (30-200 days), chemo_kill_rate
-(5e-4-1e-2 /day per mg/m^2, log), rt_alpha (0.01-0.2 /Gy, log) and the
-seed group (seed_peak_density 0.6-1, seed_relative_width 2-4 log, the
-width sigma = seed_relative_width front_width_mm in mm); diffusivity_ratio,
-rt_alpha_beta_ratio and chemo_decay_rate are fixed at the base config
-(10, 8 Gy, 9.24 /day) and the seed position is the fixed voxel. A
+Subcommand design (the cohort). The search space is the script's
+(--search-space, fisher_kpp_jax/search_spaces/
+stupp_identifiability_search_space.json): the growth group
+(front_speed_mm_per_day 0.03-0.25 mm/day and front_width_mm 1-8 mm,
+both log-uniform), the seed group (seed_peak_density 0.6-1 uniform,
+seed_sigma_mm 1-5 mm log-uniform: the width in mm, independent of the
+front width), chemo_kill_rate (5e-5-1e-2 /day per mg/m^2, log), rt_alpha
+(5e-4-0.1 /Gy, log), the fixed overrides chemo_decay_rate 9.24 /day,
+rt_alpha_beta_ratio 8 Gy and diffusivity_ratio 10 (written into the base
+config) and the script factor growth_efolds (1-12, log-uniform), the age
+a = rho T_r: an entry carrying "script": true is a factor of this script
+and not a solver parameter, so ``load_script_search_space`` strips it
+before the sensitivity script's loader sees the file and spec.json
+records it (script_factors). The seed position is the fixed voxel. A
 scrambled Sobol' sequence (scipy.stats.qmc.Sobol, seed --design-seed,
-default 1) gives 2 ** --log2-candidates points (default 1024) on the unit
-cube of the seven factors in the search space's order, transformed with
-its ranges (``transform_factor``) and derived with its groups
-(``SearchSpace.derive``: white_matter_diffusivity, rho, gaussian_seed_mass,
-gaussian_seed_diffusion_time, seed_sigma_mm, seed_enhancing_radius_mm).
-Per candidate the age rho T_r and the total log kill
+default 1) gives 2 ** --log2-candidates points (default 1024) on the
+unit cube of the seven factors (SAMPLED_FACTORS' order: v, lambda,
+growth_efolds, chemo_kill_rate, rt_alpha, seed_peak_density,
+seed_sigma_mm), transformed with the ranges (``transform_factor``) and
+derived with the groups (``SearchSpace.derive``: white_matter_diffusivity,
+rho, gaussian_seed_mass, gaussian_seed_diffusion_time,
+seed_enhancing_radius_mm, s = sigma / lambda); resection_time =
+growth_efolds / rho, and a candidate with resection_time below 5 days or
+above --tr-max (default 1000) is rejected and counted. Per candidate the
+total log kill of the 120-day schedule
   Lambda = n d alpha (1 + d / (alpha/beta)) + k_ct D_tot / gamma
          = 60 alpha (1 + 2 / 8) + k_ct 4900 / 9.24
 with n = 30 fractions of d = 2 Gy, D_tot the chemotherapy dose within the
 120-day horizon of experiment 1 (4 900 mg/m^2: 42 x 75 + 5 x 150 +
-5 x 200) and gamma = chemo_decay_rate, and the first 8 candidates (in
-sequence order) of each of the four cells
-  young_weak    rho T_r < 2, Lambda < 4
-  young_strong  rho T_r < 2, Lambda >= 4
-  old_weak      rho T_r >= 2, Lambda < 4
-  old_strong    rho T_r >= 2, Lambda >= 4
-are kept: 32 patients p00-p31 in that cell order (with the default seed
-each cell has 150-400 candidates among the 1024 points). The first
-patient of each cell is flagged for the finite-difference check of
-experiment 1 (fd_check).
+5 x 200) and gamma = chemo_decay_rate, and the visibility margin
+120 rho - Lambda (the e-folds the untreated regrowth gains on the log
+kill by day 120; its sign says whether the truth regrows past the
+treatment by then). The cells (``cell_of``):
+  compact_visible     front_width_mm <= 2 mm, visibility_margin >= 0
+  compact_invisible   front_width_mm <= 2 mm, visibility_margin < 0
+  broad_visible       front_width_mm > 2 mm,  visibility_margin >= 0
+  broad_invisible     front_width_mm > 2 mm,  visibility_margin < 0
+Size screening (``screen_cohort``): per cell the admissible candidates
+are taken in sequence order and each one gets a growth-only solve (the
+truth's growth path, ``solve_growth`` at the base time step) to its
+resection_time; from its density on the 1 mm grid (the solver upsamples
+a coarser grid) the equivalent-sphere radii r_core_mm of {u >= 0.6} and
+r_whole_mm of {u >= 0.3} on the tissue mask ((3 V / 4 pi)^(1/3)) and the
+volume ratio whole / core (``size_screen``); a candidate is accepted
+when r_core_mm lies in --r-core-band, r_whole_mm in --r-whole-band and
+the ratio in --ratio-band ("lo,hi"; the defaults 5,25 / 10,35 / 1.2,8
+are provisional), one with an empty core is rejected, and a solve that
+fails rejects the candidate (counted; three failures in a row stop the
+design). The screening runs on one device (--gpus, '' the CPU), is
+resumable (screen/c<candidate>/screen.json holds the candidate's
+factors, sizes and wall time; a record of another candidate under the
+same index, i.e. another seed or search space, is refused) and stops
+when every cell holds 8 patients (PATIENTS_PER_CELL); a cell that cannot
+be filled from the points fails the design with the counts. The
+patients are p00-p31 in cell order, the first of each cell flagged for
+the finite-difference check of experiment 1 (fd_check) and the default
+patients of the profile.
   design.csv    patient, cell, candidate (the Sobol' index), u_<factor>
                 for the seven factors, the seven factors
-                (front_speed_mm_per_day, front_width_mm, resection_time,
+                (front_speed_mm_per_day, front_width_mm, growth_efolds,
                 chemo_kill_rate, rt_alpha, seed_peak_density,
-                seed_relative_width), white_matter_diffusivity, rho,
-                gaussian_seed_mass, gaussian_seed_diffusion_time,
-                seed_sigma_mm, seed_enhancing_radius_mm, rho_T_r,
-                log_kill_rt, log_kill_ct, log_kill_total, fd_check
+                seed_sigma_mm), resection_time, white_matter_diffusivity,
+                rho, gaussian_seed_mass, gaussian_seed_diffusion_time,
+                seed_enhancing_radius_mm, s (= sigma / lambda), rho_T_r
+                (= growth_efolds), ell_mm (= v resection_time),
+                log_kill_rt, log_kill_ct, log_kill_total,
+                visibility_margin, r_core_mm, r_whole_mm,
+                whole_core_ratio, R_over_lambda (= r_whole_mm / lambda),
+                fd_check
   spec.json     the settings: base config and search space paths, the
                 tissue maps, grid shape, precision, gaussian_seed_floor,
                 resolution_factor, smoke and the smoke settings, the
-                design seed and candidate count, the cells and splits,
-                the factors' ranges, the fixed parameters, the seed
-                voxel (seed_target_voxel and seed_target_source: "default"
-                for DEFAULT_SEED_VOXEL, "base_config_fractions" for the
-                fallback, "argument" for --seed-voxel; the snapped
-                seed_voxel, seed_snap_distance_voxels, seed_fractions,
-                default_seed_voxel), the tissue
-                threshold and seedable count, the time step, the
-                treatment derivation settings, the schedules within both
-                horizons (``truncate_schedule`` records), the log-kill
-                formula and its constants, the frame moments, the CRT
-                snapshot offsets, the horizons and frames per experiment,
-                the lambda set, the experiment 1 and 2 settings
+                design seed and candidate count, patients_per_cell, the
+                cells and their splits (lambda_split_mm,
+                visibility_horizon_days), the sampled and the script
+                factors with their ranges, the fixed overrides and
+                parameters, the seed voxel (seed_target_voxel and
+                seed_target_source: "default" for DEFAULT_SEED_VOXEL,
+                "base_config_fractions" for the fallback, "argument" for
+                --seed-voxel; the snapped seed_voxel,
+                seed_snap_distance_voxels, seed_fractions,
+                default_seed_voxel), the tissue threshold and seedable
+                count, the time step, the treatment derivation settings,
+                the schedules within both horizons (``truncate_schedule``
+                records), the log-kill formula and its constants, the
+                visibility formula, the screening (tr_min, tr_max, the
+                bands, the levels, the device, the counts: candidates,
+                rejections by resection_time, solves, acceptances,
+                failures, and per cell the candidates, the admissible
+                ones, the screened, accepted and failed ones and the
+                rejections by reason; the wall time), the frame moments,
+                the CRT snapshot offsets, the horizons and frames per
+                experiment, the lambda set, the experiment 1-4 settings
+  screen/c<candidate>/screen.json   the screening record of every solved
+                candidate (accepted or not)
   base_config.json, search_space.json
   configs/<patient>.json   the truth config of experiment 1 (120-day
                 horizon, maps null, schedule truncated and shifted)
@@ -406,19 +464,24 @@ schedule truncated to it: 62 sessions, 6 900 mg/m^2, all 30 fractions;
 cycle 4 ends at offset 169, cycle 5 is dropped). Per patient
 (``substitute_patient``): the truth as in experiment 1 with the frames
 pre, d34, d55, d80, d120, d180 and the observation region of its six
-frames; then for T_0 in --t0 (default 30, 60, 100, 150 days) and each
-objective, with v and lambda at the truth, the seed position fixed and
-the floor 0, the seed (logit of the peak on (0.05, 1], log sigma; peak =
-0.05 + 0.95 sigmoid(z)) is fitted by scipy's Nelder-Mead (--maxfev
+frames; then for each deficit delta_a in --delta-a (default -2, -0.5,
+0.5, 2 e-folds) the growth time T_0 = T_r - delta_a / rho (delta_a > 0:
+T_0 earlier than the truth; ``deficit_schedule``), skipped when T_0 lies
+below 5 days or above the design's --tr-max (recorded in substitute.json
+and as a row with NaN metrics), and per objective, with v and lambda at
+the truth, the seed position fixed and the floor 0, the seed (logit of
+the peak on (0.05, 1], log sigma; peak = 0.05 + 0.95 sigmoid(z),
+``bounded_from_unbounded``) is fitted by scipy's Nelder-Mead (--maxfev
 evaluations at most, default 150, 20 with --smoke; the initial simplex
 x0, x0 + (0.5, 0), x0 + (0, 0.2); xatol 1e-3, fatol 1e-6) so that the
 growth-only field at T_0 (FKPPSolver, 12 steps/day) matches the truth's
 density at resection_time on the region's voxels (``fit_seed``):
-  A   the relative L2 of log(u + 1e-6) - log(u* + 1e-6) on the region
   B   1 - the mean over c in {0.6, 0.3} of the soft Dice
       2 sum s s* / (sum s^2 + sum s*^2) of the smoothed indicators
       (1 for identical fields, the Dice for binary ones)
-The initial guess is the linear composition rule (``composition_seed``):
+(``fit_objective`` also knows A, the relative L2 of log(u + 1e-6) -
+log(u* + 1e-6) on the region, which OBJECTIVES does not run). The
+initial guess is the linear composition rule (``composition_seed``):
 m' = m e^{rho (T_r - T_0)}, w' = w + D (T_r - T_0) (a Gaussian seed of
 diffusion time w grown for T_r - T_0 days by the linearised equation is a
 Gaussian of diffusion time w' with the mass m'), as (peak, sigma) =
@@ -431,96 +494,159 @@ history). The treated stage is then run from it with resection_time T_0,
 the truth's cavity, dose, alpha and k_ct, the schedule truncated to 180
 days and shifted for T_0, on its growth stage's grid, recording the six
 frames, and compared with the truth's frames by ``compare_fields``.
-  substitute.csv   one row per patient x T_0 x objective, plus one row
-                   per patient with objective "truth" (T_0 = T_r, the
-                   truth against itself, for the reference masses):
-                   patient, cell, T_0, rho_T_0, rho_T_r, objective,
-                   rule_peak, rule_sigma_mm, initial_peak,
-                   initial_sigma_mm, initial_from_rule, fitted_peak,
-                   fitted_sigma_mm, n_evaluations, objective_initial,
-                   objective_achieved, growth_n_steps, dt, wall_time_s
-                   (the fit), and <frame>_<metric> for the six frames
-  figures/substitute_<frame>_objective_<A|B>.{png,pdf}   for d120 and
-                   d180: every comparison metric against rho T_0 (log
-                   axis), the (patient, T_0) points coloured by cell and
-                   one line per cell through the cell's median at each
-                   T_0 (at the cell's median rho T_0)
+  substitute.csv   one row per patient x delta_a x objective (a skipped
+                   pair with its reason in skipped and NaN metrics), plus
+                   one row per patient with objective "truth" (delta_a 0,
+                   T_0 = T_r, the truth against itself, for the reference
+                   masses): patient, cell, delta_a, T_0, rho_T_0, rho_T_r,
+                   objective, skipped, rule_peak, rule_sigma_mm,
+                   initial_peak, initial_sigma_mm, initial_from_rule,
+                   fitted_peak, fitted_sigma_mm, n_evaluations,
+                   objective_initial, objective_achieved, growth_n_steps,
+                   dt, wall_time_s (the fit), and <frame>_<metric> for
+                   the six frames
+  figures/substitute_<frame>_objective_B.{png,pdf}   for d120 and d180:
+                   every comparison metric against delta_a (linear
+                   axis), the (patient, delta_a) points coloured by cell
+                   and one line per cell through the cell's median at
+                   each delta_a
   runs/substitute/<patient>/   truth/ (as in experiment 1, six frames),
                    observation.json, T0_<T_0>/<objective>/ (fit.json,
-                   row.json, run/ with the substitute's treated run),
-                   substitute.json
-  substitute_summary.json   the assembly record, as fisher_summary.json
+                   row.json, run/ with the substitute's treated run;
+                   T_0 with one decimal), substitute.json
+  substitute_summary.json   the assembly record (as fisher_summary.json)
+                   with the delta_a values, the skipped pairs and the
+                   medians (``substitute_medians``): per objective and
+                   delta_a, per cell, over all patients and per stratum
+                   R_over_lambda >= 10 / < 10, the row count, the skipped
+                   rows (excluded) and the median of every d120_ and
+                   d180_ metric
 
 Subcommand seedfix (experiment 3). The mirror of experiment 2: the seed
-is held at the solver's class default (GAUSSIAN_SEED_MASS 1500 and
-GAUSSIAN_SEED_DIFFUSION_TIME 15 mm^2 of fisher_kpp_jax.operators, as
-(peak, sigma) = (0.58, 5.48 mm) through the script's seed derivation,
-``base_seed``; not the base config's 0.8 and 6.3 mm; recorded as
-"class default" in spec.json's seedfix entry and in
-seedfix_summary.json, and per row as seed_peak and seed_sigma_mm) and
-the growth time is fitted instead. Per patient (``seedfix_patient``): the truth as in
-experiment 2 (runs/substitute/<patient>/truth is read back when it
-holds the six frames, ``load_truth_run``, its stored fields being the
-float32 ones rounded for storage; otherwise the truth is solved into
+is held at a small standard seed, --seed-peak (default 0.6) and
+--seed-sigma-mm (default 2 mm; SEED_SOURCE "argument", recorded in
+spec.json's seedfix entry with the defaults, in seedfix_summary.json and
+per row as seed_peak and seed_sigma_mm) and the growth time is fitted
+instead. Per patient (``seedfix_patient``): the truth as in experiment 2
+(runs/substitute/<patient>/truth is read back when it holds the six
+frames, ``load_truth_run``, its stored fields being the float32 ones
+rounded for storage; otherwise the truth is solved into
 runs/seedfix/<patient>/truth) and the observation region of its six
-frames; then per objective A and B, with v, lambda and the seed voxel at
-the truth, log T_r is fitted on [log 5, log 600] (--tr-bounds, days) by
-scipy's bounded Brent search (minimize_scalar; at most --maxfev
-evaluations, xatol 1e-3 in log T_r; the search starts from the
-bracket's golden-section point, never from the truth's T_r) so that the
-growth-only field at T_r from the fixed seed (FKPPSolver at 12
-steps/day, the solve path of ``fit_seed``: n_steps = ceil(12 T_r), so
-every evaluation has its own step count and compiles its own scan)
-matches the truth's density at resection on the region's voxels
-(``fit_growth_time``); the best evaluation is the fitted T_r, and
-bound_hit flags a fit whose log T_r lies within 1e-2 of a bound. The
-treated stage is then run from the fixed seed with resection_time the
-fitted T_r, the truth's cavity, dose, alpha and k_ct, the schedule
+frames; then per lambda mode of --lambda-mode (fixed | free | both, the
+default both; the fixed mode runs first), with objective B, the seed
+voxel at the truth and the growth-only solve path of ``fit_seed``
+(FKPPSolver at 12 steps/day, n_steps = ceil(12 T_r), so every evaluation
+has its own step count and compiles its own scan):
+  fixed   with v and lambda at the truth, log T_r is fitted on
+          [log 5, log 3000] (--tr-bounds, days) by scipy's bounded Brent
+          search (minimize_scalar; at most --maxfev evaluations, xatol
+          1e-3 in log T_r; the search starts from the bracket's
+          golden-section point, never from the truth's T_r)
+          (``fit_growth_time``); directory B/
+  free    with v at the truth, (log T_r, log lambda) is fitted by
+          Nelder-Mead (the options of ``fit_seed``: --maxfev evaluations
+          at most, the initial simplex x0, x0 + (0.5, 0), x0 + (0, 0.2),
+          xatol 1e-3, fatol 1e-6) in the unbounded coordinates of
+          ``bounded_from_unbounded``, log T_r on [log 5, log 3000] and
+          log lambda on [log 1, log 8] mm (LAMBDA_BOUNDS), D = v lambda / 2
+          and rho = v / (2 lambda) re-derived from the current lambda at
+          every evaluation; the start is the fixed mode's optimum
+          (T_r*, the truth's lambda) when its fit.json exists in the
+          patient's directory, else the geometric midpoints of both
+          brackets (``fit_growth_time_free``); directory B_free_lambda/
+so that the growth-only field at T_r from the fixed seed matches the
+truth's density at resection on the region's voxels; the best evaluation
+is the fit, and bound_hit flags a fit whose log T_r (or, in the free
+mode, log lambda) lies within 1e-2 of a bound. The treated stage is then
+run from the fixed seed with the fitted lambda's D and rho, resection_time
+the fitted T_r, the truth's cavity, dose, alpha and k_ct, the schedule
 truncated to 180 days and shifted for the fitted T_r (``patient_config``,
 as experiment 2 shifts it for T_0), on its growth stage's grid,
 recording the six frames, and compared with the truth's frames by
 ``compare_fields``.
-  seedfix.csv      one row per patient x objective, plus one row per
-                   patient with objective "truth" (the truth against
-                   itself, fitted_T_r = T_r, the truth's own seed):
-                   patient, cell, fitted_T_r, rho_T_r_fitted, rho_T_r,
-                   objective, seed_peak, seed_sigma_mm, n_evaluations,
-                   objective_initial, objective_achieved, bound_hit,
-                   growth_n_steps, dt, wall_time_s (the fit), and
-                   <frame>_<metric> for the six frames, the metrics
-                   followed by mass_rel = mass / ref_mass - 1 and
-                   mass_out_of_field_rel (NaN for a zero reference)
+  seedfix.csv      one row per patient x lambda mode, plus one row per
+                   patient with lambda_mode and objective "truth" (the
+                   truth against itself, fitted_T_r = T_r, the truth's
+                   own seed and lambda): patient, cell, lambda_mode,
+                   objective, fitted_T_r, fitted_lambda_mm,
+                   lambda_truth_mm, rho_T_r_fitted (with the fitted rho),
+                   rho_T_r, R_over_lambda (the design's), seed_peak,
+                   seed_sigma_mm, n_evaluations, objective_initial,
+                   objective_achieved, bound_hit, growth_n_steps, dt,
+                   wall_time_s (the fit), and <frame>_<metric> for the
+                   six frames
   seedfix_summary.json   the assembly record (as substitute_summary.json)
-                   with the seed's record and medians: per objective and
-                   cell (and "all") the patient count, n_bound_hit and,
-                   over the patients whose fit did not hit a bound, the
-                   median of every d120_ and d180_ metric (the relative
-                   masses included) and of |rho (T_r_fitted - T_r)|
-                   (abs_rho_T_r_error)
-  figures/seedfix_<frame>_objective_<A|B>.{png,pdf}   for d120 and d180:
-                   every comparison metric and, next to the mass pair,
-                   the two relative masses against rho T_r of the truth
-                   (log axis), one marker per patient coloured by cell
+                   with the seed's record, the lambda modes and the
+                   medians (``seedfix_medians``): per lambda mode, per
+                   cell, over all patients and per stratum
+                   R_over_lambda >= 10 / < 10, the patient count,
+                   n_bound_hit and, over the patients whose fit did not
+                   hit a bound, the median of |rho_fitted T_r_fitted -
+                   rho T_r| (abs_rho_T_r_error), of |log(lambda_fitted /
+                   lambda)| (abs_log_lambda_error) and of every d120_ and
+                   d180_ metric
+  figures/seedfix_<frame>_<lambda_mode>.{png,pdf}   for d120 and d180:
+                   every comparison metric against the truth's
+                   R_over_lambda (log axis, a vertical line at 10), one
+                   marker per patient coloured by cell (hollow for a
+                   bound hit)
   runs/seedfix/<patient>/   truth/ (unless experiment 2's is reused),
-                   observation.json, <objective>/ (fit.json: fitted_T_r,
-                   rho_T_r_fitted, rho_T_r_truth, objective_initial,
-                   objective_achieved, n_evaluations, the bounds, the
-                   seed, the stepping and the history; row.json; run/
-                   with the treated run), seedfix.json (the record with
-                   wall_time_s, the resume marker; an objective whose
+                   observation.json, B/ and B_free_lambda/ (fit.json:
+                   the fit's record with the bounds, the start and the
+                   history; row.json; run/ with the treated run),
+                   seedfix.json (the record with wall_time_s, the resume
+                   marker; a mode whose row.json exists is reused)
+
+Subcommand profile (experiment 4). Experiment 3's fixed-lambda fit
+profiled over the width of the standard seed: per patient of --patients
+(default the fd_check patient of each cell, 4 patients) and per sigma_0
+in --sigmas (default 2, 3, 5 mm), with the peak --seed-peak (default
+0.6), the fixed-lambda fit of the growth time (``fit_growth_time``,
+objective B, --tr-bounds, --maxfev), the treated run at the fitted T_r
+with the truth's maps, alpha and k_ct and the six-frame comparison,
+exactly the path of ``seedfix_patient``'s fixed mode
+(``profile_patient``); the truth is read back from runs/substitute/
+<patient>/truth, else runs/seedfix/<patient>/truth, else solved into
+runs/profile/<patient>/truth.
+  profile.csv      one row per patient x sigma_0: patient, cell,
+                   sigma_mm, seed_peak, fitted_T_r, rho_T_r_fitted,
+                   rho_T_r, R_over_lambda, bound_hit, objective_initial,
+                   objective_achieved, n_evaluations, growth_n_steps, dt,
+                   wall_time_s (the fit), and <frame>_<metric> for the
+                   six frames
+  figures/profile_objective.{png,pdf}   objective_achieved against
+                   sigma_0, one line per patient coloured by cell (a
+                   bound hit hollow)
+  figures/profile_d180.{png,pdf}   d180 mass_beyond_edema_rel and
+                   mass_rel against sigma_0, the same way
+  profile_summary.json   the assembly record with the seed peak, the
+                   sigmas and the medians (``profile_medians``): per
+                   sigma_0 and group (cells, all, the R_over_lambda
+                   strata) the patient count, n_bound_hit and, excluding
+                   the bound hits, the medians of fitted_T_r,
+                   rho_T_r_fitted, objective_achieved and the d120_ and
+                   d180_ metrics
+  runs/profile/<patient>/   truth/ (unless reused), observation.json,
+                   sigma_<sigma_0>/ (fit.json, row.json, run/),
+                   profile.json (the resume marker; a sigma_0 whose
                    row.json exists is reused)
 
-Subcommand all runs design (skipped when spec.json exists), invariance,
-fisher, substitute and seedfix in order (--maxfev bounds both fits).
---patients restricts fisher, substitute and seedfix to ids or ranges
-(p03, p00-p07, all).
+Subcommand all runs design (skipped when spec.json exists; on the first
+device of --gpus), then substitute, seedfix and profile in order over
+the devices (--maxfev bounds every fit; --delta-a, --seed-peak,
+--seed-sigma-mm, --lambda-mode, --sigmas, --tr-bounds, --tr-max and the
+band arguments are taken as by the subcommands). --patients restricts
+substitute, seedfix and profile to ids or ranges (p03, p00-p07, all);
+without it the profile takes the fd_check patients. The invariance and
+fisher subcommands run on their own.
 
 Devices. --gpus is a comma-separated list of CUDA device ids, '' the
 CPU (the default is the sensitivity script's slots, 1,2,3,6; ','
-names two CPU workers). The invariance experiment runs on one device
-(the first of the list under all; the invariance subcommand refuses
-more). With one device, or one selected patient, fisher, substitute and
-seedfix solve in this process. With several devices they dispatch
+names two CPU workers). The design's screening and the invariance
+experiment run on one device (the first of the list under all; their
+subcommands refuse more). With one device, or one selected patient,
+fisher, substitute, seedfix and profile solve in this process. With
+several devices they dispatch
 (``dispatch``): the selected patients, in design order, are cut into
 contiguous blocks of sizes differing by at most one, one block per
 device (``patient_blocks``; more devices than patients leave the
@@ -547,56 +673,64 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
 /mnt/Drive4/lucas/stupp_identifiability; --name required):
   <output-dir>/<name>/
     spec.json, base_config.json, search_space.json, design.csv
+    screen/c<candidate>/screen.json
     configs/<patient>.json
     runs/invariance/, runs/fisher/<patient>/, runs/substitute/<patient>/,
-    runs/seedfix/<patient>/
+    runs/seedfix/<patient>/, runs/profile/<patient>/
     invariance.csv, fisher.csv, fisher_regions.csv, fisher_fd_check.csv,
-    fisher_runs.csv, substitute.csv, seedfix.csv
+    fisher_runs.csv, substitute.csv, seedfix.csv, profile.csv
+    <experiment>_summary.json
     figures/
 
 Cost (an estimate). The sensitivity script's fit for a two-stage run in
-its own process is 6.6 s + 1.4 ms per time step on one Quadro RTX 8000
-(2026-09-07). In one process on the same class of card (GPU 2,
-2026-09-13) a growth-only atlas solve took 0.5 s + 1.4 ms per step
-(1 200 steps: 2.2 s) and a treated run recording five frames 3.5 s +
-2.2 ms per step (1 908 steps: 7.7 s; the treatment terms, the six
-frame upsamplings and the maps' downsampling are the extra). A new step
-count compiles the scan again (1-3 s). With T_r the resection time in
-days, a growth stage is 12 T_r steps and a treated run 12 (T_r + 120)
-steps (experiment 1) or 12 (T_r + 180) (experiment 2).
+its own process is 6.6 s + 1.4 ms per time step on one Quadro RTX 8000.
+In one process on the same class of card a growth-only atlas solve takes
+0.5 s + 1.4 ms per step (1 200 steps: 2.2 s) and a treated run recording
+frames 3.5 s + 2.2 ms per step (1 908 steps: 7.7 s; the treatment terms,
+the frame upsamplings and the maps' downsampling are the extra). A new
+step count compiles the scan again (1-3 s). With T_r the resection time
+in days, a growth stage is 12 T_r steps and a treated run 12 (T_r + 120)
+steps (experiment 1) or 12 (T_r + 180) (experiments 2-4).
+  design       one growth-only solve per screened candidate (12 T_r
+               steps, T_r up to --tr-max: 2-20 s each with the
+               recompilation); the number screened depends on the
+               acceptance rate of the bands (a few solves per accepted
+               patient in a cell that fits the bands, tens in one that
+               does not), so tens of minutes to a few hours on one GPU.
   invariance   5 lambdas x (2 growth + 1 treated) solves: 1-2 min.
   fisher       per patient the truth (2 solves), 16 perturbed treated
                runs (10 more for the four fd_check patients), the noise
                (K = 64: about 2 min on the CPU side), the metrics of 80
                (130) frames and the analysis (least squares on 4 million
-               rows): measured 7.9 min for p00 (T_r = 39 days, with the
-               fd check; 204 s of solves, 115 s of noise); at T_r = 200
-               a run is 3 840 steps and 12 s, so 5-12 min per patient,
-               about 4-5 h for the 32 patients on one GPU; about 500 MB
-               per fd_check patient (W.npz 116 MB, 29 run directories of
-               about 12 MB), about 16 GB in total.
-  substitute   per patient the truth and 8 fits of up to 150 growth-only
-               solves of 12 T_0 steps (measured 0.85 s per evaluation at
-               T_0 = 30, 3.1 s at T_0 = 150; a fit that converges earlier
-               stops earlier) plus 8 treated runs: measured 34.7 min for
-               p16 (T_r = 94 days), so about 35 min per patient and
-               about 19 h for the cohort on one GPU; --gpus 1,2,3,6
-               dispatches 8 patients to each of four devices (5 h). About
-               33 MB per patient.
-  --smoke      the whole pipeline on the CPU (K = 8, maxfev 20, 4 mm
-               voxels): measured 30 min on 2026-09-13, the invariance in
-               1 min, the four fisher patients in 15 min (3.4-4.5 min
-               each; the 4 mm solves take 2.6 s, the noise and the
-               metrics on the 1 mm grid the rest), the four substitute
-               patients in 13 min (3.2-3.4 min each); 1.8 GB.
+               rows): 5-12 min per patient, about 4-5 h for the 32
+               patients on one GPU; about 500 MB per fd_check patient
+               (W.npz 116 MB, 29 run directories of about 12 MB), about
+               16 GB in total.
+  substitute   per patient the truth and 4 fits of up to 150 growth-only
+               solves of 12 T_0 steps (0.85 s per evaluation at T_0 = 30
+               days, 3.1 s at 150, about 15 s at 1 000) plus 4 treated
+               runs: 20-60 min per patient depending on T_0, so 10-30 h
+               for the cohort on one GPU; --gpus 1,2,3,6 dispatches 8
+               patients to each of four devices. About 33 MB per patient.
+  seedfix      per patient 2 fits (the fixed mode 10-20 Brent
+               evaluations, the free mode up to 150 Nelder-Mead
+               evaluations, each a growth-only solve with its own step
+               count and compilation, 5-40 s) plus 2 treated runs:
+               10-60 min per patient.
+  profile      per patient 3 fixed-mode fits and 3 treated runs, 4
+               patients: 20-60 min in total.
+  --smoke      the whole pipeline on the CPU (maxfev 20, 4 mm voxels):
+               tens of minutes; the design's screening at 4 mm takes
+               2-5 s per candidate.
 
 Run from the project root, e.g. (ID = /mnt/Drive4/lucas/stupp_identifiability):
-  python scripts/identifiability_experiments.py design --name id_2026-09-13
-  python scripts/identifiability_experiments.py invariance --name id_2026-09-13 --gpus 1
-  python scripts/identifiability_experiments.py fisher --name id_2026-09-13 --gpus 1,2,3,6
-  python scripts/identifiability_experiments.py substitute --name id_2026-09-13 --gpus 1,2,3,6
-  python scripts/identifiability_experiments.py seedfix --name id_2026-09-13 --gpus 1,2,3,6
-  python scripts/identifiability_experiments.py all --name id_2026-09-13 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py design --name id_2026-09-16 --gpus 1
+  python scripts/identifiability_experiments.py substitute --name id_2026-09-16 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py seedfix --name id_2026-09-16 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py profile --name id_2026-09-16 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py invariance --name id_2026-09-16 --gpus 1
+  python scripts/identifiability_experiments.py fisher --name id_2026-09-16 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py all --name id_2026-09-16 --gpus 1,2,3,6
   python scripts/identifiability_experiments.py all --smoke --output-dir runs/ --name smoke
 Every subcommand but design needs the design directory; the CSVs and
 figures are reassembled from the records present at the end of each
@@ -613,7 +747,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -646,7 +780,6 @@ from scipy.stats import qmc  # noqa: E402
 
 from fisher_kpp_jax import SOLVER_KEY, FKPPSolver, Result, StuppFKPPSolver, read_config, write_config  # noqa: E402
 from fisher_kpp_jax.config import jsonable  # noqa: E402
-from fisher_kpp_jax.operators import GAUSSIAN_SEED_DIFFUSION_TIME, GAUSSIAN_SEED_MASS  # noqa: E402
 
 SENSITIVITY_SCRIPT = _ROOT / "scripts" / "sensitivity_analysis.py"
 
@@ -674,8 +807,9 @@ sa = load_sensitivity_analysis()
 
 # --- settings ---
 
-EXPERIMENTS: tuple[str, ...] = ("design", "invariance", "fisher", "substitute", "seedfix")
+EXPERIMENTS: tuple[str, ...] = ("design", "invariance", "fisher", "substitute", "seedfix", "profile")
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_identifiability")
+DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_identifiability_search_space.json"
 DEFAULT_GPUS: str = str(sa.DEFAULT_GPUS)  # the sensitivity script's slots, "1,2,3,6"
 # The seed voxel of every patient: right-hemisphere deep white matter on
 # the atlas, the voxel scripts/run_stupp_synthetic.py uses (snapped to the
@@ -689,48 +823,85 @@ SEED_FLOOR = 0.0  # gaussian_seed_floor of the whole cohort (the base config's 0
 DESIGN_SEED = 1
 DEFAULT_LOG2_CANDIDATES = 10  # 1024 Sobol' points to fill the four cells from
 PATIENTS_PER_CELL = 8
-AGE_SPLIT = 2.0  # rho T_r below / above
-KILL_SPLIT = 4.0  # Lambda below / above
-# The sampled factors of the shipped search space (its order); everything
-# else is fixed: diffusivity_ratio, rt_alpha_beta_ratio and
-# chemo_decay_rate at the base config, the seed position at one voxel.
+# A search-space entry carrying this key with a true value is a factor of
+# this script, not a solver parameter; ``load_script_search_space`` strips
+# it before the shared loader sees the file.
+SCRIPT_FACTOR_KEY = "script"
+GROWTH_EFOLDS_FACTOR = "growth_efolds"  # a = rho T_r; resection_time = growth_efolds / rho
+LAMBDA_SPLIT = 2.0  # front_width_mm at or below / above: compact / broad
+VISIBILITY_HORIZON = 120.0  # days; visibility_margin = VISIBILITY_HORIZON rho - log_kill_total
+TR_MIN = 5.0  # days; a candidate below it is rejected, a substitute T_0 below it skipped
+DEFAULT_TR_MAX = 1000.0  # days; --tr-max, the candidates above it are rejected
+MAX_CONSECUTIVE_SCREEN_FAILURES = 3  # the screening aborts after this many failed solves in a row
+# The sampled factors (the search space's order, growth_efolds after the
+# growth group); everything else is fixed: diffusivity_ratio,
+# rt_alpha_beta_ratio and chemo_decay_rate at the search space's
+# overrides, the seed position at one voxel.
 SAMPLED_FACTORS: tuple[str, ...] = (
     sa.GROWTH_SPEED_FACTOR,
     sa.GROWTH_WIDTH_FACTOR,
-    "resection_time",
+    GROWTH_EFOLDS_FACTOR,
     "chemo_kill_rate",
     "rt_alpha",
     sa.SEED_PEAK_FACTOR,
-    sa.SEED_RELATIVE_WIDTH_FACTOR,
+    sa.SEED_SIGMA_FACTOR,
 )
-FIXED_AT_BASE: tuple[str, ...] = ("diffusivity_ratio", "rt_alpha_beta_ratio", "chemo_decay_rate")
-CELLS: dict[str, tuple[bool, bool]] = {  # cell name -> (old: rho T_r >= AGE_SPLIT, strong: Lambda >= KILL_SPLIT)
-    "young_weak": (False, False),
-    "young_strong": (False, True),
-    "old_weak": (True, False),
-    "old_strong": (True, True),
+FIXED_PARAMETERS: tuple[str, ...] = ("diffusivity_ratio", "rt_alpha_beta_ratio", "chemo_decay_rate")
+CELLS: dict[str, tuple[bool, bool]] = {  # cell name -> (broad: front_width_mm > LAMBDA_SPLIT, visible: visibility_margin >= 0)
+    "compact_visible": (False, True),
+    "compact_invisible": (False, False),
+    "broad_visible": (True, True),
+    "broad_invisible": (True, False),
 }
 DESIGN_DERIVED: tuple[str, ...] = (
     "white_matter_diffusivity",
     "rho",
     "gaussian_seed_mass",
     "gaussian_seed_diffusion_time",
-    sa.SEED_SIGMA_COLUMN,
     sa.SEED_RADIUS_COLUMN,
+    sa.SEED_RATIO_COLUMN,
 )
+SIZE_COLUMNS: tuple[str, ...] = ("r_core_mm", "r_whole_mm", "whole_core_ratio")
 DESIGN_COLUMNS: list[str] = [
     "patient",
     "cell",
     "candidate",
     *(f"u_{name}" for name in SAMPLED_FACTORS),
     *SAMPLED_FACTORS,
+    "resection_time",
     *DESIGN_DERIVED,
     "rho_T_r",
+    "ell_mm",
     "log_kill_rt",
     "log_kill_ct",
     "log_kill_total",
+    "visibility_margin",
+    *SIZE_COLUMNS,
+    "R_over_lambda",
     "fd_check",
 ]
+SCREEN_DIR = "screen"  # <design>/screen/c<candidate>/screen.json, the screening's resume records
+SCREEN_FILE = "screen.json"
+
+
+@dataclass(frozen=True)
+class SizeBands:
+    """The size screening's acceptance bands (lo, hi), applied to the
+    growth stage's density at resection_time on the 1 mm grid: the
+    equivalent-sphere radius of {u >= 0.6} and of {u >= 0.3} on the tissue
+    mask in mm and the volume ratio whole / core. The defaults are
+    provisional (to be replaced from BraTS)."""
+
+    r_core_mm: tuple[float, float] = (5.0, 25.0)
+    r_whole_mm: tuple[float, float] = (10.0, 35.0)
+    whole_core_ratio: tuple[float, float] = (1.2, 8.0)
+
+    def record(self) -> dict[str, list[float]]:
+        return {name: [float(lo), float(hi)] for name, (lo, hi) in ((n, getattr(self, n)) for n in SIZE_COLUMNS)}
+
+
+DEFAULT_BANDS = SizeBands()
+BAND_ARGS: dict[str, str] = {"r_core_mm": "r_core_band", "r_whole_mm": "r_whole_band", "whole_core_ratio": "ratio_band"}
 
 # Horizons after resection (days) and the schedule truncation.
 FISHER_HORIZON = 120.0  # the shipped search space's time_after_resection
@@ -791,25 +962,36 @@ W_MAX_BYTES = 500e6  # W.npz is written only below this size
 REGION_NAMES: tuple[str, ...] = ("core", "rim", "out_of_field")
 SINGULAR_TOLERANCE = 1e-14  # an eigenvalue of F below it times the largest counts as zero
 
-# Experiment 2.
-SUBSTITUTE_T0: tuple[float, ...] = (30.0, 60.0, 100.0, 150.0)
+# Experiment 2: the substitute's growth time T_0 = T_r - delta_a / rho per
+# deficit delta_a in e-folds (delta_a > 0: T_0 earlier than the truth).
+SUBSTITUTE_DELTA_A: tuple[float, ...] = (-2.0, -0.5, 0.5, 2.0)
 MAXFEV = 150
 PEAK_MIN = 0.05  # the fitted peak lies in (PEAK_MIN, PEAK_MAX]
 PEAK_MAX = 1.0
 LOGIT_CLIP = 1e-4  # the inverse map keeps the unit-interval argument in [LOGIT_CLIP, 1 - LOGIT_CLIP]
-SIMPLEX_STEPS: tuple[float, float] = (0.5, 0.2)  # the initial simplex: x0, x0 + (0.5, 0), x0 + (0, 0.2) in (logit peak, log sigma)
+SIMPLEX_STEPS: tuple[float, float] = (0.5, 0.2)  # the initial simplex: x0, x0 + (0.5, 0), x0 + (0, 0.2) in the fit's two coordinates
 NELDER_MEAD_XATOL = 1e-3
 NELDER_MEAD_FATOL = 1e-6
-OBJECTIVES: tuple[str, ...] = ("A", "B")
+OBJECTIVES: tuple[str, ...] = ("B",)  # the fit objective(s) run; ``fit_objective`` also knows "A"
 LOG_EPS = 1e-6  # log(u + LOG_EPS) in the log metrics and objective A
 
 # Experiment 3.
-TR_BOUNDS: tuple[float, float] = (5.0, 600.0)  # the fitted growth time's range in days (--tr-bounds)
+TR_BOUNDS: tuple[float, float] = (5.0, 3000.0)  # the fitted growth time's range in days (--tr-bounds)
+LAMBDA_BOUNDS: tuple[float, float] = (1.0, 8.0)  # the fitted front width's range in mm (the free-lambda mode)
+LAMBDA_MODES: tuple[str, ...] = ("fixed", "free")  # --lambda-mode fixed | free | both
+LAMBDA_MODE_DIRS: dict[str, str] = {"fixed": "B", "free": "B_free_lambda"}  # runs/seedfix/<patient>/<dir>/
 SCALAR_XATOL = 1e-3  # the bounded search's tolerance in log T_r
-SEED_SOURCE = "class default"  # the fixed seed: the solver's GAUSSIAN_SEED_MASS and GAUSSIAN_SEED_DIFFUSION_TIME, not the base config's
-BOUND_TOLERANCE = 1e-2  # a fitted log T_r within it of a bound counts as a bound hit
+SEED_SOURCE = "argument"  # the fixed seed comes from --seed-peak and --seed-sigma-mm
+DEFAULT_SEED_PEAK = 0.6
+DEFAULT_SEED_SIGMA_MM = 2.0
+BOUND_TOLERANCE = 1e-2  # a fitted log parameter within it of a bound counts as a bound hit
+R_OVER_LAMBDA_SPLIT = 10.0  # the stratum R_over_lambda >= / < it of the summaries and the figures' vertical line
+
+# Experiment 4 (profile).
+PROFILE_SIGMAS: tuple[float, ...] = (2.0, 3.0, 5.0)  # the fixed seed widths sigma_0 in mm (--sigmas)
 
 # Metrics (``compare_fields``).
+MASS_NAMES: tuple[str, ...] = ("mass", "mass_out_of_field", "mass_beyond_edema")  # each with ref_<name> and <name>_rel
 METRIC_NAMES: list[str] = [
     "dice_core",
     "dice_edema",
@@ -818,22 +1000,19 @@ METRIC_NAMES: list[str] = [
     "rel_l2_log",
     "rel_l2",
     "max_abs_diff",
-    "mass",
-    "mass_out_of_field",
-    "ref_mass",
-    "ref_mass_out_of_field",
+    *MASS_NAMES,
+    *(f"ref_{name}" for name in MASS_NAMES),
+    *(f"{name}_rel" for name in MASS_NAMES),
+    "log_vol_ratio_core",
+    "log_vol_ratio_edema",
     *(f"qoi_{name}" for name in sa.QOI_NAMES),
 ]
-# The metrics plotted against lambda / rho T_0 (the QoIs are plotted in a
-# second figure).
+# The metrics plotted against lambda / delta_a / R_over_lambda (the QoIs
+# are plotted in a second figure).
 PLOTTED_METRICS: list[str] = [name for name in METRIC_NAMES if not name.startswith("qoi_") and not name.startswith("ref_")]
 PLOTTED_QOIS: list[str] = [f"qoi_{name}" for name in sa.FINAL_ANALYSED_QOIS]
-# Experiment 3 adds the relative masses mass / ref_mass - 1 and
-# mass_out_of_field / ref_mass_out_of_field - 1 (NaN for a zero reference).
-SEEDFIX_METRIC_NAMES: list[str] = [*METRIC_NAMES, "mass_rel", "mass_out_of_field_rel"]
-SEEDFIX_PLOTTED_METRICS: list[str] = [*PLOTTED_METRICS, "mass_rel", "mass_out_of_field_rel"]
 
-COLOR_CELLS: dict[str, str] = {"young_weak": "#2a78d6", "young_strong": "#eb6834", "old_weak": "#2a9d8f", "old_strong": "#8a4fbf"}
+COLOR_CELLS: dict[str, str] = {"compact_visible": "#2a78d6", "compact_invisible": "#eb6834", "broad_visible": "#2a9d8f", "broad_invisible": "#8a4fbf"}
 COLOR_TEXT = "#0b0b0b"
 COLOR_LINES: tuple[str, ...] = ("#2a78d6", "#eb6834", "#2a9d8f", "#8a4fbf", "#c9a227", "#52514e", "#d64a8a", "#7a5c2e")
 
@@ -877,6 +1056,8 @@ class Patient:
     chemo_kill_rate: float
     seed_peak: float
     seed_sigma: float
+    r_over_lambda: float = float("nan")  # the design's R_over_lambda (r_whole_mm / front_width_mm); NaN off the design
+    fd_check: bool = False  # the design's fd_check flag (the first patient of each cell)
 
     @property
     def growth(self) -> dict[str, float]:
@@ -925,7 +1106,9 @@ class Patient:
             rt_alpha=float(record["rt_alpha"]),
             chemo_kill_rate=float(record["chemo_kill_rate"]),
             seed_peak=float(record[sa.SEED_PEAK_FACTOR]),
-            seed_sigma=float(record[sa.SEED_SIGMA_COLUMN]),
+            seed_sigma=float(record[sa.SEED_SIGMA_FACTOR]),
+            r_over_lambda=sa.as_float(record.get("R_over_lambda")),
+            fd_check=str(record.get("fd_check")) == "True",
         )
 
     @classmethod
@@ -1156,43 +1339,103 @@ def first_adjuvant_offset(chemo_times: Sequence[float], rt_times: Sequence[float
     return None
 
 
-def cell_of(age: float, log_kill: float) -> str:
-    """The cell of a candidate: (rho T_r below / above AGE_SPLIT) x
-    (Lambda below / above KILL_SPLIT)."""
-    old, strong = age >= AGE_SPLIT, log_kill >= KILL_SPLIT
-    for name, (is_old, is_strong) in CELLS.items():
-        if is_old == old and is_strong == strong:
+def load_script_search_space(path: str | Path, config_keys: Iterable[str]) -> tuple[Any, dict[str, Any]]:
+    """
+    The search space of a design: the file's entries carrying
+    SCRIPT_FACTOR_KEY ("script": true), which are factors of this script
+    and not solver parameters, are taken out and parsed here as
+    {"min", "max", "scale"} ranges; the rest is handed to the sensitivity
+    script's ``load_search_space`` (which would refuse the unknown keys).
+
+    Returns:
+        (space, script_factors): the SearchSpace and the script factors by
+        name (``SearchSpaceParameter``: name, low, high, scale).
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"search space not found: {path}")
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(entries, Mapping):
+        raise ValueError(f"search space {path}: must be a JSON object.")
+    stripped: dict[str, Any] = {}
+    script: dict[str, Any] = {}
+    for key, value in entries.items():
+        if not (isinstance(value, Mapping) and value.get(SCRIPT_FACTOR_KEY)):
+            stripped[key] = value
+            continue
+        entry = {k: v for k, v in value.items() if k != SCRIPT_FACTOR_KEY}
+        if set(entry) != {"min", "max", "scale"} or entry["scale"] not in ("linear", "log"):
+            raise ValueError(
+                f'search space {path}: the script factor {key} must be {{"min", "max", "scale": "linear" | "log", '
+                f'"{SCRIPT_FACTOR_KEY}": true}}, got {dict(value)!r}.'
+            )
+        low, high = float(entry["min"]), float(entry["max"])
+        if not (np.isfinite(low) and np.isfinite(high) and low < high) or (entry["scale"] == "log" and low <= 0):
+            raise ValueError(f"search space {path}: {key}: min < max must be finite (and min > 0 for log), got {low!r}, {high!r}.")
+        script[key] = sa.SearchSpaceParameter(key, low, high, entry["scale"])
+    space = sa.load_search_space(stripped, config_keys)
+    taken = sorted(set(script) & set(space.factors))
+    if taken:
+        raise ValueError(f"search space {path}: {taken} are script factors and factors of the space at once.")
+    return space, script
+
+
+def visibility_margin(rho: NDArray | float, log_kill_total: NDArray | float) -> NDArray:
+    """VISIBILITY_HORIZON rho - Lambda: the e-folds the untreated growth
+    gains over the 120-day log kill; at or above 0 the truth regrows past
+    the treatment by day 120 (visible), below it does not (invisible)."""
+    return VISIBILITY_HORIZON * np.asarray(rho, dtype=np.float64) - np.asarray(log_kill_total, dtype=np.float64)
+
+
+def cell_of(front_width: float, margin: float) -> str:
+    """The cell of a candidate: (front_width_mm at or below / above
+    LAMBDA_SPLIT: compact / broad) x (visibility_margin at or above /
+    below 0: visible / invisible)."""
+    broad, visible = front_width > LAMBDA_SPLIT, margin >= 0.0
+    for name, (is_broad, is_visible) in CELLS.items():
+        if is_broad == broad and is_visible == visible:
             return name
     raise AssertionError("unreachable")
 
 
-def sample_cohort(
+def sample_candidates(
     space: Any,
+    script_factors: Mapping[str, Any],
     base: Mapping[str, Any],
     treatment: Mapping[str, float],
     chemo_total_dose: float,
     n_fractions: int,
     log2_candidates: int,
     seed: int,
+    tr_max: float = DEFAULT_TR_MAX,
 ) -> list[dict[str, Any]]:
     """
-    The design records: a scrambled Sobol' sequence over the sampled
-    factors (unit cube, 2 ** log2_candidates points), transformed with the
-    search space's ranges and derived with its groups, then the first
-    PATIENTS_PER_CELL candidates of each cell in sequence order.
+    The candidates of a design: a scrambled Sobol' sequence over the
+    sampled factors (unit cube, 2 ** log2_candidates points) transformed
+    with the factors' ranges (the search space's and the script's) and
+    derived with the space's groups; resection_time = growth_efolds / rho,
+    ell_mm = v resection_time, the log kill (``total_log_kill``) and the
+    visibility margin; the cell (``cell_of``) and "rejected": None, or
+    "T_r_below_min" / "T_r_above_max" for a resection_time outside
+    [TR_MIN, tr_max].
 
     Returns:
-        One record per patient (``DESIGN_COLUMNS``), cells in CELLS' order,
-        ids p00, p01, ...
+        One record per Sobol' point in sequence order (the DESIGN_COLUMNS
+        without patient, fd_check, the sizes and R_over_lambda, plus
+        "rejected").
     """
-    missing = [name for name in SAMPLED_FACTORS if name not in space.factors]
+    factors = {**space.factors, **script_factors}
+    missing = [name for name in SAMPLED_FACTORS if name not in factors]
     if missing:
         raise ValueError(f"the search space lacks the factors {missing}.")
+    if GROWTH_EFOLDS_FACTOR not in script_factors:
+        raise ValueError(f"{GROWTH_EFOLDS_FACTOR} must be a factor of the script ({SCRIPT_FACTOR_KEY!r}: true), not a solver parameter.")
     sampler = qmc.Sobol(d=len(SAMPLED_FACTORS), scramble=True, seed=int(seed))
     u = np.asarray(sampler.random_base2(int(log2_candidates)), dtype=np.float64)
-    values = {name: space.factors[name].transform(u[:, column]) for column, name in enumerate(SAMPLED_FACTORS)}
+    values = {name: factors[name].transform(u[:, column]) for column, name in enumerate(SAMPLED_FACTORS)}
     derived = space.derive(values)
-    age = derived["rho"] * values["resection_time"]
+    rho = np.asarray(derived["rho"], dtype=np.float64)
+    resection_time = values[GROWTH_EFOLDS_FACTOR] / rho
     kill = total_log_kill(
         values["rt_alpha"],
         float(base["rt_alpha_beta_ratio"]),
@@ -1202,30 +1445,223 @@ def sample_cohort(
         chemo_total_dose,
         float(base["chemo_decay_rate"]),
     )
-    cells = [cell_of(float(age[i]), float(kill["log_kill_total"][i])) for i in range(len(u))]
+    margin = visibility_margin(rho, kill["log_kill_total"])
+    records: list[dict[str, Any]] = []
+    for i in range(len(u)):
+        t_r = float(resection_time[i])
+        rejected = "T_r_below_min" if t_r < TR_MIN else ("T_r_above_max" if t_r > float(tr_max) else None)
+        record: dict[str, Any] = {
+            "candidate": int(i),
+            "cell": cell_of(float(values[sa.GROWTH_WIDTH_FACTOR][i]), float(margin[i])),
+            "rejected": rejected,
+        }
+        record.update({f"u_{name}": float(u[i, column]) for column, name in enumerate(SAMPLED_FACTORS)})
+        record.update({name: float(values[name][i]) for name in SAMPLED_FACTORS})
+        record["resection_time"] = t_r
+        record.update({key: float(derived[key][i]) for key in DESIGN_DERIVED})
+        record["rho_T_r"] = float(values[GROWTH_EFOLDS_FACTOR][i])
+        record["ell_mm"] = float(values[sa.GROWTH_SPEED_FACTOR][i]) * t_r
+        record.update({key: float(kill[key][i]) for key in ("log_kill_rt", "log_kill_ct", "log_kill_total")})
+        record["visibility_margin"] = float(margin[i])
+        records.append(record)
+    return records
+
+
+def candidate_patient(record: Mapping[str, Any]) -> Patient:
+    """The Patient of a candidate record (id c<candidate>)."""
+    return Patient(
+        id=f"c{int(record['candidate']):04d}",
+        cell=str(record["cell"]),
+        front_speed=float(record[sa.GROWTH_SPEED_FACTOR]),
+        front_width=float(record[sa.GROWTH_WIDTH_FACTOR]),
+        resection_time=float(record["resection_time"]),
+        rt_alpha=float(record["rt_alpha"]),
+        chemo_kill_rate=float(record["chemo_kill_rate"]),
+        seed_peak=float(record[sa.SEED_PEAK_FACTOR]),
+        seed_sigma=float(record[sa.SEED_SIGMA_FACTOR]),
+    )
+
+
+def equivalent_radius(volume: float) -> float:
+    """The radius in mm of the sphere of a volume in mm^3: (3 V / 4 pi)^(1/3)."""
+    return float((3.0 * float(volume) / (4.0 * np.pi)) ** (1.0 / 3.0))
+
+
+def size_screen(
+    density: NDArray, tissue: NDArray, zooms: Sequence[float], core_level: float = sa.TAU_CORE, whole_level: float = sa.TAU_EDEMA
+) -> dict[str, float]:
+    """
+    The size measures of a density on the tissue mask: the voxel counts
+    n_core and n_whole of {u >= core_level} and {u >= whole_level}, the
+    equivalent-sphere radii r_core_mm and r_whole_mm of their volumes
+    (``equivalent_radius``; 0 for an empty set), the volume ratio
+    whole_core_ratio (NaN for an empty core) and max_density.
+    """
+    density = np.asarray(density, dtype=np.float64)
+    voxel_volume = float(np.prod(np.asarray(zooms, dtype=np.float64)))
+    n_core = int(np.count_nonzero(np.logical_and(density >= core_level, tissue)))
+    n_whole = int(np.count_nonzero(np.logical_and(density >= whole_level, tissue)))
+    return {
+        "n_core": n_core,
+        "n_whole": n_whole,
+        "r_core_mm": equivalent_radius(voxel_volume * n_core),
+        "r_whole_mm": equivalent_radius(voxel_volume * n_whole),
+        "whole_core_ratio": n_whole / n_core if n_core > 0 else float("nan"),
+        "max_density": float(density.max()) if density.size else 0.0,
+    }
+
+
+def accept_sizes(sizes: Mapping[str, Any], bands: SizeBands = DEFAULT_BANDS) -> str | None:
+    """None when the sizes lie within every band, else the reason of the
+    rejection: "empty_core", or the first of r_core_mm, r_whole_mm,
+    whole_core_ratio (SIZE_COLUMNS' order) outside its band."""
+    if int(sizes["n_core"]) == 0:
+        return "empty_core"
+    for name in SIZE_COLUMNS:
+        lo, hi = getattr(bands, name)
+        value = float(sizes[name])
+        if not (np.isfinite(value) and lo <= value <= hi):
+            return name
+    return None
+
+
+def screen_candidate(cohort: Cohort, record: Mapping[str, Any], screen_dir: Path) -> dict[str, Any]:
+    """
+    The screening record of a candidate: read back from
+    screen_dir/c<candidate>/screen.json when it exists (its factor values
+    must match the candidate's, else the design was resumed with another
+    seed or search space), otherwise the growth-only solve of the
+    candidate to its resection_time (the truth's growth path: the base
+    time step, the cohort's seed voxel; ``solve_growth``) measured by
+    ``size_screen`` on the 1 mm grid and written there.
+
+    Returns:
+        candidate, the sampled factors, resection_time, rho, n_core,
+        n_whole, r_core_mm, r_whole_mm, whole_core_ratio, max_density,
+        n_steps, dt, wall_time_s, failed and error (the solver's message
+        when the solve raised; the sizes are then NaN).
+    """
+    keys = (*SAMPLED_FACTORS, "resection_time", "rho")
+    path = screen_dir / f"c{int(record['candidate']):04d}" / SCREEN_FILE
+    if path.is_file():
+        stored = read_record(path)
+        for name in keys:
+            if not np.isclose(float(stored[name]), float(record[name]), rtol=1e-9, atol=0.0):
+                raise ValueError(
+                    f"{path} holds another candidate ({name} {stored[name]!r}, the design's {record[name]!r}): "
+                    "the design was resumed with a different seed or search space; remove the directory."
+                )
+        return stored
+    patient = candidate_patient(record)
+    out: dict[str, Any] = {"candidate": int(record["candidate"]), "cell": str(record["cell"])}
+    out.update({name: float(record[name]) for name in keys})
+    start = time.perf_counter()
+    try:
+        result = solve_growth(cohort, growth_config(patient_config(cohort, patient, FISHER_HORIZON)))
+    except RuntimeError as error:
+        out.update({name: float("nan") for name in ("n_core", "n_whole", *SIZE_COLUMNS, "max_density", "n_steps", "dt")})
+        out.update({"failed": True, "error": str(error)})
+    else:
+        out.update(size_screen(np.asarray(result.final_state["cell_density"], dtype=np.float64), cohort.tissue, cohort.zooms))
+        out.update({"n_steps": result.n_steps, "dt": result.dt, "failed": False, "error": None})
+    out["wall_time_s"] = time.perf_counter() - start
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_record(path, out)
+    return out
+
+
+def screen_cohort(
+    cohort: Cohort,
+    candidates: Sequence[Mapping[str, Any]],
+    bands: SizeBands,
+    patients_per_cell: int,
+    screen_dir: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    The size screening: per cell (CELLS' order) the admissible candidates
+    (not rejected by their resection_time) are screened in sequence order
+    (``screen_candidate``, ``accept_sizes``) until patients_per_cell are
+    accepted. A failed solve rejects the candidate and is counted;
+    MAX_CONSECUTIVE_SCREEN_FAILURES failures in a row raise. When a cell
+    cannot be filled the screening of the other cells still runs and the
+    error then names every short cell with the counts.
+
+    Returns:
+        (records, counts): the design records (``DESIGN_COLUMNS``; ids
+        p00, p01, ... in cell order, the first of each cell flagged
+        fd_check, R_over_lambda = r_whole_mm / front_width_mm) and the
+        counts: n_candidates, n_rejected_T_r_below_min,
+        n_rejected_T_r_above_max, n_screened, n_accepted, n_solve_failed
+        and per cell n_candidates, n_admissible, n_screened, n_accepted,
+        n_solve_failed and n_rejected by reason.
+    """
+    counts: dict[str, Any] = {
+        "n_candidates": len(candidates),
+        "n_rejected_T_r_below_min": sum(1 for c in candidates if c["rejected"] == "T_r_below_min"),
+        "n_rejected_T_r_above_max": sum(1 for c in candidates if c["rejected"] == "T_r_above_max"),
+        "n_screened": 0,
+        "n_accepted": 0,
+        "n_solve_failed": 0,
+        "cells": {},
+    }
+    accepted_by_cell: dict[str, list[dict[str, Any]]] = {}
+    for cell in CELLS:
+        queue = [c for c in candidates if c["cell"] == cell and c["rejected"] is None]
+        cell_counts: dict[str, Any] = {
+            "n_candidates": sum(1 for c in candidates if c["cell"] == cell),
+            "n_admissible": len(queue),
+            "n_screened": 0,
+            "n_accepted": 0,
+            "n_solve_failed": 0,
+            "n_rejected": {reason: 0 for reason in ("empty_core", *SIZE_COLUMNS)},
+        }
+        accepted: list[dict[str, Any]] = []
+        consecutive = 0
+        for candidate in queue:
+            if len(accepted) >= patients_per_cell:
+                break
+            screened = screen_candidate(cohort, candidate, screen_dir)
+            cell_counts["n_screened"] += 1
+            label = f"c{int(candidate['candidate']):04d} ({cell}, T_r {candidate['resection_time']:.0f} d)"
+            if screened["failed"]:
+                cell_counts["n_solve_failed"] += 1
+                consecutive += 1
+                print(f"  screen {label}: solve failed: {screened['error']}", flush=True)
+                if consecutive >= MAX_CONSECUTIVE_SCREEN_FAILURES:
+                    raise RuntimeError(f"the screening failed {consecutive} solves in a row (last: {screened['error']}); the design stops.")
+                continue
+            consecutive = 0
+            reason = accept_sizes(screened, bands)
+            verdict = "accepted" if reason is None else f"rejected ({reason})"
+            print(
+                f"  screen {label}: r_core {screened['r_core_mm']:.1f} mm, r_whole {screened['r_whole_mm']:.1f} mm, "
+                f"ratio {screened['whole_core_ratio']:.2f}: {verdict} ({screened['wall_time_s']:.1f} s)",
+                flush=True,
+            )
+            if reason is None:
+                accepted.append({**candidate, **{key: screened[key] for key in SIZE_COLUMNS}})
+            else:
+                cell_counts["n_rejected"][reason] += 1
+        cell_counts["n_accepted"] = len(accepted)
+        counts["cells"][cell] = cell_counts
+        accepted_by_cell[cell] = accepted
+    for key in ("n_screened", "n_accepted", "n_solve_failed"):
+        counts[key] = sum(int(c[key]) for c in counts["cells"].values())
+    short = [cell for cell, accepted in accepted_by_cell.items() if len(accepted) < patients_per_cell]
+    if short:
+        raise ValueError(
+            f"the cells {short} could not be filled with {patients_per_cell} patients each from {len(candidates)} Sobol' points "
+            f"(counts {json.dumps(jsonable(counts))}); raise --log2-candidates or widen the bands."
+        )
     records: list[dict[str, Any]] = []
     for cell in CELLS:
-        candidates = [i for i, name in enumerate(cells) if name == cell][:PATIENTS_PER_CELL]
-        if len(candidates) < PATIENTS_PER_CELL:
-            counts = {name: cells.count(name) for name in CELLS}
-            raise ValueError(
-                f"cell {cell} has {len(candidates)} candidates among {len(u)} Sobol' points (counts {counts}); "
-                "raise --log2-candidates."
-            )
-        for position, i in enumerate(candidates):
-            record: dict[str, Any] = {
-                "patient": f"p{len(records):02d}",
-                "cell": cell,
-                "candidate": int(i),
-                "fd_check": position == 0,
-            }
-            record.update({f"u_{name}": float(u[i, column]) for column, name in enumerate(SAMPLED_FACTORS)})
-            record.update({name: float(values[name][i]) for name in SAMPLED_FACTORS})
-            record.update({key: float(derived[key][i]) for key in DESIGN_DERIVED})
-            record["rho_T_r"] = float(age[i])
-            record.update({key: float(kill[key][i]) for key in ("log_kill_rt", "log_kill_ct", "log_kill_total")})
+        for position, candidate in enumerate(accepted_by_cell[cell]):
+            record = {key: value for key, value in candidate.items() if key != "rejected"}
+            record["patient"] = f"p{len(records):02d}"
+            record["fd_check"] = position == 0
+            record["R_over_lambda"] = float(record["r_whole_mm"]) / float(record[sa.GROWTH_WIDTH_FACTOR])
             records.append(record)
-    return records
+    return records, counts
 
 
 def make_design(
@@ -1241,15 +1677,23 @@ def make_design(
     cavity_threshold: float = sa.CAVITY_THRESHOLD,
     rt_margin_mm: float = sa.RT_MARGIN_MM,
     rt_dose_per_fraction: float = sa.RT_DOSE_PER_FRACTION_GY,
+    tr_max: float = DEFAULT_TR_MAX,
+    bands: SizeBands = DEFAULT_BANDS,
+    patients_per_cell: int = PATIENTS_PER_CELL,
+    device: str = "",
 ) -> Path:
     """
-    Draw the cohort and write the design directory <output_dir>/<name>:
-    base_config.json, search_space.json, spec.json, design.csv and
-    configs/<patient>.json. Refuses to overwrite an existing directory.
+    Draw and screen the cohort and write the design directory
+    <output_dir>/<name>: base_config.json, search_space.json, screen/
+    (the screening records), spec.json, design.csv and
+    configs/<patient>.json. A directory holding spec.json is never
+    overwritten; one without it (an interrupted screening) is resumed
+    from its screen/ records.
 
     Args:
         config_path: The base config (resection_cavity and rt_dose null).
-        search_space_path: The search space (the shipped one).
+        search_space_path: The search space (the script's default,
+            ``load_script_search_space``).
         output_dir: Parent of the design directory.
         name: The design directory name.
         tissue_maps: NIfTI paths replacing the base config's
@@ -1266,13 +1710,19 @@ def make_design(
         cavity_threshold: See ``treatment_settings``.
         rt_margin_mm: See ``treatment_settings``.
         rt_dose_per_fraction: See ``treatment_settings``.
+        tr_max: Candidates with resection_time above it (days) are
+            rejected; also the cap of the substitute arm's T_0.
+        bands: The size screening's acceptance bands (``SizeBands``).
+        patients_per_cell: Patients accepted per cell.
+        device: The screening device, for the record ('' the CPU).
 
     Returns:
         The design directory.
     """
     root = Path(output_dir) / name
-    if root.exists():
-        raise FileExistsError(f"{root} exists; a design is never overwritten.")
+    if (root / "spec.json").is_file():
+        raise FileExistsError(f"{root} holds a design (spec.json); a design is never overwritten.")
+    resumed = (root / SCREEN_DIR).is_dir()
     config_path = Path(config_path).resolve()
     search_space_path = Path(search_space_path).resolve()
     base = read_config(config_path, solver=StuppFKPPSolver)
@@ -1289,21 +1739,28 @@ def make_design(
         raise ValueError(f"the base config {config_path} sets {given}, which every run derives; set them to null.")
     if all(base.get(key) is None for key in sa.TIME_STEP_KEYS):
         raise ValueError(f"the base config {config_path} sets none of {list(sa.TIME_STEP_KEYS)}; set steps_per_day.")
+    if int(patients_per_cell) < 1:
+        raise ValueError(f"patients_per_cell must be at least 1, got {patients_per_cell!r}.")
     base["precision"] = PRECISION
     base["gaussian_seed_floor"] = SEED_FLOOR
     base["snapshot_times"] = None
     if smoke:
         base["resolution_factor"] = SMOKE.resolution_factor
-    space = sa.load_search_space(search_space_path, StuppFKPPSolver.config_keys())
+    space, script_factors = load_script_search_space(search_space_path, StuppFKPPSolver.config_keys())
     scale = space.overrides.get("gaussian_seed_scale", base["gaussian_seed_scale"])
     if float(scale) != 1.0:
         raise ValueError(f"the seed derivation needs gaussian_seed_scale = 1, got {scale!r}.")
-    base["gaussian_seed_scale"] = 1.0
     horizon_override = space.overrides.get("time_after_resection")
     if horizon_override is not None and float(horizon_override) != FISHER_HORIZON:
         raise ValueError(
             f"the search space fixes time_after_resection at {horizon_override!r}, the fisher horizon is {FISHER_HORIZON:g}."
         )
+    # The search space's fixed overrides go into the base config (the
+    # horizon is set per run; the seed scale is 1 either way).
+    for key, value in space.overrides.items():
+        if key not in ("time_after_resection", "gaussian_seed_scale"):
+            base[key] = value
+    base["gaussian_seed_scale"] = 1.0
     treatment = sa.treatment_settings(cavity_threshold, rt_margin_mm, rt_dose_per_fraction)
     # The growth stage's instance of the base config validates the entries
     # and holds the loaded maps and the resolved flux threshold.
@@ -1339,7 +1796,37 @@ def make_design(
     if first_adjuvant != FRAME_MOMENTS["d80"]:
         raise ValueError(f"the first adjuvant dose is at offset {first_adjuvant}, the d80 frame assumes {FRAME_MOMENTS['d80']:g}.")
     n_fractions = int(schedules["fisher"]["n_fractions"])
-    records = sample_cohort(space, base, treatment, float(schedules["fisher"]["chemo_total_dose"]), n_fractions, log2_candidates, seed)
+    chemo_total_dose = float(schedules["fisher"]["chemo_total_dose"])
+    candidates = sample_candidates(space, script_factors, base, treatment, chemo_total_dose, n_fractions, log2_candidates, seed, tr_max)
+    root.mkdir(parents=True, exist_ok=True)
+    for sub in ("configs", "runs", "figures", SCREEN_DIR):
+        (root / sub).mkdir(exist_ok=True)
+    shutil.copyfile(search_space_path, root / "search_space.json")
+    write_config(base, root / "base_config.json")
+    wm_array, gm_array, zooms, affine = load_tissue(base)
+    screening_cohort = Cohort(
+        root=root,
+        spec={"treatment": treatment, "min_tissue_fraction": min_tissue_fraction},
+        base=base,
+        wm=wm_array,
+        gm=gm_array,
+        zooms=zooms,
+        affine=affine,
+        tissue=(wm_array + gm_array) >= min_tissue_fraction,
+        seed_voxel=(voxel[0], voxel[1], voxel[2]),
+        seed_fractions=(fractions[0], fractions[1], fractions[2]),
+        patients=[],
+    )
+    print(
+        f"screening {len(candidates)} candidates ({sum(1 for c in candidates if c['rejected'] is None)} with T_r in "
+        f"[{TR_MIN:g}, {tr_max:g}] days) for {patients_per_cell} patients per cell on {device or 'cpu'}"
+        f"{' (resumed)' if resumed else ''}",
+        flush=True,
+    )
+    start = time.perf_counter()
+    records, counts = screen_cohort(screening_cohort, candidates, bands, int(patients_per_cell), root / SCREEN_DIR)
+    screening_time = time.perf_counter() - start
+    factors = {**space.factors, **script_factors}
     spec: dict[str, Any] = {
         "name": name,
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1356,13 +1843,15 @@ def make_design(
         "design_seed": int(seed),
         "log2_candidates": int(log2_candidates),
         "n_candidates": 2 ** int(log2_candidates),
-        "patients_per_cell": PATIENTS_PER_CELL,
-        "cells": {name: {"old": old, "strong": strong} for name, (old, strong) in CELLS.items()},
-        "age_split_rho_T_r": AGE_SPLIT,
-        "kill_split_lambda": KILL_SPLIT,
+        "patients_per_cell": int(patients_per_cell),
+        "cells": {name: {"broad": broad, "visible": visible} for name, (broad, visible) in CELLS.items()},
+        "lambda_split_mm": LAMBDA_SPLIT,
+        "visibility_horizon_days": VISIBILITY_HORIZON,
         "sampled_factors": list(SAMPLED_FACTORS),
-        "factors": {name: {"min": space.factors[name].low, "max": space.factors[name].high, "scale": space.factors[name].scale} for name in SAMPLED_FACTORS},
-        "fixed_at_base": {key: base[key] for key in FIXED_AT_BASE},
+        "script_factors": list(script_factors),
+        "factors": {name: {"min": factors[name].low, "max": factors[name].high, "scale": factors[name].scale} for name in SAMPLED_FACTORS},
+        "fixed_overrides": dict(space.overrides),
+        "fixed_parameters": {key: base[key] for key in FIXED_PARAMETERS},
         "seed_voxel": list(voxel),
         "seed_fractions": list(fractions),
         "seed_target_voxel": target,
@@ -1376,9 +1865,22 @@ def make_design(
         "schedules": schedules,
         "log_kill": {
             "formula": "Lambda = n_fractions d alpha (1 + d / rt_alpha_beta_ratio) + chemo_kill_rate D_tot / chemo_decay_rate, D_tot the chemo dose sum within the fisher horizon",
-            "chemo_total_dose": float(schedules["fisher"]["chemo_total_dose"]),
+            "chemo_total_dose": chemo_total_dose,
             "chemo_decay_rate": float(base["chemo_decay_rate"]),
             "rt_alpha_beta_ratio": float(base["rt_alpha_beta_ratio"]),
+        },
+        "visibility": {"formula": f"visibility_margin = {VISIBILITY_HORIZON:g} rho - Lambda; visible at or above 0"},
+        "screening": {
+            "tr_min": TR_MIN,
+            "tr_max": float(tr_max),
+            "bands": bands.record(),
+            "levels": {"core": sa.TAU_CORE, "whole": sa.TAU_EDEMA},
+            "radius": "equivalent-sphere radius (3 V / 4 pi)^(1/3) of the set on the tissue mask, mm, on the 1 mm grid",
+            "device": device or "cpu",
+            "max_consecutive_failures": MAX_CONSECUTIVE_SCREEN_FAILURES,
+            "resumed": resumed,
+            "wall_time_s": screening_time,
+            "counts": counts,
         },
         "frame_moments": FRAME_MOMENTS,
         "crt_snapshots": snapshots,
@@ -1403,26 +1905,29 @@ def make_design(
             "variance_floor": VARIANCE_FLOOR,
         },
         "substitute": {
-            "T0": list(SUBSTITUTE_T0),
+            "delta_a": list(SUBSTITUTE_DELTA_A),
+            "T_0": "T_r - delta_a / rho; skipped below T_0_min or above T_0_max",
+            "T_0_min": TR_MIN,
+            "T_0_max": float(tr_max),
             "maxfev": SMOKE.maxfev if smoke else MAXFEV,
             "peak_range": [PEAK_MIN, PEAK_MAX],
             "objectives": list(OBJECTIVES),
             "simplex_steps": list(SIMPLEX_STEPS),
         },
         "seedfix": {
-            "seed": seed_record(),
+            "seed": seed_record(DEFAULT_SEED_PEAK, DEFAULT_SEED_SIGMA_MM),
             "T_r_bounds": list(TR_BOUNDS),
+            "lambda_bounds": list(LAMBDA_BOUNDS),
+            "lambda_modes": list(LAMBDA_MODES),
             "maxfev": SMOKE.maxfev if smoke else MAXFEV,
             "objectives": list(OBJECTIVES),
             "bound_tolerance": BOUND_TOLERANCE,
+            "simplex_steps": list(SIMPLEX_STEPS),
+            "R_over_lambda_split": R_OVER_LAMBDA_SPLIT,
         },
+        "profile": {"sigmas": list(PROFILE_SIGMAS), "seed_peak": DEFAULT_SEED_PEAK, "objective": OBJECTIVES[0], "maxfev": SMOKE.maxfev if smoke else MAXFEV},
         "n_patients": len(records),
     }
-    root.mkdir(parents=True, exist_ok=False)
-    for sub in ("configs", "runs", "figures"):
-        (root / sub).mkdir()
-    shutil.copyfile(search_space_path, root / "search_space.json")
-    write_config(base, root / "base_config.json")
     sa.write_json(root / "spec.json", spec)
     sa.write_csv(root / "design.csv", records, DESIGN_COLUMNS)
     cohort = load_cohort(root)
@@ -1772,30 +2277,40 @@ def compare_fields(
     symmetric surface distance in mm of each iso-surface
     (``surface_distance``; NaN when either set is empty), the relative L2
     of log(u + 1e-6) - log(u* + 1e-6) (``rel_l2_log``), the relative L2
-    ||u - u*|| / ||u*||, the max abs difference, the total mass of u
-    (dV sum u), its mass outside the dose map's support (dose == 0: the
-    out-of-field tail), the same two of u*, and the script's QoIs of u
-    (``compute_qois``, prefixed qoi_).
+    ||u - u*|| / ||u*||, the max abs difference, the masses of u (dV sum u
+    in total, outside the dose map's support (dose == 0: the out-of-field
+    tail) and beyond the reference's edema (the tissue voxels with
+    u* < 0.3)), the same three of u* (ref_<name>), the relative masses
+    <name> / ref_<name> - 1 (NaN for a zero reference), the log volume
+    ratios log10(V + dV) - log10(V* + dV) of the 0.6 and the 0.3 sets, and
+    the script's QoIs of u (``compute_qois``, prefixed qoi_).
     """
     field = np.asarray(field, dtype=np.float64)
     reference = np.asarray(reference, dtype=np.float64)
     voxel_volume = float(np.prod(np.asarray(zooms, dtype=np.float64)))
     u, u_ref = field[tissue], reference[tissue]
     out_of_field = np.logical_and(tissue, np.asarray(dose) <= 0)
+    beyond_edema = np.logical_and(tissue, reference < sa.TAU_EDEMA)
     out: dict[str, float] = {}
     for label, level in (("core", sa.TAU_CORE), ("edema", sa.TAU_EDEMA)):
         a = np.logical_and(field >= level, tissue)
         b = np.logical_and(reference >= level, tissue)
         out[f"dice_{label}"] = dice(a, b)
         out[f"assd_{label}_mm"] = surface_distance(a, b, zooms)
+        out[f"log_vol_ratio_{label}"] = float(np.log10(voxel_volume * (int(a.sum()) + 1)) - np.log10(voxel_volume * (int(b.sum()) + 1)))
     out["rel_l2_log"] = rel_l2_log(u, u_ref)
     norm_ref = float(np.linalg.norm(u_ref))
     out["rel_l2"] = float(np.linalg.norm(u - u_ref) / norm_ref) if norm_ref > 0 else float("nan")
     out["max_abs_diff"] = float(np.max(np.abs(u - u_ref))) if u.size else 0.0
     out["mass"] = voxel_volume * float(u.sum())
     out["mass_out_of_field"] = voxel_volume * float(field[out_of_field].sum())
+    out["mass_beyond_edema"] = voxel_volume * float(field[beyond_edema].sum())
     out["ref_mass"] = voxel_volume * float(u_ref.sum())
     out["ref_mass_out_of_field"] = voxel_volume * float(reference[out_of_field].sum())
+    out["ref_mass_beyond_edema"] = voxel_volume * float(reference[beyond_edema].sum())
+    for name in MASS_NAMES:
+        ref = out[f"ref_{name}"]
+        out[f"{name}_rel"] = out[name] / ref - 1.0 if ref > 0 else float("nan")
     qois = sa.compute_qois(field, zooms, seed_voxel, wm)
     out.update({f"qoi_{name}": float(value) for name, value in qois.items()})
     return out
@@ -2290,16 +2805,29 @@ def fisher_patient(cohort: Cohort, patient: Patient, out_dir: Path, draws: int, 
 # --- substitute seeds (experiment 2) ---
 
 
+def bounded_from_unbounded(z: float, lo: float, hi: float) -> float:
+    """The bounded coordinate of an unbounded one: lo + (hi - lo) sigmoid(z),
+    the fits' transform onto an open range (the peak on (PEAK_MIN,
+    PEAK_MAX], log T_r and log lambda on their log bounds)."""
+    return float(lo) + (float(hi) - float(lo)) * float(expit(z))
+
+
+def unbounded_from_bounded(x: float, lo: float, hi: float) -> float:
+    """The inverse of ``bounded_from_unbounded``, the unit-interval argument
+    clipped to [LOGIT_CLIP, 1 - LOGIT_CLIP] (a value at or beyond a bound
+    maps to a finite z)."""
+    p = float(np.clip((float(x) - float(lo)) / (float(hi) - float(lo)), LOGIT_CLIP, 1.0 - LOGIT_CLIP))
+    return float(np.log(p / (1.0 - p)))
+
+
 def peak_from_logit(z: float) -> float:
     """The peak density of its logit coordinate: PEAK_MIN + (PEAK_MAX - PEAK_MIN) sigmoid(z)."""
-    return PEAK_MIN + (PEAK_MAX - PEAK_MIN) * float(expit(z))
+    return bounded_from_unbounded(z, PEAK_MIN, PEAK_MAX)
 
 
 def logit_from_peak(peak: float) -> float:
-    """The inverse of ``peak_from_logit``, the unit-interval argument
-    clipped to [LOGIT_CLIP, 1 - LOGIT_CLIP]."""
-    p = float(np.clip((peak - PEAK_MIN) / (PEAK_MAX - PEAK_MIN), LOGIT_CLIP, 1.0 - LOGIT_CLIP))
-    return float(np.log(p / (1.0 - p)))
+    """The inverse of ``peak_from_logit`` (``unbounded_from_bounded``)."""
+    return unbounded_from_bounded(peak, PEAK_MIN, PEAK_MAX)
 
 
 def composition_seed(patient: Patient, t0: float) -> tuple[float, float, bool]:
@@ -2449,33 +2977,69 @@ def fit_seed(
     )
 
 
-def substitute_row(cohort: Cohort, patient: Patient, t0: float, objective: str, fit: SeedFit | None, metrics: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
-    """A substitute.csv record: the patient, T_0, rho T_0, rho T_r, the fit
-    and the metrics per frame as <frame>_<metric>."""
+def substitute_t0(patient: Patient, delta_a: float) -> float:
+    """The substitute's growth time of a deficit delta_a in e-folds:
+    T_0 = T_r - delta_a / rho (delta_a > 0: earlier than the truth)."""
+    return patient.resection_time - float(delta_a) / patient.rho
+
+
+def deficit_schedule(patient: Patient, deltas: Sequence[float] = SUBSTITUTE_DELTA_A, tr_max: float = DEFAULT_TR_MAX) -> list[dict[str, Any]]:
+    """The substitute arm's (delta_a, T_0) pairs of a patient
+    (``substitute_t0``) with "skipped": None, or "T_0_below_min" for a
+    T_0 below TR_MIN, "T_0_above_max" for one above tr_max (the design's
+    --tr-max)."""
+    out: list[dict[str, Any]] = []
+    for delta_a in deltas:
+        t0 = substitute_t0(patient, float(delta_a))
+        skipped = "T_0_below_min" if t0 < TR_MIN else ("T_0_above_max" if t0 > float(tr_max) else None)
+        out.append({"delta_a": float(delta_a), "T_0": t0, "skipped": skipped})
+    return out
+
+
+def substitute_row(
+    cohort: Cohort,
+    patient: Patient,
+    delta_a: float,
+    t0: float,
+    objective: str,
+    fit: SeedFit | None,
+    metrics: Mapping[str, Mapping[str, float]],
+    skipped: str | None = None,
+) -> dict[str, Any]:
+    """A substitute.csv record: the patient, delta_a, T_0, rho T_0, rho T_r,
+    the objective, skipped (the reason, '' for a run pair), the fit (the
+    truth's seed for the "truth" row) and the metrics per frame as
+    <frame>_<metric> (NaN for the frames not given, i.e. a skipped
+    pair)."""
     row: dict[str, Any] = {
         "patient": patient.id,
         "cell": patient.cell,
+        "delta_a": float(delta_a),
         "T_0": float(t0),
         "rho_T_0": patient.rho * float(t0),
         "rho_T_r": patient.rho * patient.resection_time,
         "objective": objective,
+        "skipped": skipped or "",
     }
     if fit is not None:
         row.update({key: value for key, value in fit.record().items() if key not in ("history", "objective", "T_0")})
-    else:
+    elif objective == "truth":
         row.update({"fitted_peak": patient.seed_peak, "fitted_sigma_mm": patient.seed_sigma})
-    for frame, values in metrics.items():
-        row.update({f"{frame}_{name}": value for name, value in values.items()})
+    for frame in SUBSTITUTE_FRAMES:
+        values = metrics.get(frame)
+        row.update({f"{frame}_{name}": (float("nan") if values is None else values[name]) for name in METRIC_NAMES})
     return row
 
 
 SUBSTITUTE_COLUMNS: list[str] = [
     "patient",
     "cell",
+    "delta_a",
     "T_0",
     "rho_T_0",
     "rho_T_r",
     "objective",
+    "skipped",
     "rule_peak",
     "rule_sigma_mm",
     "initial_peak",
@@ -2493,15 +3057,25 @@ SUBSTITUTE_COLUMNS: list[str] = [
 ]
 
 
-def substitute_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: int, t0_values: Sequence[float] = SUBSTITUTE_T0) -> dict[str, Any]:
+def substitute_patient(
+    cohort: Cohort,
+    patient: Patient,
+    out_dir: Path,
+    maxfev: int,
+    deltas: Sequence[float] = SUBSTITUTE_DELTA_A,
+    tr_max: float = DEFAULT_TR_MAX,
+) -> dict[str, Any]:
     """
     Experiment 2 for one patient: the truth over SUBSTITUTE_HORIZON with
-    the frames SUBSTITUTE_FRAMES, then per T_0 and objective the fitted
-    seed (``fit_seed``; T0_<T_0>/<objective>/fit.json), the treated run
-    from it with resection_time T_0, the truth's maps, alpha and k_ct and
-    the schedule shifted for T_0 (T0_<T_0>/<objective>/run/) and the
-    metrics against the truth per frame; a (T_0, objective) whose row.json
-    exists is reused. Writes substitute.json (the record returned).
+    the frames SUBSTITUTE_FRAMES, then per deficit delta_a
+    (``deficit_schedule``: T_0 = T_r - delta_a / rho; a T_0 below TR_MIN
+    or above tr_max is skipped, recorded and given a row of NaN metrics)
+    and objective the fitted seed (``fit_seed``; T0_<T_0>/<objective>/
+    fit.json), the treated run from it with resection_time T_0, the
+    truth's maps, alpha and k_ct and the schedule shifted for T_0
+    (T0_<T_0>/<objective>/run/) and the metrics against the truth per
+    frame; a (T_0, objective) whose row.json exists is reused. Writes
+    substitute.json (the record returned).
     """
     patient_dir = out_dir / patient.id
     start = time.perf_counter()
@@ -2511,29 +3085,37 @@ def substitute_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: 
     dose = truth.maps.dose
     rows: list[dict[str, Any]] = []
     truth_metrics = {name: compare_to(cohort, truth.run.frames[name], truth.run.frames[name], dose) for name in SUBSTITUTE_FRAMES}
-    rows.append(substitute_row(cohort, patient, patient.resection_time, "truth", None, truth_metrics))
-    for t0 in t0_values:
+    rows.append(substitute_row(cohort, patient, 0.0, patient.resection_time, "truth", None, truth_metrics))
+    schedule = deficit_schedule(patient, deltas, tr_max)
+    skipped: list[dict[str, Any]] = []
+    for entry in schedule:
+        delta_a, t0 = float(entry["delta_a"]), float(entry["T_0"])
         for objective in OBJECTIVES:
-            fit_dir = patient_dir / f"T0_{int(round(t0)):03d}" / objective
+            if entry["skipped"]:
+                rows.append(substitute_row(cohort, patient, delta_a, t0, objective, None, {}, skipped=str(entry["skipped"])))
+                skipped.append({**entry, "objective": objective})
+                print(f"  {patient.id} delta_a={delta_a:g} (T_0={t0:.1f}) {objective}: skipped ({entry['skipped']})", flush=True)
+                continue
+            fit_dir = patient_dir / f"T0_{t0:.1f}" / objective
             row_path = fit_dir / "row.json"
             if row_path.is_file():
                 rows.append(read_record(row_path))
-                print(f"  {patient.id} T_0={t0:g} {objective}: row exists, kept", flush=True)
+                print(f"  {patient.id} delta_a={delta_a:g} (T_0={t0:.1f}) {objective}: row exists, kept", flush=True)
                 continue
             fit = fit_seed(cohort, patient, t0, truth.density, region, objective, maxfev)
             fit_dir.mkdir(parents=True, exist_ok=True)
-            write_record(fit_dir / "fit.json", fit.record())
-            substitute = replace(patient, seed_peak=fit.peak, seed_sigma=fit.sigma, resection_time=float(t0))
+            write_record(fit_dir / "fit.json", {**fit.record(), "delta_a": delta_a})
+            substitute = replace(patient, seed_peak=fit.peak, seed_sigma=fit.sigma, resection_time=t0)
             config = patient_config(cohort, substitute, SUBSTITUTE_HORIZON)
             run = treated_run(cohort, config, truth.maps, fit.growth_n_steps, fit.dt, SUBSTITUTE_FRAMES, fit_dir / "run")
             metrics = {name: compare_to(cohort, run.frames[name], truth.run.frames[name], dose) for name in SUBSTITUTE_FRAMES}
-            row = substitute_row(cohort, patient, t0, objective, fit, metrics)
+            row = substitute_row(cohort, patient, delta_a, t0, objective, fit, metrics)
             write_record(row_path, row)
             rows.append(row)
             print(
-                f"  {patient.id} T_0={t0:g} {objective}: peak {fit.initial_peak:.3f} -> {fit.peak:.3f}, sigma {fit.initial_sigma:.2f} -> "
-                f"{fit.sigma:.2f} mm, objective {fit.value_initial:.4f} -> {fit.value:.4f} in {fit.n_evaluations} evaluations "
-                f"({fit.wall_time_s:.0f} s); d120 Dice {metrics['d120']['dice_edema']:.3f}",
+                f"  {patient.id} delta_a={delta_a:g} (T_0={t0:.1f}) {objective}: peak {fit.initial_peak:.3f} -> {fit.peak:.3f}, sigma "
+                f"{fit.initial_sigma:.2f} -> {fit.sigma:.2f} mm, objective {fit.value_initial:.4f} -> {fit.value:.4f} in {fit.n_evaluations} "
+                f"evaluations ({fit.wall_time_s:.0f} s); d120 Dice {metrics['d120']['dice_edema']:.3f}",
                 flush=True,
             )
     record = {
@@ -2546,6 +3128,10 @@ def substitute_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: 
         "cavity_volume_mm3": truth.maps.record["cavity_volume_mm3"],
         "dose_volume_mm3": truth.maps.record["dose_volume_mm3"],
         "observation": region.record(),
+        "delta_a": [float(v) for v in deltas],
+        "schedule": schedule,
+        "T_0_range": [TR_MIN, float(tr_max)],
+        "skipped": skipped,
         "rows": rows,
         "wall_time_s": time.perf_counter() - start,
     }
@@ -2556,24 +3142,18 @@ def substitute_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: 
 # --- fixed-seed substitution (experiment 3) ---
 
 
-def base_seed() -> tuple[float, float]:
-    """The fixed seed of experiment 3 as (peak density, sigma in mm): the
-    solver's class defaults GAUSSIAN_SEED_MASS and
-    GAUSSIAN_SEED_DIFFUSION_TIME (1500, 15 mm^2: peak 0.58, sigma 5.48 mm)
-    through the script's seed derivation; not the base config's values."""
-    tau = float(GAUSSIAN_SEED_DIFFUSION_TIME)
-    return float(sa.seed_peak_density(float(GAUSSIAN_SEED_MASS), tau)), float(np.sqrt(2.0 * tau))
-
-
-def seed_record() -> dict[str, Any]:
-    """The fixed seed's record for spec.json and seedfix_summary.json."""
-    peak, sigma = base_seed()
+def seed_record(peak: float, sigma: float) -> dict[str, Any]:
+    """The fixed seed's record (spec.json, seedfix_summary.json): its
+    source (SEED_SOURCE: --seed-peak and --seed-sigma-mm), peak density,
+    sigma in mm and the solver's mass and diffusion time
+    (``seed_parameters``)."""
+    derived = sa.seed_parameters(float(peak), float(sigma))
     return {
         "source": SEED_SOURCE,
-        "gaussian_seed_mass": float(GAUSSIAN_SEED_MASS),
-        "gaussian_seed_diffusion_time": float(GAUSSIAN_SEED_DIFFUSION_TIME),
-        "seed_peak": peak,
-        "seed_sigma_mm": sigma,
+        "seed_peak": float(peak),
+        "seed_sigma_mm": float(sigma),
+        "gaussian_seed_mass": float(derived["gaussian_seed_mass"]),
+        "gaussian_seed_diffusion_time": float(derived["gaussian_seed_diffusion_time"]),
     }
 
 
@@ -2618,16 +3198,24 @@ def load_truth_run(cohort: Cohort, patient: Patient, horizon: float, frames: Seq
 
 @dataclass
 class TimeFit:
-    """The result of ``fit_growth_time``."""
+    """The result of ``fit_growth_time`` (lambda_mode "fixed") or
+    ``fit_growth_time_free`` ("free"): the fitted growth time, the front
+    width (the truth's in the fixed mode) and the rho they imply."""
 
     objective: str
+    lambda_mode: str
     seed_peak: float
     seed_sigma: float
     bounds: tuple[float, float]
+    lambda_bounds: tuple[float, float] | None
     t_r: float
+    front_width: float
+    front_width_truth: float
     bound_hit: bool
-    rho: float
+    rho: float  # rho of the fitted front width (the truth's in the fixed mode)
+    rho_truth: float
     t_r_truth: float
+    start: dict[str, float] | None
     n_evaluations: int
     value_initial: float
     value: float
@@ -2639,14 +3227,19 @@ class TimeFit:
     def record(self) -> dict[str, Any]:
         return {
             "objective": self.objective,
+            "lambda_mode": self.lambda_mode,
             "fitted_T_r": self.t_r,
+            "fitted_lambda_mm": self.front_width,
+            "lambda_truth_mm": self.front_width_truth,
             "rho_T_r_fitted": self.rho * self.t_r,
-            "rho_T_r_truth": self.rho * self.t_r_truth,
+            "rho_T_r_truth": self.rho_truth * self.t_r_truth,
             "objective_initial": self.value_initial,
             "objective_achieved": self.value,
             "n_evaluations": self.n_evaluations,
             "bound_hit": self.bound_hit,
             "T_r_bounds": [self.bounds[0], self.bounds[1]],
+            "lambda_bounds": None if self.lambda_bounds is None else [self.lambda_bounds[0], self.lambda_bounds[1]],
+            "start": self.start,
             "seed_peak": self.seed_peak,
             "seed_sigma_mm": self.seed_sigma,
             "growth_n_steps": self.growth_n_steps,
@@ -2654,6 +3247,13 @@ class TimeFit:
             "wall_time_s": self.wall_time_s,
             "history": self.history,
         }
+
+
+def _near_bound(value: float, bounds: tuple[float, float], tolerance: float = BOUND_TOLERANCE) -> bool:
+    """Whether log(value) lies within tolerance of log of either bound."""
+    lo, hi = float(np.log(bounds[0])), float(np.log(bounds[1]))
+    x = float(np.log(value))
+    return bool(abs(x - lo) < tolerance or abs(x - hi) < tolerance)
 
 
 def fit_growth_time(
@@ -2700,17 +3300,21 @@ def fit_growth_time(
     start = time.perf_counter()
     optimum = minimize_scalar(evaluate, bounds=(float(np.log(lo)), float(np.log(hi))), method="bounded", options={"maxiter": int(maxfev), "xatol": SCALAR_XATOL})
     best = min(history, key=lambda h: h["value"])
-    log_t_r = float(np.log(best["T_r"]))
-    bound_hit = bool(abs(log_t_r - np.log(lo)) < BOUND_TOLERANCE or abs(log_t_r - np.log(hi)) < BOUND_TOLERANCE)
     return TimeFit(
         objective=objective,
+        lambda_mode="fixed",
         seed_peak=float(seed_peak),
         seed_sigma=float(seed_sigma),
         bounds=(lo, hi),
+        lambda_bounds=None,
         t_r=best["T_r"],
-        bound_hit=bound_hit,
+        front_width=patient.front_width,
+        front_width_truth=patient.front_width,
+        bound_hit=_near_bound(best["T_r"], (lo, hi)),
         rho=patient.rho,
+        rho_truth=patient.rho,
         t_r_truth=patient.resection_time,
+        start=None,
         n_evaluations=int(optimum.nfev),
         value_initial=history[0]["value"],
         value=best["value"],
@@ -2721,42 +3325,137 @@ def fit_growth_time(
     )
 
 
-def seedfix_row(cohort: Cohort, patient: Patient, objective: str, fit: TimeFit | None, metrics: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
-    """A seedfix.csv record: the patient, the fitted T_r (the truth's for
-    the "truth" row), rho T_r fitted and true, the seed, the fit (with
-    bound_hit; False for the truth row) and the metrics per frame as
-    <frame>_<metric>, plus <frame>_mass_rel and
-    <frame>_mass_out_of_field_rel (SEEDFIX_METRIC_NAMES: the mass over
-    the reference's minus 1, NaN when the reference is 0)."""
+def fit_growth_time_free(
+    cohort: Cohort,
+    patient: Patient,
+    seed_peak: float,
+    seed_sigma: float,
+    reference: NDArray,
+    region: Region,
+    objective: str,
+    maxfev: int,
+    bounds: tuple[float, float] = TR_BOUNDS,
+    lambda_bounds: tuple[float, float] = LAMBDA_BOUNDS,
+    start: tuple[float, float] | None = None,
+    horizon: float = SUBSTITUTE_HORIZON,
+) -> TimeFit:
+    """
+    Fit (log T_r, log lambda) of a growth-only run from the fixed seed
+    with v at the truth's, D = v lambda / 2 and rho = v / (2 lambda)
+    re-derived from the current lambda at every evaluation (the
+    patient's growth derivation), to the truth's density at resection on
+    the region's voxels, by Nelder-Mead (the solve path and the options of
+    ``fit_seed``: at most maxfev evaluations, the initial simplex x0,
+    x0 + (SIMPLEX_STEPS[0], 0), x0 + (0, SIMPLEX_STEPS[1]), xatol
+    NELDER_MEAD_XATOL, fatol NELDER_MEAD_FATOL) in the unbounded
+    coordinates of ``bounded_from_unbounded`` over [log lo, log hi] of
+    the T_r bounds (days) and of the lambda bounds (mm). The start is
+    (T_r, lambda) in days and mm, default the geometric midpoints of both
+    brackets. The best evaluation is the fit; bound_hit says whether its
+    log T_r or its log lambda lies within BOUND_TOLERANCE of a bound.
+    """
+    lo, hi = float(bounds[0]), float(bounds[1])
+    llo, lhi = float(lambda_bounds[0]), float(lambda_bounds[1])
+    if not 0.0 < lo < hi:
+        raise ValueError(f"the T_r bounds must be 0 < lo < hi days, got {bounds}.")
+    if not 0.0 < llo < lhi:
+        raise ValueError(f"the lambda bounds must be 0 < lo < hi mm, got {lambda_bounds}.")
+    log_t = (float(np.log(lo)), float(np.log(hi)))
+    log_l = (float(np.log(llo)), float(np.log(lhi)))
+    if start is None:
+        start = (float(np.sqrt(lo * hi)), float(np.sqrt(llo * lhi)))
+    x0 = np.array([unbounded_from_bounded(float(np.log(start[0])), *log_t), unbounded_from_bounded(float(np.log(start[1])), *log_l)])
+    index = tuple(region.voxels.T)
+    reference_values = np.asarray(reference, dtype=np.float64)[index]
+    history: list[dict[str, float]] = []
+
+    def evaluate(x: NDArray) -> float:
+        t_r = float(np.exp(bounded_from_unbounded(float(x[0]), *log_t)))
+        width = float(np.exp(bounded_from_unbounded(float(x[1]), *log_l)))
+        candidate = replace(patient, front_width=width, seed_peak=seed_peak, seed_sigma=seed_sigma, resection_time=t_r)
+        result = solve_growth(cohort, growth_config(patient_config(cohort, candidate, horizon)))
+        assert result.n_steps is not None and result.dt is not None
+        value = fit_objective(objective, np.asarray(result.final_state["cell_density"], dtype=np.float64)[index], reference_values)
+        history.append({"T_r": t_r, "lambda_mm": width, "value": value, "n_steps": float(result.n_steps), "dt": float(result.dt)})
+        return value
+
+    started = time.perf_counter()
+    simplex = np.array([x0, x0 + np.array([SIMPLEX_STEPS[0], 0.0]), x0 + np.array([0.0, SIMPLEX_STEPS[1]])])
+    optimum = minimize(
+        evaluate,
+        x0,
+        method="Nelder-Mead",
+        options={"maxfev": int(maxfev), "initial_simplex": simplex, "xatol": NELDER_MEAD_XATOL, "fatol": NELDER_MEAD_FATOL},
+    )
+    best = min(history, key=lambda h: h["value"])
+    width = float(best["lambda_mm"])
+    return TimeFit(
+        objective=objective,
+        lambda_mode="free",
+        seed_peak=float(seed_peak),
+        seed_sigma=float(seed_sigma),
+        bounds=(lo, hi),
+        lambda_bounds=(llo, lhi),
+        t_r=best["T_r"],
+        front_width=width,
+        front_width_truth=patient.front_width,
+        bound_hit=_near_bound(best["T_r"], (lo, hi)) or _near_bound(width, (llo, lhi)),
+        rho=float(sa.growth_parameters(patient.front_speed, width)["rho"]),
+        rho_truth=patient.rho,
+        t_r_truth=patient.resection_time,
+        start={"T_r": float(start[0]), "lambda_mm": float(start[1])},
+        n_evaluations=int(optimum.nfev),
+        value_initial=history[0]["value"],
+        value=best["value"],
+        growth_n_steps=int(best["n_steps"]),
+        dt=best["dt"],
+        history=history,
+        wall_time_s=time.perf_counter() - started,
+    )
+
+
+def seedfix_row(cohort: Cohort, patient: Patient, lambda_mode: str, fit: TimeFit | None, metrics: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
+    """A seedfix.csv record: the patient, the lambda mode ("truth" for
+    the truth row), the fitted T_r and lambda (the truth's for the truth
+    row), rho T_r fitted (with the fitted rho) and true, the design's
+    R_over_lambda, the seed, the fit (with bound_hit; False for the
+    truth row) and the metrics per frame as <frame>_<metric>."""
     t_r = fit.t_r if fit is not None else patient.resection_time
+    width = fit.front_width if fit is not None else patient.front_width
+    rho = fit.rho if fit is not None else patient.rho
     row: dict[str, Any] = {
         "patient": patient.id,
         "cell": patient.cell,
+        "lambda_mode": lambda_mode,
+        "objective": fit.objective if fit is not None else "truth",
         "fitted_T_r": float(t_r),
-        "rho_T_r_fitted": patient.rho * float(t_r),
+        "fitted_lambda_mm": float(width),
+        "lambda_truth_mm": patient.front_width,
+        "rho_T_r_fitted": float(rho) * float(t_r),
         "rho_T_r": patient.rho * patient.resection_time,
-        "objective": objective,
+        "R_over_lambda": patient.r_over_lambda,
     }
     if fit is not None:
-        skipped = ("history", "objective", "fitted_T_r", "rho_T_r_fitted", "rho_T_r_truth", "T_r_bounds")
+        skipped = ("history", "objective", "lambda_mode", "fitted_T_r", "fitted_lambda_mm", "lambda_truth_mm", "rho_T_r_fitted", "rho_T_r_truth", "T_r_bounds", "lambda_bounds", "start")
         row.update({key: value for key, value in fit.record().items() if key not in skipped})
     else:
         row.update({"seed_peak": patient.seed_peak, "seed_sigma_mm": patient.seed_sigma, "bound_hit": False})
     for frame, values in metrics.items():
         row.update({f"{frame}_{name}": value for name, value in values.items()})
-        for name in ("mass", "mass_out_of_field"):
-            reference = float(values[f"ref_{name}"])
-            row[f"{frame}_{name}_rel"] = float(values[name]) / reference - 1.0 if reference > 0 else float("nan")
     return row
 
 
 SEEDFIX_COLUMNS: list[str] = [
     "patient",
     "cell",
+    "lambda_mode",
+    "objective",
     "fitted_T_r",
+    "fitted_lambda_mm",
+    "lambda_truth_mm",
     "rho_T_r_fitted",
     "rho_T_r",
-    "objective",
+    "R_over_lambda",
     "seed_peak",
     "seed_sigma_mm",
     "n_evaluations",
@@ -2766,61 +3465,101 @@ SEEDFIX_COLUMNS: list[str] = [
     "growth_n_steps",
     "dt",
     "wall_time_s",
-    *(f"{frame}_{name}" for frame in SUBSTITUTE_FRAMES for name in SEEDFIX_METRIC_NAMES),
+    *(f"{frame}_{name}" for frame in SUBSTITUTE_FRAMES for name in METRIC_NAMES),
 ]
 
 
-def seedfix_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: int, tr_bounds: tuple[float, float] = TR_BOUNDS) -> dict[str, Any]:
+def load_or_solve_truth(cohort: Cohort, patient: Patient, patient_dir: Path, sources: Sequence[Path]) -> tuple[TruthRun, bool]:
     """
-    Experiment 3 for one patient: the truth over SUBSTITUTE_HORIZON with
-    the frames SUBSTITUTE_FRAMES (experiment 2's, runs/substitute/
-    <patient>/truth, read back when complete, ``load_truth_run``; else
-    solved into <patient>/truth), then per objective the fitted growth
-    time of the fixed seed (``base_seed``, ``fit_growth_time``;
-    <objective>/fit.json), the treated run from that seed with
+    The patient's truth over SUBSTITUTE_HORIZON with the frames
+    SUBSTITUTE_FRAMES: read back (``load_truth_run``) from the first of
+    the source directories holding the six frames (their stored fields
+    are the float32 ones rounded for storage), else solved into
+    patient_dir/truth. Returns (truth, reused).
+    """
+    for source in sources:
+        truth = load_truth_run(cohort, patient, SUBSTITUTE_HORIZON, SUBSTITUTE_FRAMES, source)
+        if truth is not None:
+            print(f"  {patient.id}: truth read from {source}", flush=True)
+            return truth, True
+    return truth_run(cohort, patient, SUBSTITUTE_HORIZON, SUBSTITUTE_FRAMES, patient_dir / "truth"), False
+
+
+def parse_lambda_modes(text: str | None) -> tuple[str, ...]:
+    """--lambda-mode as the modes run, in LAMBDA_MODES' order: fixed |
+    free | both (the default)."""
+    mode = "both" if text is None or str(text).strip() == "" else str(text).strip()
+    if mode == "both":
+        return tuple(LAMBDA_MODES)
+    if mode not in LAMBDA_MODES:
+        raise ValueError(f"--lambda-mode must be one of {(*LAMBDA_MODES, 'both')}, got {text!r}.")
+    return (mode,)
+
+
+def seedfix_patient(
+    cohort: Cohort,
+    patient: Patient,
+    out_dir: Path,
+    maxfev: int,
+    tr_bounds: tuple[float, float] = TR_BOUNDS,
+    seed_peak: float = DEFAULT_SEED_PEAK,
+    seed_sigma: float = DEFAULT_SEED_SIGMA_MM,
+    lambda_modes: Sequence[str] = LAMBDA_MODES,
+    lambda_bounds: tuple[float, float] = LAMBDA_BOUNDS,
+) -> dict[str, Any]:
+    """
+    Experiment 3 for one patient: the truth (experiment 2's, runs/
+    substitute/<patient>/truth, read back when complete; else solved into
+    <patient>/truth; ``load_or_solve_truth``), then per lambda mode (fixed
+    before free) the fitted growth time of the fixed seed (seed_peak,
+    seed_sigma; ``fit_growth_time`` with v and lambda at the truth, or
+    ``fit_growth_time_free`` with lambda fitted too, started from the
+    fixed mode's optimum (log T_r*, log lambda_truth) when its fit.json
+    exists in this patient's directory, else the brackets' midpoints), the
+    treated run from that seed with the fitted lambda's D and rho,
     resection_time the fitted T_r, the truth's maps, alpha and k_ct and
-    the schedule shifted for it (<objective>/run/) and the metrics
-    against the truth per frame; an objective whose row.json exists is
+    the schedule shifted for it (<LAMBDA_MODE_DIRS[mode]>/run/) and the
+    metrics against the truth per frame; a mode whose row.json exists is
     reused. Writes seedfix.json (the record returned).
     """
     patient_dir = out_dir / patient.id
     start = time.perf_counter()
-    substitute_dir = out_dir.parent / "substitute" / patient.id / "truth"
-    truth = load_truth_run(cohort, patient, SUBSTITUTE_HORIZON, SUBSTITUTE_FRAMES, substitute_dir)
-    reused = truth is not None
-    if truth is None:
-        truth = truth_run(cohort, patient, SUBSTITUTE_HORIZON, SUBSTITUTE_FRAMES, patient_dir / "truth")
-    else:
-        print(f"  {patient.id}: truth read from {substitute_dir}", flush=True)
+    truth, reused = load_or_solve_truth(cohort, patient, patient_dir, [out_dir.parent / "substitute" / patient.id / "truth"])
     region = observation_region(truth.run.frames, cohort.tissue, cohort.zooms)
     patient_dir.mkdir(parents=True, exist_ok=True)
     sa.write_json(patient_dir / "observation.json", {**region.record(), "margin_mm": OBSERVATION_MARGIN_MM})
-    peak, sigma = base_seed()
     dose = truth.maps.dose
+    objective = OBJECTIVES[0]
     rows: list[dict[str, Any]] = []
     truth_metrics = {name: compare_to(cohort, truth.run.frames[name], truth.run.frames[name], dose) for name in SUBSTITUTE_FRAMES}
     rows.append(seedfix_row(cohort, patient, "truth", None, truth_metrics))
-    for objective in OBJECTIVES:
-        fit_dir = patient_dir / objective
+    fixed_fit_path = patient_dir / LAMBDA_MODE_DIRS["fixed"] / "fit.json"
+    for mode in (m for m in LAMBDA_MODES if m in lambda_modes):
+        fit_dir = patient_dir / LAMBDA_MODE_DIRS[mode]
         row_path = fit_dir / "row.json"
         if row_path.is_file():
             rows.append(read_record(row_path))
-            print(f"  {patient.id} {objective}: row exists, kept", flush=True)
+            print(f"  {patient.id} {mode}: row exists, kept", flush=True)
             continue
-        fit = fit_growth_time(cohort, patient, peak, sigma, truth.density, region, objective, maxfev, tr_bounds)
+        if mode == "fixed":
+            fit = fit_growth_time(cohort, patient, seed_peak, seed_sigma, truth.density, region, objective, maxfev, tr_bounds)
+        else:
+            free_start = (float(read_record(fixed_fit_path)["fitted_T_r"]), patient.front_width) if fixed_fit_path.is_file() else None
+            fit = fit_growth_time_free(cohort, patient, seed_peak, seed_sigma, truth.density, region, objective, maxfev, tr_bounds, lambda_bounds, free_start)
         fit_dir.mkdir(parents=True, exist_ok=True)
         write_record(fit_dir / "fit.json", fit.record())
-        substitute = replace(patient, seed_peak=peak, seed_sigma=sigma, resection_time=fit.t_r)
+        substitute = replace(patient, front_width=fit.front_width, seed_peak=seed_peak, seed_sigma=seed_sigma, resection_time=fit.t_r)
         config = patient_config(cohort, substitute, SUBSTITUTE_HORIZON)
         run = treated_run(cohort, config, truth.maps, fit.growth_n_steps, fit.dt, SUBSTITUTE_FRAMES, fit_dir / "run")
         metrics = {name: compare_to(cohort, run.frames[name], truth.run.frames[name], dose) for name in SUBSTITUTE_FRAMES}
-        row = seedfix_row(cohort, patient, objective, fit, metrics)
+        row = seedfix_row(cohort, patient, mode, fit, metrics)
         write_record(row_path, row)
         rows.append(row)
         print(
-            f"  {patient.id} {objective}: T_r {fit.t_r:.1f} (truth {patient.resection_time:.1f}), rho T_r {patient.rho * fit.t_r:.2f} "
-            f"(truth {patient.rho * patient.resection_time:.2f}), objective {fit.value_initial:.4f} -> {fit.value:.4f} in {fit.n_evaluations} "
-            f"evaluations ({fit.wall_time_s:.0f} s); d120 Dice {metrics['d120']['dice_edema']:.3f}",
+            f"  {patient.id} {mode}: T_r {fit.t_r:.1f} (truth {patient.resection_time:.1f}), lambda {fit.front_width:.2f} (truth "
+            f"{patient.front_width:.2f}) mm, rho T_r {fit.rho * fit.t_r:.2f} (truth {patient.rho * patient.resection_time:.2f}), "
+            f"objective {fit.value_initial:.4f} -> {fit.value:.4f} in {fit.n_evaluations} evaluations ({fit.wall_time_s:.0f} s)"
+            f"{', bound hit' if fit.bound_hit else ''}; d120 Dice {metrics['d120']['dice_edema']:.3f}",
             flush=True,
         )
     record = {
@@ -2828,21 +3567,150 @@ def seedfix_patient(cohort: Cohort, patient: Patient, out_dir: Path, maxfev: int
         "cell": patient.cell,
         "resection_time": patient.resection_time,
         "rho": patient.rho,
+        "front_width": patient.front_width,
+        "R_over_lambda": patient.r_over_lambda,
         "n_growth": truth.n_growth,
         "dt": truth.dt,
         "cavity_volume_mm3": truth.maps.record["cavity_volume_mm3"],
         "dose_volume_mm3": truth.maps.record["dose_volume_mm3"],
         "truth_dir": str(truth.run.run_dir),
         "truth_reused": reused,
-        "seed_source": SEED_SOURCE,
-        "seed_peak": peak,
-        "seed_sigma_mm": sigma,
+        "seed": seed_record(seed_peak, seed_sigma),
+        "lambda_modes": list(lambda_modes),
         "T_r_bounds": [float(tr_bounds[0]), float(tr_bounds[1])],
+        "lambda_bounds": [float(lambda_bounds[0]), float(lambda_bounds[1])],
         "observation": region.record(),
         "rows": rows,
         "wall_time_s": time.perf_counter() - start,
     }
     write_record(patient_dir / PATIENT_FILE.format(experiment="seedfix"), record)
+    return record
+
+
+# --- seed-width profile (experiment 4) ---
+
+
+PROFILE_COLUMNS: list[str] = [
+    "patient",
+    "cell",
+    "sigma_mm",
+    "seed_peak",
+    "fitted_T_r",
+    "rho_T_r_fitted",
+    "rho_T_r",
+    "R_over_lambda",
+    "bound_hit",
+    "objective_initial",
+    "objective_achieved",
+    "n_evaluations",
+    "growth_n_steps",
+    "dt",
+    "wall_time_s",
+    *(f"{frame}_{name}" for frame in SUBSTITUTE_FRAMES for name in METRIC_NAMES),
+]
+
+
+def profile_row(patient: Patient, sigma: float, fit: TimeFit, metrics: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
+    """A profile.csv record: the patient, the seed width sigma_0 and peak,
+    the fit (fitted_T_r, rho_T_r_fitted, bound_hit, the objective values,
+    the evaluations, the stepping) and the metrics per frame as
+    <frame>_<metric>."""
+    row: dict[str, Any] = {
+        "patient": patient.id,
+        "cell": patient.cell,
+        "sigma_mm": float(sigma),
+        "seed_peak": fit.seed_peak,
+        "fitted_T_r": fit.t_r,
+        "rho_T_r_fitted": fit.rho * fit.t_r,
+        "rho_T_r": patient.rho * patient.resection_time,
+        "R_over_lambda": patient.r_over_lambda,
+        "bound_hit": fit.bound_hit,
+        "objective_initial": fit.value_initial,
+        "objective_achieved": fit.value,
+        "n_evaluations": fit.n_evaluations,
+        "growth_n_steps": fit.growth_n_steps,
+        "dt": fit.dt,
+        "wall_time_s": fit.wall_time_s,
+    }
+    for frame, values in metrics.items():
+        row.update({f"{frame}_{name}": value for name, value in values.items()})
+    return row
+
+
+def profile_patient(
+    cohort: Cohort,
+    patient: Patient,
+    out_dir: Path,
+    maxfev: int,
+    tr_bounds: tuple[float, float] = TR_BOUNDS,
+    seed_peak: float = DEFAULT_SEED_PEAK,
+    sigmas: Sequence[float] = PROFILE_SIGMAS,
+) -> dict[str, Any]:
+    """
+    Experiment 4 for one patient: the truth (runs/substitute/<patient>/
+    truth, else runs/seedfix/<patient>/truth, read back when complete;
+    else solved into <patient>/truth; ``load_or_solve_truth``), then per
+    seed width sigma_0 the fixed-lambda fit of the growth time of the seed
+    (seed_peak, sigma_0) (``fit_growth_time``, objective OBJECTIVES[0]),
+    the treated run from it at the fitted T_r with the truth's maps,
+    alpha and k_ct (sigma_<sigma_0>/run/) and the metrics against the
+    truth per frame, the path of ``seedfix_patient``'s fixed mode; a
+    sigma_0 whose row.json exists is reused. Writes profile.json (the
+    record returned).
+    """
+    patient_dir = out_dir / patient.id
+    start = time.perf_counter()
+    sources = [out_dir.parent / experiment / patient.id / "truth" for experiment in ("substitute", "seedfix")]
+    truth, reused = load_or_solve_truth(cohort, patient, patient_dir, sources)
+    region = observation_region(truth.run.frames, cohort.tissue, cohort.zooms)
+    patient_dir.mkdir(parents=True, exist_ok=True)
+    sa.write_json(patient_dir / "observation.json", {**region.record(), "margin_mm": OBSERVATION_MARGIN_MM})
+    dose = truth.maps.dose
+    objective = OBJECTIVES[0]
+    rows: list[dict[str, Any]] = []
+    for sigma in sigmas:
+        fit_dir = patient_dir / f"sigma_{float(sigma):g}"
+        row_path = fit_dir / "row.json"
+        if row_path.is_file():
+            rows.append(read_record(row_path))
+            print(f"  {patient.id} sigma_0={sigma:g}: row exists, kept", flush=True)
+            continue
+        fit = fit_growth_time(cohort, patient, seed_peak, float(sigma), truth.density, region, objective, maxfev, tr_bounds)
+        fit_dir.mkdir(parents=True, exist_ok=True)
+        write_record(fit_dir / "fit.json", fit.record())
+        substitute = replace(patient, seed_peak=seed_peak, seed_sigma=float(sigma), resection_time=fit.t_r)
+        config = patient_config(cohort, substitute, SUBSTITUTE_HORIZON)
+        run = treated_run(cohort, config, truth.maps, fit.growth_n_steps, fit.dt, SUBSTITUTE_FRAMES, fit_dir / "run")
+        metrics = {name: compare_to(cohort, run.frames[name], truth.run.frames[name], dose) for name in SUBSTITUTE_FRAMES}
+        row = profile_row(patient, float(sigma), fit, metrics)
+        write_record(row_path, row)
+        rows.append(row)
+        print(
+            f"  {patient.id} sigma_0={sigma:g} mm: T_r {fit.t_r:.1f} (truth {patient.resection_time:.1f}), rho T_r {fit.rho * fit.t_r:.2f} "
+            f"(truth {patient.rho * patient.resection_time:.2f}), objective {fit.value_initial:.4f} -> {fit.value:.4f} in {fit.n_evaluations} "
+            f"evaluations ({fit.wall_time_s:.0f} s){', bound hit' if fit.bound_hit else ''}; d180 mass beyond edema rel "
+            f"{metrics['d180']['mass_beyond_edema_rel']:.3f}",
+            flush=True,
+        )
+    record = {
+        "patient": patient.id,
+        "cell": patient.cell,
+        "resection_time": patient.resection_time,
+        "rho": patient.rho,
+        "R_over_lambda": patient.r_over_lambda,
+        "n_growth": truth.n_growth,
+        "dt": truth.dt,
+        "truth_dir": str(truth.run.run_dir),
+        "truth_reused": reused,
+        "seed_peak": float(seed_peak),
+        "sigmas": [float(s) for s in sigmas],
+        "objective": objective,
+        "T_r_bounds": [float(tr_bounds[0]), float(tr_bounds[1])],
+        "observation": region.record(),
+        "rows": rows,
+        "wall_time_s": time.perf_counter() - start,
+    }
+    write_record(patient_dir / PATIENT_FILE.format(experiment="profile"), record)
     return record
 
 
@@ -3147,9 +4015,59 @@ def invariance_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path) -> N
         _save_figure(figure, figure_dir / stem)
 
 
+def row_groups(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
+    """The summaries' groups of rows: each cell, "all", and the strata
+    R_over_lambda >= / < R_OVER_LAMBDA_SPLIT (R_over_lambda_ge_10,
+    R_over_lambda_lt_10; a row without a finite value is in neither);
+    empty groups are left out."""
+    groups: dict[str, list[Mapping[str, Any]]] = {cell: [row for row in rows if row["cell"] == cell] for cell in CELLS}
+    groups["all"] = list(rows)
+    ratios = {id(row): sa.as_float(row.get("R_over_lambda")) for row in rows}
+    groups[f"R_over_lambda_ge_{R_OVER_LAMBDA_SPLIT:g}"] = [row for row in rows if ratios[id(row)] >= R_OVER_LAMBDA_SPLIT]
+    groups[f"R_over_lambda_lt_{R_OVER_LAMBDA_SPLIT:g}"] = [row for row in rows if ratios[id(row)] < R_OVER_LAMBDA_SPLIT]
+    return {name: group for name, group in groups.items() if group}
+
+
+def median_of(rows: Sequence[Mapping[str, Any]], key: str) -> float | None:
+    """The median of a column over the rows with a finite value; None
+    without one."""
+    values = np.array([sa.as_float(row.get(key)) for row in rows], dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    return float(np.median(finite)) if finite.size else None
+
+
+def frame_metric_keys(frames: Sequence[str] = ("d120", "d180")) -> list[str]:
+    """<frame>_<metric> for the summarised frames and every metric."""
+    return [f"{frame}_{name}" for frame in frames for name in METRIC_NAMES]
+
+
+def substitute_medians(rows: Sequence[Mapping[str, Any]], frames: Sequence[str] = ("d120", "d180")) -> dict[str, Any]:
+    """Per objective and delta_a, per group (``row_groups``: the cells,
+    "all", the two R_over_lambda strata): the row count, the skipped rows
+    (n_skipped, a T_0 outside its range; excluded) and the median of
+    every <frame>_<metric> of the frames (NaN entries left out; None
+    when no value is finite)."""
+    keys = frame_metric_keys(frames)
+    out: dict[str, Any] = {}
+    for objective in OBJECTIVES:
+        selected = [row for row in rows if row["objective"] == objective]
+        out[objective] = {}
+        for delta_a in sorted({float(row["delta_a"]) for row in selected}):
+            at = [row for row in selected if float(row["delta_a"]) == delta_a]
+            entries: dict[str, Any] = {}
+            for group, group_rows in row_groups(at).items():
+                kept = [row for row in group_rows if not str(row.get("skipped") or "")]
+                entry: dict[str, Any] = {"n_rows": len(group_rows), "n_skipped": len(group_rows) - len(kept)}
+                entry.update({key: median_of(kept, key) for key in keys})
+                entries[group] = entry
+            out[objective][f"{delta_a:g}"] = entries
+    return out
+
+
 def assemble_substitute(root: Path, dispatch: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
-    """substitute.csv, its figures and substitute_summary.json from the
-    patient records present (``write_summary``)."""
+    """substitute.csv, its figures and substitute_summary.json
+    (``write_summary`` plus the medians, ``substitute_medians``, and the
+    skipped pairs) from the patient records present."""
     rows: list[dict[str, Any]] = []
     records = patient_records(root, "substitute")
     for record in records:
@@ -3157,98 +4075,98 @@ def assemble_substitute(root: Path, dispatch: Mapping[str, Any] | None = None) -
     sa.write_csv(root / "substitute.csv", rows, SUBSTITUTE_COLUMNS)
     if rows:
         substitute_figures(rows, root / "figures")
-    write_summary(root, "substitute", records, len(rows), dispatch)
+    summary = write_summary(root, "substitute", records, len(rows), dispatch)
+    summary["delta_a"] = sorted({float(row["delta_a"]) for row in rows if row["objective"] != "truth"})
+    summary["skipped"] = [{"patient": record["patient"], **entry} for record in records for entry in record.get("skipped", [])]
+    summary["n_skipped"] = len(summary["skipped"])
+    summary["medians"] = substitute_medians(rows)
+    write_record(root / "substitute_summary.json", summary)
     return rows
 
 
+def _metric_axes(names: Sequence[str]) -> tuple[Any, Any]:
+    n_cols = 4
+    n_rows = int(np.ceil(len(names) / n_cols))
+    return plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 2.6 * n_rows), squeeze=False)
+
+
 def substitute_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path, frames: Sequence[str] = ("d120", "d180")) -> None:
-    """Per frame and objective: every comparison metric against rho T_0,
-    points per (patient, T_0) coloured by cell, one line per cell through
-    the cell's median at each T_0 (at the cell's median rho T_0)."""
+    """Per frame and objective: every comparison metric against delta_a
+    (linear axis), points per (patient, delta_a) coloured by cell, one
+    line per cell through the cell's median at each delta_a; skipped
+    pairs have no finite value and are not drawn."""
     figure_dir.mkdir(exist_ok=True)
     for frame in frames:
         for objective in OBJECTIVES:
             selected = [row for row in rows if row["objective"] == objective]
             if not selected:
                 continue
-            names = [name for name in PLOTTED_METRICS if not name.startswith("ref_")]
-            n_cols = 4
-            n_rows = int(np.ceil(len(names) / n_cols))
-            figure, axes = plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 2.6 * n_rows), squeeze=False)
-            ages = np.array([float(row["rho_T_0"]) for row in selected])
-            for axis, name in zip(axes.flat, names):
+            deltas = sorted({float(row["delta_a"]) for row in selected})
+            figure, axes = _metric_axes(PLOTTED_METRICS)
+            for axis, name in zip(axes.flat, PLOTTED_METRICS):
                 key = f"{frame}_{name}"
                 for cell, color in COLOR_CELLS.items():
                     cell_rows = [row for row in selected if row["cell"] == cell]
                     if not cell_rows:
                         continue
-                    x = np.array([float(row["rho_T_0"]) for row in cell_rows])
+                    x = np.array([float(row["delta_a"]) for row in cell_rows])
                     y = np.array([sa.as_float(row.get(key)) for row in cell_rows])
                     finite = np.isfinite(y)
                     axis.scatter(x[finite], y[finite], s=10, color=color, alpha=0.5, linewidths=0, label=cell)
-                    t0_values = sorted(set(float(row["T_0"]) for row in cell_rows))
-                    medians = []
-                    for t0 in t0_values:
-                        at = [row for row in cell_rows if float(row["T_0"]) == t0]
-                        values = np.array([sa.as_float(row.get(key)) for row in at])
-                        at_ages = np.array([float(row["rho_T_0"]) for row in at])
-                        if np.isfinite(values).any():
-                            medians.append((float(np.median(at_ages)), float(np.nanmedian(values))))
-                    if medians:
-                        axis.plot([m[0] for m in medians], [m[1] for m in medians], "-", color=color, linewidth=1.5)
+                    medians = [(delta_a, median_of([row for row in cell_rows if float(row["delta_a"]) == delta_a], key)) for delta_a in deltas]
+                    points = [(x_, m) for x_, m in medians if m is not None]
+                    if points:
+                        axis.plot([p[0] for p in points], [p[1] for p in points], "-", color=color, linewidth=1.5)
                 # Limits by hand: a panel whose values are all NaN (an empty
                 # iso-surface for every substitute) has no data to scale.
-                low, high = float(ages.min()) / 1.5, float(ages.max()) * 1.5
-                axis.set_xlim(low, high)
-                axis.set_xscale("log")
-                ticks = [t for t in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50) if low <= t <= high]
-                axis.set_xticks(ticks, [f"{t:g}" for t in ticks])
-                axis.set_xticks([], minor=True)
-                axis.set_xlabel("rho T_0", fontsize=8)
+                span = max(deltas[-1] - deltas[0], 1.0)
+                axis.set_xlim(deltas[0] - 0.15 * span, deltas[-1] + 0.15 * span)
+                axis.set_xticks(deltas, [f"{d:g}" for d in deltas])
+                axis.axvline(0.0, color="#52514e", linewidth=0.6, linestyle=":")
+                axis.set_xlabel("delta_a = rho (T_r - T_0)", fontsize=8)
                 axis.set_title(f"{frame} {name}", fontsize=8)
                 axis.tick_params(labelsize=7)
                 axis.spines[["top", "right"]].set_visible(False)
-            for axis in axes.flat[len(names):]:
+            for axis in axes.flat[len(PLOTTED_METRICS):]:
                 axis.set_visible(False)
             handles, labels = axes.flat[0].get_legend_handles_labels()
             figure.legend(handles, labels, loc="lower right", fontsize=7, frameon=False, ncol=2)
-            figure.suptitle(f"experiment 2, objective {objective}: substitute against truth at {frame}; lines: cell medians per T_0", fontsize=10)
+            figure.suptitle(f"experiment 2, objective {objective}: substitute against truth at {frame}; lines: cell medians per delta_a", fontsize=10)
             figure.tight_layout()
             _save_figure(figure, figure_dir / f"substitute_{frame}_objective_{objective}")
 
 
 def seedfix_medians(rows: Sequence[Mapping[str, Any]], frames: Sequence[str] = ("d120", "d180")) -> dict[str, dict[str, dict[str, Any]]]:
-    """Per objective and cell ("all" for every cell): the patient count,
-    the number of fits that hit a bound (n_bound_hit) and, over the
-    patients whose fit did not, the median of |rho (T_r_fitted - T_r)|
-    (abs_rho_T_r_error) and of every <frame>_<metric> of the frames
-    (SEEDFIX_METRIC_NAMES; NaN entries left out; None when no value is
-    finite)."""
-    keys = [f"{frame}_{name}" for frame in frames for name in SEEDFIX_METRIC_NAMES]
+    """Per lambda mode and group (``row_groups``: the cells, "all", the
+    two R_over_lambda strata): the patient count, the number of fits that
+    hit a bound (n_bound_hit) and, over the patients whose fit did not,
+    the median of |rho_fitted T_r_fitted - rho T_r| (abs_rho_T_r_error),
+    of |log(lambda_fitted / lambda)| (abs_log_lambda_error) and of every
+    <frame>_<metric> of the frames (NaN entries left out; None when no
+    value is finite)."""
+    keys = frame_metric_keys(frames)
     medians: dict[str, dict[str, dict[str, Any]]] = {}
-    for objective in OBJECTIVES:
-        selected = [row for row in rows if row["objective"] == objective]
-        medians[objective] = {}
-        for cell in (*CELLS, "all"):
-            cell_rows = [row for row in selected if cell == "all" or row["cell"] == cell]
-            if not cell_rows:
-                continue
-            kept = [row for row in cell_rows if str(row.get("bound_hit")) != "True"]
-            entry: dict[str, Any] = {"n_patients": len(cell_rows), "n_bound_hit": len(cell_rows) - len(kept)}
+    for mode in LAMBDA_MODES:
+        selected = [row for row in rows if row.get("lambda_mode") == mode]
+        if not selected:
+            continue
+        medians[mode] = {}
+        for group, group_rows in row_groups(selected).items():
+            kept = [row for row in group_rows if str(row.get("bound_hit")) != "True"]
+            entry: dict[str, Any] = {"n_patients": len(group_rows), "n_bound_hit": len(group_rows) - len(kept)}
             errors = np.array([abs(float(row["rho_T_r_fitted"]) - float(row["rho_T_r"])) for row in kept])
             entry["abs_rho_T_r_error"] = float(np.median(errors)) if errors.size else None
-            for key in keys:
-                values = np.array([sa.as_float(row.get(key)) for row in kept], dtype=np.float64)
-                finite = values[np.isfinite(values)]
-                entry[key] = float(np.median(finite)) if finite.size else None
-            medians[objective][cell] = entry
+            widths = np.array([abs(np.log(float(row["fitted_lambda_mm"]) / float(row["lambda_truth_mm"]))) for row in kept])
+            entry["abs_log_lambda_error"] = float(np.median(widths)) if widths.size else None
+            entry.update({key: median_of(kept, key) for key in keys})
+            medians[mode][group] = entry
     return medians
 
 
 def assemble_seedfix(root: Path, dispatch: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     """seedfix.csv, its figures and seedfix_summary.json (``write_summary``
-    plus the medians, ``seedfix_medians``) from the patient records
-    present."""
+    plus the seed's record, the lambda modes and the medians,
+    ``seedfix_medians``) from the patient records present."""
     rows: list[dict[str, Any]] = []
     records = patient_records(root, "seedfix")
     for record in records:
@@ -3257,62 +4175,168 @@ def assemble_seedfix(root: Path, dispatch: Mapping[str, Any] | None = None) -> l
     if rows:
         seedfix_figures(rows, root / "figures")
     summary = write_summary(root, "seedfix", records, len(rows), dispatch)
-    summary["seed"] = seed_record()
+    summary["seed"] = records[0]["seed"] if records else None
+    summary["lambda_modes"] = sorted({str(row["lambda_mode"]) for row in rows if row["lambda_mode"] != "truth"}, key=lambda m: LAMBDA_MODES.index(m) if m in LAMBDA_MODES else 99)
     summary["medians"] = seedfix_medians(rows)
     write_record(root / "seedfix_summary.json", summary)
     return rows
 
 
+def _log_axis(axis: Any, values: NDArray, label: str, fallback: tuple[float, float] = (1.0, 100.0)) -> None:
+    """A log x axis scaled by hand around the finite values (the fallback
+    range without any), with plain tick labels."""
+    finite = values[np.isfinite(values) & (values > 0)]
+    low, high = (float(finite.min()) / 1.5, float(finite.max()) * 1.5) if finite.size else fallback
+    if low == high:
+        low, high = low / 1.5, high * 1.5
+    axis.set_xlim(low, high)
+    axis.set_xscale("log")
+    ticks = [t for t in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200) if low <= t <= high]
+    axis.set_xticks(ticks, [f"{t:g}" for t in ticks])
+    axis.set_xticks([], minor=True)
+    axis.set_xlabel(label, fontsize=8)
+
+
 def seedfix_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path, frames: Sequence[str] = ("d120", "d180")) -> None:
-    """Per frame and objective: every comparison metric and the two
-    relative masses (SEEDFIX_PLOTTED_METRICS) against rho T_r of the
-    truth, one marker per patient coloured by cell."""
+    """Per frame and lambda mode: every comparison metric against the
+    truth's R_over_lambda (log axis; a vertical line at
+    R_OVER_LAMBDA_SPLIT), one marker per patient coloured by cell (a bound
+    hit hollow)."""
     figure_dir.mkdir(exist_ok=True)
     for frame in frames:
-        for objective in OBJECTIVES:
-            selected = [row for row in rows if row["objective"] == objective]
+        for mode in LAMBDA_MODES:
+            selected = [row for row in rows if row.get("lambda_mode") == mode]
             if not selected:
                 continue
-            names = [name for name in SEEDFIX_PLOTTED_METRICS if not name.startswith("ref_")]
-            n_cols = 4
-            n_rows = int(np.ceil(len(names) / n_cols))
-            figure, axes = plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 2.6 * n_rows), squeeze=False)
-            ages = np.array([float(row["rho_T_r"]) for row in selected])
-            for axis, name in zip(axes.flat, names):
+            ratios = np.array([sa.as_float(row.get("R_over_lambda")) for row in selected])
+            figure, axes = _metric_axes(PLOTTED_METRICS)
+            for axis, name in zip(axes.flat, PLOTTED_METRICS):
                 key = f"{frame}_{name}"
                 for cell, color in COLOR_CELLS.items():
                     cell_rows = [row for row in selected if row["cell"] == cell]
                     if not cell_rows:
                         continue
-                    x = np.array([float(row["rho_T_r"]) for row in cell_rows])
+                    x = np.array([sa.as_float(row.get("R_over_lambda")) for row in cell_rows])
                     y = np.array([sa.as_float(row.get(key)) for row in cell_rows])
-                    finite = np.isfinite(y)
-                    axis.scatter(x[finite], y[finite], s=16, color=color, alpha=0.7, linewidths=0, label=cell)
-                # Limits by hand: a panel whose values are all NaN (an empty
-                # iso-surface for every patient) has no data to scale.
-                low, high = float(ages.min()) / 1.5, float(ages.max()) * 1.5
-                axis.set_xlim(low, high)
-                axis.set_xscale("log")
-                ticks = [t for t in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50) if low <= t <= high]
-                axis.set_xticks(ticks, [f"{t:g}" for t in ticks])
-                axis.set_xticks([], minor=True)
-                axis.set_xlabel("rho T_r (truth)", fontsize=8)
+                    hit = np.array([str(row.get("bound_hit")) == "True" for row in cell_rows])
+                    finite = np.isfinite(x) & np.isfinite(y)
+                    axis.scatter(x[finite & ~hit], y[finite & ~hit], s=16, color=color, alpha=0.7, linewidths=0, label=cell)
+                    axis.scatter(x[finite & hit], y[finite & hit], s=16, facecolors="none", edgecolors=color, linewidths=0.8)
+                axis.axvline(R_OVER_LAMBDA_SPLIT, color="#52514e", linewidth=0.6, linestyle=":")
+                # Limits by hand: a panel whose values are all NaN has no data to scale.
+                _log_axis(axis, ratios, "R / lambda (truth)")
                 axis.set_title(f"{frame} {name}", fontsize=8)
                 axis.tick_params(labelsize=7)
                 axis.spines[["top", "right"]].set_visible(False)
-            for axis in axes.flat[len(names):]:
+            for axis in axes.flat[len(PLOTTED_METRICS):]:
                 axis.set_visible(False)
             handles, labels = axes.flat[0].get_legend_handles_labels()
             figure.legend(handles, labels, loc="lower right", fontsize=7, frameon=False, ncol=2)
-            figure.suptitle(f"experiment 3, objective {objective}: fixed seed with fitted T_r against truth at {frame}; one marker per patient", fontsize=10)
+            figure.suptitle(f"experiment 3, lambda {mode}: fixed seed with fitted T_r against truth at {frame}; one marker per patient (hollow: bound hit)", fontsize=10)
             figure.tight_layout()
-            _save_figure(figure, figure_dir / f"seedfix_{frame}_objective_{objective}")
+            _save_figure(figure, figure_dir / f"seedfix_{frame}_{mode}")
+
+
+def profile_medians(rows: Sequence[Mapping[str, Any]], frames: Sequence[str] = ("d120", "d180")) -> dict[str, Any]:
+    """Per sigma_0 and group (``row_groups``): the patient count, the
+    bound hits (excluded) and the medians of fitted_T_r, rho_T_r_fitted,
+    objective_achieved and every <frame>_<metric> of the frames."""
+    keys = ["fitted_T_r", "rho_T_r_fitted", "objective_achieved", *frame_metric_keys(frames)]
+    out: dict[str, Any] = {}
+    for sigma in sorted({float(row["sigma_mm"]) for row in rows}):
+        at = [row for row in rows if float(row["sigma_mm"]) == sigma]
+        entries: dict[str, Any] = {}
+        for group, group_rows in row_groups(at).items():
+            kept = [row for row in group_rows if str(row.get("bound_hit")) != "True"]
+            entry: dict[str, Any] = {"n_patients": len(group_rows), "n_bound_hit": len(group_rows) - len(kept)}
+            entry.update({key: median_of(kept, key) for key in keys})
+            entries[group] = entry
+        out[f"{sigma:g}"] = entries
+    return out
+
+
+def assemble_profile(root: Path, dispatch: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """profile.csv, its figures and profile_summary.json (``write_summary``
+    plus the seed peak, the sigmas and the medians, ``profile_medians``)
+    from the patient records present."""
+    rows: list[dict[str, Any]] = []
+    records = patient_records(root, "profile")
+    for record in records:
+        rows.extend(record["rows"])
+    sa.write_csv(root / "profile.csv", rows, PROFILE_COLUMNS)
+    if rows:
+        profile_figures(rows, root / "figures")
+    summary = write_summary(root, "profile", records, len(rows), dispatch)
+    summary["seed_peak"] = records[0]["seed_peak"] if records else None
+    summary["sigmas"] = sorted({float(row["sigma_mm"]) for row in rows})
+    summary["medians"] = profile_medians(rows)
+    write_record(root / "profile_summary.json", summary)
+    return rows
+
+
+def profile_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path) -> None:
+    """profile_objective: objective_achieved against sigma_0, one line per
+    patient coloured by cell (a bound hit as a hollow marker);
+    profile_d180: d180 mass_beyond_edema_rel and mass_rel against
+    sigma_0 the same way."""
+    figure_dir.mkdir(exist_ok=True)
+    patients = list(dict.fromkeys(str(row["patient"]) for row in rows))
+    sigmas = sorted({float(row["sigma_mm"]) for row in rows})
+    panels = {"profile_objective": ["objective_achieved"], "profile_d180": ["d180_mass_beyond_edema_rel", "d180_mass_rel"]}
+    for stem, keys in panels.items():
+        figure, axes = plt.subplots(1, len(keys), figsize=(4.2 * len(keys), 3.2), squeeze=False)
+        for axis, key in zip(axes.flat, keys):
+            for patient in patients:
+                patient_rows = sorted((row for row in rows if str(row["patient"]) == patient), key=lambda row: float(row["sigma_mm"]))
+                cell = str(patient_rows[0]["cell"])
+                color = COLOR_CELLS.get(cell, "#52514e")
+                x = np.array([float(row["sigma_mm"]) for row in patient_rows])
+                y = np.array([sa.as_float(row.get(key)) for row in patient_rows])
+                hit = np.array([str(row.get("bound_hit")) == "True" for row in patient_rows])
+                finite = np.isfinite(y)
+                axis.plot(x[finite], y[finite], "-", color=color, linewidth=1.2, alpha=0.8, label=f"{patient} {cell}")
+                axis.scatter(x[finite & ~hit], y[finite & ~hit], s=18, color=color, linewidths=0)
+                axis.scatter(x[finite & hit], y[finite & hit], s=18, facecolors="none", edgecolors=color, linewidths=0.8)
+            axis.set_xticks(sigmas, [f"{s:g}" for s in sigmas])
+            axis.set_xlim(min(sigmas) - 0.5, max(sigmas) + 0.5)
+            axis.set_xlabel("seed width sigma_0 (mm)", fontsize=8)
+            axis.set_title(key, fontsize=8)
+            axis.tick_params(labelsize=7)
+            axis.spines[["top", "right"]].set_visible(False)
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        figure.legend(handles, labels, loc="upper right", fontsize=6, frameon=False, ncol=1)
+        figure.suptitle("experiment 4: fixed seed of width sigma_0 with fitted T_r (hollow: bound hit)", fontsize=10)
+        figure.tight_layout()
+        _save_figure(figure, figure_dir / stem)
 
 
 # --- commands ---
 
 
-def design_command(args: argparse.Namespace) -> Path:
+def parse_band(text: str | None, default: tuple[float, float], flag: str) -> tuple[float, float]:
+    """A band argument "lo,hi" with lo < hi; the default when not given."""
+    if text is None or str(text).strip() == "":
+        return default
+    parts = [part.strip() for part in str(text).split(",")]
+    if len(parts) != 2:
+        raise ValueError(f"{flag}: expected lo,hi, got {text!r}.")
+    lo, hi = float(parts[0]), float(parts[1])
+    if not lo < hi:
+        raise ValueError(f"{flag}: need lo < hi, got {text!r}.")
+    return lo, hi
+
+
+def parse_bands(args: argparse.Namespace) -> SizeBands:
+    """The size bands of the command line (--r-core-band, --r-whole-band,
+    --ratio-band; DEFAULT_BANDS where not given)."""
+    values = {
+        name: parse_band(getattr(args, attribute, None), getattr(DEFAULT_BANDS, name), "--" + attribute.replace("_", "-"))
+        for name, attribute in BAND_ARGS.items()
+    }
+    return SizeBands(**values)
+
+
+def design_command(args: argparse.Namespace, device: str = "") -> Path:
     root = make_design(
         args.config,
         args.search_space,
@@ -3326,6 +4350,9 @@ def design_command(args: argparse.Namespace) -> Path:
         args.cavity_threshold,
         args.rt_margin_mm,
         args.rt_dose_per_fraction,
+        tr_max=float(args.tr_max),
+        bands=parse_bands(args),
+        device=device,
     )
     spec = sa.read_json(root / "spec.json")
     print(f"design directory: {root}")
@@ -3335,12 +4362,33 @@ def design_command(args: argparse.Namespace) -> Path:
         f"floor {spec['gaussian_seed_floor']:g}, precision {spec['precision']}, resolution_factor {spec['resolution_factor']:g}"
         f"{' (smoke)' if spec['smoke'] else ''}"
     )
+    screening = spec["screening"]
+    counts = screening["counts"]
+    print(
+        f"screening: {counts['n_candidates']} candidates, {counts['n_rejected_T_r_below_min']} with T_r < {screening['tr_min']:g} d and "
+        f"{counts['n_rejected_T_r_above_max']} with T_r > {screening['tr_max']:g} d rejected; {counts['n_screened']} solved, "
+        f"{counts['n_accepted']} accepted, {counts['n_solve_failed']} failed; bands {screening['bands']}; {screening['wall_time_s'] / 60:.1f} min"
+    )
     records = sa.read_csv(root / "design.csv")
     for cell in CELLS:
         members = [r for r in records if r["cell"] == cell]
-        ages = [float(r["rho_T_r"]) for r in members]
-        kills = [float(r["log_kill_total"]) for r in members]
-        print(f"  {cell}: {len(members)} patients, rho T_r {min(ages):.2f}-{max(ages):.2f}, Lambda {min(kills):.2f}-{max(kills):.2f}")
+        cell_counts = counts["cells"][cell]
+        rejected = ", ".join(f"{reason} {n}" for reason, n in cell_counts["n_rejected"].items() if n)
+        print(
+            f"  {cell}: {cell_counts['n_candidates']} candidates ({cell_counts['n_admissible']} admissible), {cell_counts['n_screened']} screened, "
+            f"{cell_counts['n_accepted']} accepted, {cell_counts['n_solve_failed']} failed; rejected: {rejected or '-'}"
+        )
+        if members:
+            spans = {
+                key: (min(float(r[key]) for r in members), max(float(r[key]) for r in members))
+                for key in ("resection_time", "rho_T_r", "r_core_mm", "r_whole_mm", "whole_core_ratio", "R_over_lambda", "visibility_margin")
+            }
+            print(
+                f"    {len(members)} patients: T_r {spans['resection_time'][0]:.0f}-{spans['resection_time'][1]:.0f} d, rho T_r "
+                f"{spans['rho_T_r'][0]:.1f}-{spans['rho_T_r'][1]:.1f}, r_core {spans['r_core_mm'][0]:.1f}-{spans['r_core_mm'][1]:.1f} mm, r_whole "
+                f"{spans['r_whole_mm'][0]:.1f}-{spans['r_whole_mm'][1]:.1f} mm, ratio {spans['whole_core_ratio'][0]:.2f}-{spans['whole_core_ratio'][1]:.2f}, "
+                f"R/lambda {spans['R_over_lambda'][0]:.1f}-{spans['R_over_lambda'][1]:.1f}, margin {spans['visibility_margin'][0]:.2f}-{spans['visibility_margin'][1]:.2f}"
+            )
     print(f"{spec['n_patients']} patients from {spec['n_candidates']} Sobol' points (seed {spec['design_seed']})")
     return root
 
@@ -3377,7 +4425,11 @@ def patient_blocks(patients: Sequence[Patient], n_blocks: int) -> list[list[Pati
 def worker_command(root: Path, experiment: str, device: str, patients: Sequence[Patient], args: argparse.Namespace) -> list[str]:
     """The command line of one dispatched worker: this script's
     experiment subcommand on one device and one block of patients, the
-    other options passed through, the assembly skipped."""
+    other options passed through (those given: --draws for fisher;
+    --maxfev for the fits; --delta-a for substitute; --tr-bounds and
+    --seed-peak for seedfix and profile; --seed-sigma-mm and
+    --lambda-mode for seedfix; --sigmas for profile), the assembly
+    skipped."""
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -3394,14 +4446,20 @@ def worker_command(root: Path, experiment: str, device: str, patients: Sequence[
     ]
     if getattr(args, "smoke", False):
         command.append("--smoke")
-    if experiment == "fisher" and getattr(args, "draws", None) is not None:
-        command += ["--draws", str(args.draws)]
-    if experiment in ("substitute", "seedfix") and getattr(args, "maxfev", None) is not None:
-        command += ["--maxfev", str(args.maxfev)]
-    if experiment == "substitute" and getattr(args, "t0", None):
-        command += ["--t0", str(args.t0)]
-    if experiment == "seedfix" and getattr(args, "tr_bounds", None):
-        command += ["--tr-bounds", str(args.tr_bounds)]
+    forwarded: list[tuple[tuple[str, ...], str, str]] = [  # (experiments, attribute, flag)
+        (("fisher",), "draws", "--draws"),
+        (("substitute", "seedfix", "profile"), "maxfev", "--maxfev"),
+        (("substitute",), "delta_a", "--delta-a"),
+        (("seedfix", "profile"), "tr_bounds", "--tr-bounds"),
+        (("seedfix", "profile"), "seed_peak", "--seed-peak"),
+        (("seedfix",), "seed_sigma_mm", "--seed-sigma-mm"),
+        (("seedfix",), "lambda_mode", "--lambda-mode"),
+        (("profile",), "sigmas", "--sigmas"),
+    ]
+    for experiments, attribute, flag in forwarded:
+        value = getattr(args, attribute, None)
+        if experiment in experiments and value is not None and str(value) != "":
+            command += [flag, str(value)]
     return command
 
 
@@ -3502,6 +4560,22 @@ def fisher_command(root: Path, args: argparse.Namespace, smoke: bool, devices: S
         assemble_fisher(root)
 
 
+def spec_tr_max(cohort: Cohort) -> float:
+    """The design's --tr-max (spec.json, screening.tr_max), the cap of the
+    substitute arm's T_0."""
+    return float(cohort.spec.get("screening", {}).get("tr_max", DEFAULT_TR_MAX))
+
+
+def parse_floats(text: str | None, default: Sequence[float], flag: str) -> list[float]:
+    """A comma-separated list of floats; the default when not given."""
+    if text is None or str(text).strip() == "":
+        return [float(v) for v in default]
+    try:
+        return [float(part) for part in str(text).split(",") if part.strip()]
+    except ValueError as error:
+        raise ValueError(f"{flag}: expected comma-separated numbers, got {text!r}.") from error
+
+
 def substitute_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
     cohort = load_cohort(root)
     patients = select_patients(cohort, args.patients, smoke)
@@ -3511,7 +4585,8 @@ def substitute_command(root: Path, args: argparse.Namespace, smoke: bool, device
         check_dispatch(record)
         return
     maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else MAXFEV)
-    t0_values = [float(v) for v in args.t0.split(",")] if args.t0 else list(SUBSTITUTE_T0)
+    deltas = parse_floats(getattr(args, "delta_a", None), SUBSTITUTE_DELTA_A, "--delta-a")
+    tr_max = spec_tr_max(cohort)
     out_dir = root / "runs" / "substitute"
     start = time.perf_counter()
     for index, patient in enumerate(patients):
@@ -3519,8 +4594,12 @@ def substitute_command(root: Path, args: argparse.Namespace, smoke: bool, device
         if marker.is_file():
             print(f"substitute {patient.id}: {marker} exists, skipped", flush=True)
             continue
-        print(f"substitute {patient.id} ({patient.cell}): T_r {patient.resection_time:.1f}, rho T_r {patient.rho * patient.resection_time:.2f}, maxfev {maxfev}", flush=True)
-        record = substitute_patient(cohort, patient, out_dir, maxfev, t0_values)
+        print(
+            f"substitute {patient.id} ({patient.cell}): T_r {patient.resection_time:.1f}, rho T_r {patient.rho * patient.resection_time:.2f}, "
+            f"delta_a {','.join(f'{d:g}' for d in deltas)}, T_0 in [{TR_MIN:g}, {tr_max:g}], maxfev {maxfev}",
+            flush=True,
+        )
+        record = substitute_patient(cohort, patient, out_dir, maxfev, deltas, tr_max)
         print(f"substitute {patient.id}: {record['wall_time_s'] / 60:.1f} min ({index + 1} done)", flush=True)
     print(f"substitute: {(time.perf_counter() - start) / 60:.1f} min", flush=True)
     if not getattr(args, "no_assemble", False):
@@ -3541,6 +4620,19 @@ def parse_tr_bounds(text: str | None) -> tuple[float, float]:
     return lo, hi
 
 
+def fixed_seed_args(args: argparse.Namespace) -> tuple[float, float]:
+    """(--seed-peak, --seed-sigma-mm) with the defaults DEFAULT_SEED_PEAK
+    and DEFAULT_SEED_SIGMA_MM; the peak must lie in (0, 1], the width be
+    positive."""
+    peak = float(args.seed_peak) if getattr(args, "seed_peak", None) is not None else DEFAULT_SEED_PEAK
+    sigma = float(args.seed_sigma_mm) if getattr(args, "seed_sigma_mm", None) is not None else DEFAULT_SEED_SIGMA_MM
+    if not 0.0 < peak <= 1.0:
+        raise ValueError(f"--seed-peak must lie in (0, 1], got {peak!r}.")
+    if not sigma > 0.0:
+        raise ValueError(f"--seed-sigma-mm must be positive, got {sigma!r}.")
+    return peak, sigma
+
+
 def seedfix_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
     cohort = load_cohort(root)
     patients = select_patients(cohort, args.patients, smoke)
@@ -3551,7 +4643,8 @@ def seedfix_command(root: Path, args: argparse.Namespace, smoke: bool, devices: 
         return
     maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else MAXFEV)
     tr_bounds = parse_tr_bounds(getattr(args, "tr_bounds", None))
-    peak, sigma = base_seed()
+    peak, sigma = fixed_seed_args(args)
+    modes = parse_lambda_modes(getattr(args, "lambda_mode", None))
     out_dir = root / "runs" / "seedfix"
     start = time.perf_counter()
     for index, patient in enumerate(patients):
@@ -3561,14 +4654,51 @@ def seedfix_command(root: Path, args: argparse.Namespace, smoke: bool, devices: 
             continue
         print(
             f"seedfix {patient.id} ({patient.cell}): T_r {patient.resection_time:.1f}, rho T_r {patient.rho * patient.resection_time:.2f}, "
-            f"seed peak {peak:.3f} sigma {sigma:.2f} mm, T_r in [{tr_bounds[0]:g}, {tr_bounds[1]:g}], maxfev {maxfev}",
+            f"lambda {patient.front_width:.2f} mm, R/lambda {patient.r_over_lambda:.1f}, seed peak {peak:.3f} sigma {sigma:.2f} mm, T_r in "
+            f"[{tr_bounds[0]:g}, {tr_bounds[1]:g}], lambda in [{LAMBDA_BOUNDS[0]:g}, {LAMBDA_BOUNDS[1]:g}], modes {','.join(modes)}, maxfev {maxfev}",
             flush=True,
         )
-        record = seedfix_patient(cohort, patient, out_dir, maxfev, tr_bounds)
+        record = seedfix_patient(cohort, patient, out_dir, maxfev, tr_bounds, peak, sigma, modes)
         print(f"seedfix {patient.id}: {record['wall_time_s'] / 60:.1f} min ({index + 1} done)", flush=True)
     print(f"seedfix: {(time.perf_counter() - start) / 60:.1f} min", flush=True)
     if not getattr(args, "no_assemble", False):
         assemble_seedfix(root)
+
+
+def profile_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
+    cohort = load_cohort(root)
+    if args.patients:
+        patients = select_patients(cohort, args.patients, smoke)
+    else:
+        patients = [patient for patient in cohort.patients if patient.fd_check]
+    if min(len(devices), len(patients)) > 1:
+        record = dispatch(root, "profile", devices, patients, args)
+        assemble_profile(root, record)
+        check_dispatch(record)
+        return
+    maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else MAXFEV)
+    tr_bounds = parse_tr_bounds(getattr(args, "tr_bounds", None))
+    peak, _ = fixed_seed_args(args)
+    sigmas = parse_floats(getattr(args, "sigmas", None), PROFILE_SIGMAS, "--sigmas")
+    if any(s <= 0 for s in sigmas):
+        raise ValueError(f"--sigmas must be positive widths in mm, got {args.sigmas!r}.")
+    out_dir = root / "runs" / "profile"
+    start = time.perf_counter()
+    for index, patient in enumerate(patients):
+        marker = out_dir / patient.id / PATIENT_FILE.format(experiment="profile")
+        if marker.is_file():
+            print(f"profile {patient.id}: {marker} exists, skipped", flush=True)
+            continue
+        print(
+            f"profile {patient.id} ({patient.cell}): T_r {patient.resection_time:.1f}, rho T_r {patient.rho * patient.resection_time:.2f}, "
+            f"seed peak {peak:.3f}, sigma_0 {','.join(f'{s:g}' for s in sigmas)} mm, T_r in [{tr_bounds[0]:g}, {tr_bounds[1]:g}], maxfev {maxfev}",
+            flush=True,
+        )
+        record = profile_patient(cohort, patient, out_dir, maxfev, tr_bounds, peak, sigmas)
+        print(f"profile {patient.id}: {record['wall_time_s'] / 60:.1f} min ({index + 1} done)", flush=True)
+    print(f"profile: {(time.perf_counter() - start) / 60:.1f} min", flush=True)
+    if not getattr(args, "no_assemble", False):
+        assemble_profile(root)
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -3594,7 +4724,7 @@ def _add_worker_arg(parser: argparse.ArgumentParser) -> None:
 
 def _add_design_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default=str(sa.DEFAULT_CONFIG), help="base config JSON (resection_cavity and rt_dose null)")
-    parser.add_argument("--search-space", default=str(sa.DEFAULT_SEARCH_SPACE), help="search-space JSON")
+    parser.add_argument("--search-space", default=str(DEFAULT_SEARCH_SPACE), help="search-space JSON (growth_efolds a script factor)")
     for key, path in sa.DEFAULT_TISSUE_MAPS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", default=str(path), help=f"NIfTI replacing the base config's {key} ('' keeps the base config's)")
     parser.add_argument(
@@ -3607,6 +4737,14 @@ def _add_design_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cavity-threshold", type=float, default=sa.CAVITY_THRESHOLD, help="cell density at or above which a voxel at resection_time is resected")
     parser.add_argument("--rt-margin-mm", type=float, default=sa.RT_MARGIN_MM, help="margin around the cavity of the dose region, mm")
     parser.add_argument("--rt-dose-per-fraction", type=float, default=sa.RT_DOSE_PER_FRACTION_GY, help="dose per fraction in Gy")
+    parser.add_argument("--tr-max", type=float, default=DEFAULT_TR_MAX, help=f"candidates with resection_time above it (days) are rejected; also caps the substitute arm's T_0 (default {DEFAULT_TR_MAX:g}; below {TR_MIN:g} d is rejected too)")
+    for name, attribute in BAND_ARGS.items():
+        lo, hi = getattr(DEFAULT_BANDS, name)
+        parser.add_argument(
+            f"--{attribute.replace('_', '-')}",
+            default=None,
+            help=f"size screening: accepted range lo,hi of {name} (PROVISIONAL default {lo:g},{hi:g}, to be replaced from BraTS)",
+        )
 
 
 def _add_invariance_args(parser: argparse.ArgumentParser) -> None:
@@ -3616,30 +4754,51 @@ def _add_invariance_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resection-time", type=float, default=None, help="T_r of the invariance patient (default the base config's)")
 
 
-def _add_patient_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--patients", default=None, help="comma-separated patient ids or ranges (p03, p00-p07); default all, or the first of each cell with --smoke")
+def _add_patient_args(parser: argparse.ArgumentParser, profile: bool = False) -> None:
+    default = "the fd_check patient of each cell" if profile else "all, or the first of each cell with --smoke"
+    parser.add_argument("--patients", default=None, help=f"comma-separated patient ids or ranges (p03, p00-p07); default {default}")
 
 
 def _add_fisher_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--draws", type=int, default=None, help=f"noise draws K (default {NOISE_DRAWS}, {SMOKE.draws} with --smoke)")
 
 
+def _add_fit_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--maxfev", type=int, default=None, help=f"evaluations per fit (default {MAXFEV}, {SMOKE.maxfev} with --smoke)")
+
+
 def _add_substitute_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--maxfev", type=int, default=None, help=f"Nelder-Mead evaluations per fit (default {MAXFEV}, {SMOKE.maxfev} with --smoke)")
-    parser.add_argument("--t0", default=None, help=f"comma-separated T_0 values in days; default {','.join(f'{v:g}' for v in SUBSTITUTE_T0)}")
+    parser.add_argument("--delta-a", default=None, help=f"comma-separated deficits delta_a in e-folds (T_0 = T_r - delta_a / rho); default {','.join(f'{v:g}' for v in SUBSTITUTE_DELTA_A)}")
 
 
-def _add_seedfix_args(parser: argparse.ArgumentParser, maxfev: bool = True) -> None:
-    if maxfev:
-        parser.add_argument("--maxfev", type=int, default=None, help=f"bounded-search evaluations per fit (default {MAXFEV}, {SMOKE.maxfev} with --smoke)")
+def _add_seed_peak_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--seed-peak", type=float, default=None, help=f"the fixed seed's peak density (default {DEFAULT_SEED_PEAK:g})")
+
+
+def _add_tr_bounds_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tr-bounds", default=None, help=f"the fitted growth time's range lo,hi in days; default {TR_BOUNDS[0]:g},{TR_BOUNDS[1]:g}")
+
+
+def _add_seedfix_args(parser: argparse.ArgumentParser) -> None:
+    _add_tr_bounds_arg(parser)
+    _add_seed_peak_arg(parser)
+    parser.add_argument("--seed-sigma-mm", type=float, default=None, help=f"the fixed seed's width sigma in mm (default {DEFAULT_SEED_SIGMA_MM:g})")
+    parser.add_argument("--lambda-mode", default=None, choices=(*LAMBDA_MODES, "both"), help="fit T_r with lambda at the truth (fixed), with lambda fitted too (free), or both (default)")
+
+
+def _add_profile_args(parser: argparse.ArgumentParser, shared: bool = False) -> None:
+    if not shared:
+        _add_tr_bounds_arg(parser)
+        _add_seed_peak_arg(parser)
+    parser.add_argument("--sigmas", default=None, help=f"comma-separated fixed seed widths sigma_0 in mm; default {','.join(f'{v:g}' for v in PROFILE_SIGMAS)}")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    design = commands.add_parser("design", help="draw the cohort and write the design directory")
+    design = commands.add_parser("design", help="draw and screen the cohort and write the design directory")
     _add_common_args(design)
+    _add_device_arg(design, single=True)
     _add_design_args(design)
     invariance = commands.add_parser("invariance", help="experiment 0")
     _add_common_args(invariance)
@@ -3655,53 +4814,68 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(substitute)
     _add_device_arg(substitute)
     _add_patient_args(substitute)
+    _add_fit_args(substitute)
     _add_substitute_args(substitute)
     _add_worker_arg(substitute)
     seedfix = commands.add_parser("seedfix", help="experiment 3")
     _add_common_args(seedfix)
     _add_device_arg(seedfix)
     _add_patient_args(seedfix)
+    _add_fit_args(seedfix)
     _add_seedfix_args(seedfix)
     _add_worker_arg(seedfix)
-    everything = commands.add_parser("all", help="design, invariance, fisher, substitute and seedfix in order")
+    profile = commands.add_parser("profile", help="experiment 4")
+    _add_common_args(profile)
+    _add_device_arg(profile)
+    _add_patient_args(profile, profile=True)
+    _add_fit_args(profile)
+    _add_profile_args(profile)
+    _add_worker_arg(profile)
+    everything = commands.add_parser("all", help="design (one device), then substitute, seedfix and profile")
     _add_common_args(everything)
     _add_device_arg(everything)
     _add_design_args(everything)
-    _add_invariance_args(everything)
     _add_patient_args(everything)
-    _add_fisher_args(everything)
+    _add_fit_args(everything)
     _add_substitute_args(everything)
-    _add_seedfix_args(everything, maxfev=False)
+    _add_seedfix_args(everything)
+    _add_profile_args(everything, shared=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = Path(args.output_dir) / args.name
-    if args.command == "design":
-        design_command(args)
-        return 0
-    if args.command == "all" and not (root / "spec.json").is_file():
-        design_command(args)
-    elif args.command == "all":
-        print(f"design directory {root} exists, kept")
-    if not (root / "spec.json").is_file():
-        raise FileNotFoundError(f"{root / 'spec.json'} not found; run the design first.")
-    smoke = bool(args.smoke) or bool(sa.read_json(root / "spec.json").get("smoke", False))
     devices = parse_devices(args.gpus)
+    if args.command == "design":
+        if len(devices) > 1:
+            raise ValueError(f"design screens on one device; give --gpus one entry, not {args.gpus!r}.")
+        device = "" if args.smoke else devices[0]
+        configure_device(device)
+        design_command(args, device)
+        return 0
+    smoke = bool(args.smoke) or ((root / "spec.json").is_file() and bool(sa.read_json(root / "spec.json").get("smoke", False)))
     if smoke:
         devices = ["" for _ in devices]  # the CPU, as many workers as devices given
     if args.command == "invariance" and len(devices) > 1:
         raise ValueError(f"invariance runs on one device; give --gpus one entry, not {args.gpus!r}.")
     configure_device(devices[0])
-    if args.command in ("invariance", "all"):
+    if args.command == "all" and not (root / "spec.json").is_file():
+        design_command(args, devices[0])
+    elif args.command == "all":
+        print(f"design directory {root} exists, kept")
+    if not (root / "spec.json").is_file():
+        raise FileNotFoundError(f"{root / 'spec.json'} not found; run the design first.")
+    if args.command == "invariance":
         invariance_command(root, args)
-    if args.command in ("fisher", "all"):
+    if args.command == "fisher":
         fisher_command(root, args, smoke, devices)
     if args.command in ("substitute", "all"):
         substitute_command(root, args, smoke, devices)
     if args.command in ("seedfix", "all"):
         seedfix_command(root, args, smoke, devices)
+    if args.command in ("profile", "all"):
+        profile_command(root, args, smoke, devices)
     return 0
 
 
