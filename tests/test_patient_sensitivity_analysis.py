@@ -1,20 +1,23 @@
 """Tests of scripts/patient_sensitivity_analysis.py (loaded with importlib
 from scripts/), fast only: no patient data, no solver run.
 
-(1) The clinical timeline from synthetic session dates (resection three
-days before the post-op scan, 30 weekday fractions within six weeks, 42
-TMZ days, the adjuvant start 28 days after the CRT end, 14-day cycles of
-5 days on with the config's per-cycle doses, truncation at the last
-session, every model day shifted by preop_time), the protocol doses read
-from the shipped base config, (2) the pre-op relabelling 4 -> 3 and the
+(1) The clinical timeline from synthetic session dates, anchored on the
+CRT start session's day t3 whatever its weekday (resection three days
+before the post-op scan, 30 fractions at t3 + 7 w + d, 42 TMZ days from
+t3, the adjuvant start at t3 + 69, 14-day cycles of 5 days on with the
+config's per-cycle doses, truncation at the last session, every model
+day shifted by preop_time, the CRT-relative offsets and the anchor line
+of the spec record), the protocol doses read from the shipped base
+config, (2) the pre-op relabelling 4 -> 3 and the
 cavity exclusion in the Dice, (3) Dice / msd / hd95 on toy masks with the
 empty-mask conventions, (4) the threshold-pair grid, the profiled
 thresholds and the row thresholds on a synthetic field, (5) the
 cheap-factor dedup (N (k_dyn + 2) distinct solves, every row mapped to a
 run of equal dynamics) and edema_threshold < core_threshold on every
 sampled row, (6) the shipped search space in both modes (factor order,
-cheap factors, the refusal of timeline keys, the shared ranges equal to
-sigma_v2's, the script's defaults) and the snapshot-day rule.
+cheap factors, the refusal of timeline keys, the v1 space's shared ranges
+equal to sigma_v2's, the v2 space differing from v1 in exactly its three
+widened ranges, the script's defaults) and the snapshot-day rule.
 """
 
 from __future__ import annotations
@@ -31,9 +34,17 @@ import pytest
 from fisher_kpp_jax import StuppFKPPSolver, read_config
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "patient_sensitivity_analysis.py"
-SEARCH_SPACE = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_search_space.json"
+# The script's default (v2, 2026-09-17) and its predecessor (v1, 2026-09-15).
+SEARCH_SPACE = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_v2_search_space.json"
+SEARCH_SPACE_V1 = SEARCH_SPACE.with_name("sailor_patient_search_space.json")
 BASE_CONFIG = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "configs" / "StuppFKPPSolver.json"
 SIGMA_V2_SEARCH_SPACE = SEARCH_SPACE.with_name("stupp_fkpp_sigma_v2_search_space.json")
+# The entries v2 changes against v1 (patient-fit priors widened toward non-response).
+V2_CHANGES = {
+    "growth.front_width_mm": {"min": 1.0, "max": 8.0, "scale": "log"},
+    "chemo_kill_rate": {"min": 5.0e-5, "max": 1.0e-2, "scale": "log"},
+    "rt_alpha": {"min": 5.0e-4, "max": 0.1, "scale": "log"},
+}
 
 
 def _load_script():
@@ -75,82 +86,130 @@ def _sessions(preop: date, later_offsets: dict[str, int], labels: dict[str, str]
 # --- (1) timeline ---
 
 
-def test_timeline_synthetic():
-    # Pre-op on a Wednesday; post-op 15 days later; CRT start on a Thursday
-    # (offset 43); further scans at 60, 100 (the last one).
+def _crt_offsets(t3: int) -> tuple[list[int], list[int], list[int]]:
+    """The protocol's fraction, concomitant TMZ and adjuvant start offsets
+    for a CRT start at offset t3: t3 + 7 w + d, t3 .. t3 + 41, t3 + 69."""
+    fractions = [t3 + 7 * w + d for w in range(6) for d in range(5)]
+    concomitant = [t3 + i for i in range(42)]
+    return fractions, concomitant, [t3 + 69 + 14 * c for c in range(20)]
+
+
+@pytest.mark.parametrize("t3", [40, 43])  # Monday and Thursday for a pre-op on Wednesday 2020-01-01
+def test_timeline_protocol_anchored_on_crt_start(t3: int):
+    # Pre-op on a Wednesday; post-op 15 days later; further scans at 60 and
+    # 100 (the last one). The schedule must not depend on the weekday of
+    # the CRT start date.
     preop = date(2020, 1, 1)
-    sessions = _sessions(preop, {"ses-02": 15, "ses-03": 43, "ses-04": 60, "ses-05": 100}, {"ses-02": "postop"})
-    assert (preop + timedelta(days=43)).weekday() == 3  # Thursday
+    assert (preop + timedelta(days=t3)).weekday() in (0, 3)
+    sessions = _sessions(preop, {"ses-02": 15, "ses-03": t3, "ses-04": 60, "ses-05": 100}, {"ses-02": "postop"})
     timeline = psa.build_timeline(sessions, PROTOCOL)
+    fractions, concomitant, adjuvant_starts = _crt_offsets(t3)
     assert timeline.resection_offset == 15 - 3
-    assert timeline.crt_start_offset == 43
-    # 30 fractions on weekdays, none on a weekend, the first on the CRT start
-    # day and the last within six weeks.
-    rt = timeline.rt_offsets
-    assert len(rt) == 30
-    assert rt[0] == 43
-    assert all(timeline.date_of(o).weekday() < 5 for o in rt)
-    assert rt[-1] - rt[0] <= 7 * 6 - 1
-    assert rt[-1] == 43 + 41  # Thursday start: fractions end on the Wednesday of week 7
-    assert len(set(rt)) == 30
-    # 42 consecutive TMZ days from the CRT start.
-    assert timeline.concomitant_offsets == tuple(43 + i for i in range(42))
-    assert timeline.last_crt_offset == 43 + 41
-    # Adjuvant: 28 days after the last CRT day (day 84) -> day 112, after the
-    # horizon 100: no cycle.
+    assert timeline.crt_start_offset == t3 and timeline.crt_session_id == "ses-03"
+    # 30 fractions at t3 + 7 w + d (w = 0..5, d = 0..4), the last on t3 + 39.
+    assert list(timeline.rt_offsets) == fractions
+    assert list(timeline.rt_offsets_total) == fractions and fractions[-1] == t3 + 39
+    assert [timeline.crt_offset(o) for o in timeline.rt_offsets] == [7 * w + d for w in range(6) for d in range(5)]
+    # 42 consecutive TMZ days from t3; the last CRT day is t3 + 41.
+    assert list(timeline.concomitant_offsets) == concomitant
+    assert timeline.last_crt_offset == t3 + 41
+    # Adjuvant start t3 + 69 (= t3 + 41 + 28): after the horizon 100 for
+    # both starts, so no cycle runs.
+    assert adjuvant_starts[0] == t3 + 69 > 100
     assert timeline.adjuvant_cycles == ()
     assert timeline.horizon_offset == 100
     assert timeline.n_rt_dropped == 0 and timeline.n_concomitant_dropped == 0
     chemo_offsets, chemo_doses = timeline.chemo_schedule
-    assert chemo_offsets == list(timeline.concomitant_offsets)
+    assert chemo_offsets == concomitant
     assert chemo_doses == [75.0] * 42
-    assert timeline.snapshot_offsets == {"ses-01": 0, "ses-02": 15, "ses-03": 43, "ses-04": 60, "ses-05": 100}
+    assert timeline.snapshot_offsets == {"ses-01": 0, "ses-02": 15, "ses-03": t3, "ses-04": 60, "ses-05": 100}
     # Every model day shifts by preop_time.
     days = timeline.model_days(137.5)
     assert days["resection_time"] == pytest.approx(137.5 + 12)
     assert days["time_after_resection"] == pytest.approx(100 - 12)
-    assert days["rt_times"] == pytest.approx([137.5 + o for o in rt])
-    assert days["chemo_times"] == pytest.approx([137.5 + o for o in chemo_offsets])
+    assert days["rt_times"] == pytest.approx([137.5 + o for o in fractions])
+    assert days["chemo_times"] == pytest.approx([137.5 + o for o in concomitant])
+    assert days["snapshots"]["ses-03"] == pytest.approx(137.5 + t3)
     assert days["snapshots"]["ses-05"] == pytest.approx(237.5)
     assert days["stopping_time"] == pytest.approx(days["resection_time"] + days["time_after_resection"])
+    # The spec record: calendar dates for reference, offsets after the
+    # pre-op scan and relative to the CRT start, the anchor line.
     record = timeline.record()
+    assert record["protocol_anchor"] == "ses-03 = day 0 of CRT week 1; weekdays from the calendar are not used"
     assert record["resection"]["date"] == (preop + timedelta(days=12)).isoformat()
+    assert record["crt_start"] == {
+        "session": "ses-03", "date": (preop + timedelta(days=t3)).isoformat(), "offset_days": t3, "crt_offset_days": 0,
+    }
+    assert [f["crt_offset_days"] for f in record["rt_fractions"]] == [o - t3 for o in fractions]
+    assert [f["offset_days"] for f in record["rt_fractions"]] == fractions
+    assert record["rt_fractions"][-1]["date"] == (preop + timedelta(days=t3 + 39)).isoformat()
+    assert [d["crt_offset_days"] for d in record["concomitant_tmz"]] == list(range(42))
+    assert record["last_crt_day"]["crt_offset_days"] == 41
+    assert record["adjuvant_start"]["crt_offset_days"] == 69 and record["adjuvant_start"]["offset_days"] == t3 + 69
     assert record["n_rt_fractions"] == 30 and record["adjuvant_cycles"] == []
-    assert "adjuvant cycle table" in psa.format_timeline(timeline)
+    table = psa.format_timeline(timeline)
+    assert "adjuvant cycle table" in table and "CRT day" in table
+    assert "fractions: 30 at CRT days 0-4, 7-11, 14-18, 21-25, 28-32, 35-39" in table
+    assert "concomitant TMZ: 42 days at CRT days 0-41" in table
+    assert "Mon" not in table and "Thu" not in table
 
 
-def test_timeline_adjuvant_cycles_and_truncation():
+@pytest.mark.parametrize("t3", [40, 43])
+def test_timeline_adjuvant_cycles_and_truncation(t3: int):
     preop = date(2020, 1, 1)
-    # Last scan at day 152: adjuvant starts at day 112 (CRT end 84 + 28);
-    # cycles at 112, 126, 140 (5 days each: 140-144) and 154 (beyond).
-    sessions = _sessions(preop, {"ses-02": 15, "ses-03": 43, "ses-04": 152}, {"ses-02": "postop"})
+    fractions, concomitant, adjuvant_starts = _crt_offsets(t3)
+    # Last scan at t3 + 109: the adjuvant phase starts at t3 + 69 and the
+    # cycles at t3 + 69, 83, 97 (5 days each, the third t3 + 97..101); the
+    # fourth (t3 + 111) starts after the horizon.
+    horizon = t3 + 109
+    sessions = _sessions(preop, {"ses-02": 15, "ses-03": t3, "ses-04": horizon}, {"ses-02": "postop"})
     timeline = psa.build_timeline(sessions, PROTOCOL)
     cycles = timeline.adjuvant_cycles
-    assert [c.start_offset for c in cycles] == [112, 126, 140]
+    assert [c.start_offset for c in cycles] == adjuvant_starts[:3] == [t3 + 69, t3 + 83, t3 + 97]
     assert [c.dose for c in cycles] == [150.0, 200.0, 200.0]
     assert all(c.offsets == tuple(c.start_offset + i for i in range(5)) for c in cycles)
+    assert [timeline.crt_offset(o) for c in cycles for o in c.offsets] == [
+        *range(69, 74), *range(83, 88), *range(97, 102)
+    ]
     assert all(c.n_dropped == 0 for c in cycles)
     chemo_offsets, chemo_doses = timeline.chemo_schedule
     assert len(chemo_offsets) == 42 + 15
-    assert chemo_offsets == sorted(chemo_offsets)
+    assert chemo_offsets == sorted(chemo_offsets) and chemo_offsets[:42] == concomitant
     assert sum(chemo_doses) == pytest.approx(42 * 75 + 5 * 150 + 10 * 200)
-    # A last scan inside a cycle truncates it: day 142 keeps 140, 141, 142.
-    sessions = _sessions(preop, {"ses-02": 15, "ses-03": 43, "ses-04": 142}, {"ses-02": "postop"})
+    record = timeline.record()
+    assert [c["start_crt_offset_days"] for c in record["adjuvant_cycles"]] == [69, 83, 97]
+    assert [d["crt_offset_days"] for d in record["adjuvant_cycles"][0]["days"]] == list(range(69, 74))
+    assert record["chemo_offsets"] == chemo_offsets and record["chemo_total_dose_mg_m2"] == pytest.approx(sum(chemo_doses))
+    # All offsets shift by preop_time; the resection offset is unchanged.
+    days = timeline.model_days(60.0)
+    assert days["chemo_times"] == pytest.approx([60.0 + o for o in chemo_offsets])
+    assert days["rt_times"] == pytest.approx([60.0 + o for o in fractions])
+    assert days["resection_time"] == pytest.approx(60.0 + 12)
+    # A last scan inside a cycle truncates it: t3 + 99 keeps t3 + 97, 98, 99.
+    sessions = _sessions(preop, {"ses-02": 15, "ses-03": t3, "ses-04": t3 + 99}, {"ses-02": "postop"})
     truncated = psa.build_timeline(sessions, PROTOCOL).adjuvant_cycles
-    assert truncated[-1].offsets == (140, 141, 142) and truncated[-1].n_dropped == 2
+    assert truncated[-1].offsets == (t3 + 97, t3 + 98, t3 + 99) and truncated[-1].n_dropped == 2
     assert len(truncated) == 3
-    # A last scan before the CRT end drops fractions and TMZ days.
-    sessions = _sessions(preop, {"ses-02": 15, "ses-03": 43, "ses-04": 50}, {"ses-02": "postop"})
+    # A last scan before the CRT end drops fractions and TMZ days: at
+    # t3 + 7 the fractions 0-4 and 7 (6) and the TMZ days 0-7 (8) remain.
+    sessions = _sessions(preop, {"ses-02": 15, "ses-03": t3, "ses-04": t3 + 7}, {"ses-02": "postop"})
     short = psa.build_timeline(sessions, PROTOCOL)
-    assert short.n_rt_dropped == 30 - len(short.rt_offsets) > 0
+    assert list(short.rt_offsets) == [t3 + d for d in (0, 1, 2, 3, 4, 7)] and short.n_rt_dropped == 24
     assert short.n_concomitant_dropped == 42 - 8
-    assert all(o <= 50 for o in short.rt_offsets)
+    assert short.adjuvant_cycles == ()
     # A post-op scan within three days of the pre-op one puts the resection
     # before the pre-op scan; a CRT start needs a follow-up after the post-op scan.
     with pytest.raises(ValueError, match="precedes"):
-        psa.build_timeline(_sessions(preop, {"ses-02": 2, "ses-03": 43}, {"ses-02": "postop"}), PROTOCOL)
+        psa.build_timeline(_sessions(preop, {"ses-02": 2, "ses-03": t3}, {"ses-02": "postop"}), PROTOCOL)
     with pytest.raises(ValueError, match="no followup"):
         psa.build_timeline(_sessions(preop, {"ses-02": 45, "ses-03": 43}, {"ses-02": "postop"}), PROTOCOL)
+
+
+def test_fraction_offsets_pattern():
+    assert psa.fraction_offsets(0, 30) == tuple(7 * w + d for w in range(6) for d in range(5))
+    assert psa.fraction_offsets(10, 7) == (10, 11, 12, 13, 14, 17, 18)
+    assert psa.fraction_offsets(3, 0) == ()
+    assert psa.N_FRACTIONS == 30 and psa.CONCOMITANT_DAYS == 42 and psa.ADJUVANT_DELAY_DAYS == 28
 
 
 def test_protocol_from_shipped_config():
@@ -414,13 +473,14 @@ def test_search_space_modes():
 
 
 def test_shared_ranges_equal_sigma_v2():
-    """Every range and scale the patient space shares with the sigma_v2
+    """Every range and scale the v1 patient space shares with the sigma_v2
     atlas space (growth, seed, diffusivity_ratio, chemo_kill_rate,
     chemo_decay_rate, rt_alpha, rt_alpha_beta_ratio, the seed fractions,
     gaussian_seed_scale) equals it; preop_time stands in for
     resection_time with its range, and only the threshold factors are
-    the patient space's own."""
-    patient = {k: v for k, v in json.loads(SEARCH_SPACE.read_text()).items() if not k.startswith("_")}
+    the patient space's own. This documents the sigma_v2 alignment of v1
+    (2026-09-15); v2 departs from it in three ranges (below)."""
+    patient = {k: v for k, v in json.loads(SEARCH_SPACE_V1.read_text()).items() if not k.startswith("_")}
     atlas = {k: v for k, v in json.loads(SIGMA_V2_SEARCH_SPACE.read_text()).items() if not k.startswith("_")}
     shared = set(patient) & set(atlas)
     assert shared == set(atlas) - {"resection_time", "time_after_resection"}
@@ -428,10 +488,54 @@ def test_shared_ranges_equal_sigma_v2():
         assert patient[key] == atlas[key], key
     assert patient["preop_time"] == atlas["resection_time"]
     assert set(patient) - shared == {"preop_time", "core_threshold", "edema_threshold_ratio"}
-    space, _ = psa.read_patient_search_space(SEARCH_SPACE, "sampled")
+    space, _ = psa.read_patient_search_space(SEARCH_SPACE_V1, "sampled")
     assert space.factors["front_width_mm"].high == 4.0 and space.factors["seed_sigma_mm"].low == 5.0
     assert space.factors["chemo_kill_rate"].low == 1e-3 and space.factors["chemo_kill_rate"].high == 3.5e-2
     assert space.factors["rt_alpha"].low == 5e-3
+
+
+def _flat_entries(path: Path) -> dict[str, object]:
+    """The non-comment entries of a search-space file with the derived
+    groups' sub-entries flattened to '<group>.<factor>' (their 'derives'
+    lists kept under '<group>.derives')."""
+    flat: dict[str, object] = {}
+    for key, value in json.loads(path.read_text()).items():
+        if key.startswith("_"):
+            continue
+        if isinstance(value, dict) and "derives" in value:
+            for sub, entry in value.items():
+                flat[f"{key}.{sub}"] = entry
+        else:
+            flat[key] = value
+    return flat
+
+
+def test_v2_differs_from_v1_in_three_ranges():
+    """The v2 space (the script's default) equals v1 in every non-comment
+    entry except rt_alpha, chemo_kill_rate and growth.front_width_mm, whose
+    ranges are V2_CHANGES; the loader sees the same factors in the same
+    order, and the parser's default search space is the v2 file."""
+    v1, v2 = _flat_entries(SEARCH_SPACE_V1), _flat_entries(SEARCH_SPACE)
+    assert set(v1) == set(v2)
+    changed = {key for key in v1 if v1[key] != v2[key]}
+    assert changed == set(V2_CHANGES)
+    for key, entry in V2_CHANGES.items():
+        assert v2[key] == entry, key
+        assert v1[key]["scale"] == entry["scale"] == "log", key
+    for key in set(v1) - changed:
+        assert v1[key] == v2[key], key
+    for mode in ("profiled", "sampled"):
+        space_v1, meta_v1 = psa.read_patient_search_space(SEARCH_SPACE_V1, mode)
+        space_v2, meta_v2 = psa.read_patient_search_space(SEARCH_SPACE, mode)
+        assert space_v1.names == space_v2.names and meta_v1["cheap_factors"] == meta_v2["cheap_factors"]
+        assert space_v2.overrides == space_v1.overrides
+    space, _ = psa.read_patient_search_space(SEARCH_SPACE, "sampled")
+    assert (space.factors["rt_alpha"].low, space.factors["rt_alpha"].high) == (5e-4, 0.1)
+    assert (space.factors["chemo_kill_rate"].low, space.factors["chemo_kill_rate"].high) == (5e-5, 1e-2)
+    assert (space.factors["front_width_mm"].low, space.factors["front_width_mm"].high) == (1.0, 8.0)
+    assert psa.DEFAULT_SEARCH_SPACE == SEARCH_SPACE
+    args = psa.build_parser().parse_args(["design", "--name", "x"])
+    assert Path(args.search_space) == SEARCH_SPACE
 
 
 def test_defaults():
@@ -441,6 +545,7 @@ def test_defaults():
     args = psa.build_parser().parse_args(["design", "--name", "x"])
     assert args.sessions == "02-08" and args.log2_n == 10 and args.threshold_mode == "sampled"
     assert args.search_space == str(psa.DEFAULT_SEARCH_SPACE) and args.patient == "sub-01"
+    assert psa.DEFAULT_SEARCH_SPACE.name == "sailor_patient_v2_search_space.json"
     assert psa.parse_sessions(args.sessions) == [f"ses-{n:02d}" for n in range(2, 9)]
 
 

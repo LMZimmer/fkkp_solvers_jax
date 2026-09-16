@@ -34,22 +34,33 @@ segmentation's (nothing is resampled; a mismatch is an error) before
 sampling anything (``check_patient_data``; the record goes into
 spec.json under data_checks).
 
-Clinical schedule (fixed): resection RESECTION_DAYS_BEFORE_POSTOP (3)
-days before the post-op scan date; chemoradiotherapy (CRT) from the CRT
-start date, N_FRACTIONS (30) fractions on calendar weekdays (Mon-Fri)
-and CONCOMITANT_DAYS (42) daily temozolomide (TMZ) days from that date,
-with the concomitant dose of the base config's protocol
+Clinical schedule (fixed), defined on model days relative to the CRT
+start session and NOT on calendar weekdays (the follow-up dates of the
+tsv are approximate, and the dataset convention is that the CRT start
+session marks the start of a full Stupp week): resection
+RESECTION_DAYS_BEFORE_POSTOP (3) days before the post-op scan date;
+with t3 the day of the CRT start session (ses-03 for sub-01),
+chemoradiotherapy (CRT) with N_FRACTIONS (30) fractions at
+t3 + 7 w + d for w = 0..CRT_WEEKS - 1 (6 weeks) and
+d = 0..FRACTIONS_PER_WEEK - 1 (5 per week; the last fraction on
+t3 + 39) and CONCOMITANT_DAYS (42) daily temozolomide (TMZ) days
+t3 .. t3 + 41, with the concomitant dose of the base config's protocol
 (``protocol_from_config``: 75 mg/m^2); adjuvant TMZ from
 ADJUVANT_DELAY_DAYS (28) days after the last CRT day (the later of the
-last fraction and the last concomitant day), ADJUVANT_DAYS_ON (5) days
-on then 9 off in ADJUVANT_CYCLE_DAYS (14) cycles with the base config's
-per-cycle doses (150 mg/m^2 in cycle 1, 200 afterwards), as many cycles
-as start before the last session date, a cycle truncated at the end of
-the run. NOTE: the base config's own protocol uses 28-day adjuvant
-cycles; the 14-day cycle is this analysis's definition, and the
-concomitant and adjuvant dose values are the only things taken from
-the config's schedule. The design step prints the calendar and the
-cycle table (``build_timeline``, ``print_timeline``).
+last fraction and the last concomitant day, t3 + 41, so the first
+cycle starts on t3 + 69), ADJUVANT_DAYS_ON (5) days on then 9 off in
+ADJUVANT_CYCLE_DAYS (14) cycles (t3 + 69..73, t3 + 83..87, ...) with
+the base config's per-cycle doses (150 mg/m^2 in cycle 1, 200
+afterwards), as many cycles as start before the last session date, a
+cycle truncated at the end of the run; every event after the last
+session is dropped and counted. NOTE: the base config's own protocol
+uses 28-day adjuvant cycles; the 14-day cycle is this analysis's
+definition, and the concomitant and adjuvant dose values are the only
+things taken from the config's schedule. The design step prints the
+timeline table (calendar dates for reference, offsets after the pre-op
+scan and relative to the CRT start) and the cycle table
+(``build_timeline``, ``format_timeline``); spec.json's timeline holds
+the same offsets and the line protocol_anchor.
 
 Timeline (model days). Day 0 is the seed; the pre-op scan is at
 t_pre = preop_time, a sampled factor (30-200 days) in the role of the
@@ -93,7 +104,7 @@ ranges exactly as the atlas script maps them onto the atlas tissue
 ``project_seeds`` does the mapping).
 
 Search space (--search-space, default
-fisher_kpp_jax/search_spaces/sailor_patient_search_space.json), read as
+fisher_kpp_jax/search_spaces/sailor_patient_v2_search_space.json), read as
 the atlas script reads its files (``load_search_space``) with three
 script factors that are not solver parameters: preop_time and the two
 threshold factors core_threshold and edema_threshold_ratio, which carry
@@ -239,7 +250,7 @@ import threading
 import time
 import traceback
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -307,7 +318,7 @@ from sensitivity_analysis import (  # noqa: E402
 )
 
 SOLVER_NAME = "StuppFKPPSolver"
-DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_search_space.json"
+DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_v2_search_space.json"
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_patient")
 DEFAULT_PATIENT = "sub-01"
 DEFAULT_PATIENT_ROOT = Path("/mnt/Drive4/lucas/SAILOR/processed")
@@ -347,12 +358,12 @@ LABEL_CONVENTIONS: dict[str, Any] = {
 RESECTION_DAYS_BEFORE_POSTOP = 3
 CRT_WEEKS = 6
 FRACTIONS_PER_WEEK = 5
-N_FRACTIONS = CRT_WEEKS * FRACTIONS_PER_WEEK  # 30, on calendar weekdays
-CONCOMITANT_DAYS = 7 * CRT_WEEKS  # 42 daily TMZ days
+N_FRACTIONS = CRT_WEEKS * FRACTIONS_PER_WEEK  # 30, at t3 + 7 w + d (``fraction_offsets``)
+CONCOMITANT_DAYS = 7 * CRT_WEEKS  # 42 daily TMZ days from t3
 ADJUVANT_DELAY_DAYS = 28  # after the last CRT day
 ADJUVANT_DAYS_ON = 5
 ADJUVANT_CYCLE_DAYS = 14  # 5 on / 9 off (the base config's protocol has 28)
-WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+PROTOCOL_ANCHOR = "ses-03 = day 0 of CRT week 1; weekdays from the calendar are not used"
 # The dose map's maximum should be the total prescribed dose, about 60 Gy.
 RT_TOTAL_DOSE_PLAUSIBLE_GY: tuple[float, float] = (50.0, 70.0)
 
@@ -778,7 +789,10 @@ class Protocol:
             "adjuvant_first_cycle_dose_mg_m2": self.adjuvant_first_dose,
             "adjuvant_later_cycles_dose_mg_m2": self.adjuvant_later_dose,
             "n_fractions": self.n_fractions,
-            "fractions_on": "calendar weekdays (Mon-Fri) from the CRT start date",
+            "fractions_on": (
+                f"t3 + 7 w + d for w = 0..{CRT_WEEKS - 1}, d = 0..{FRACTIONS_PER_WEEK - 1}, t3 the CRT start "
+                "session's day (calendar weekdays are not used)"
+            ),
             "concomitant_days": self.concomitant_days,
             "adjuvant_delay_days": self.adjuvant_delay_days,
             "adjuvant_days_on": self.adjuvant_days_on,
@@ -867,7 +881,9 @@ class Timeline:
     Attributes:
         sessions: The sessions, the pre-op one first.
         resection_offset: Resection day.
-        crt_start_offset: The first fraction and the first TMZ day.
+        crt_start_offset: The CRT start session's day t3: the first
+            fraction and the first TMZ day (``PROTOCOL_ANCHOR``).
+        crt_session_id: That session's id.
         rt_offsets: The fractions within the run.
         concomitant_offsets: The concomitant TMZ days within the run.
         adjuvant_cycles: The cycles starting within the run.
@@ -878,6 +894,7 @@ class Timeline:
     sessions: tuple[Session, ...]
     resection_offset: int
     crt_start_offset: int
+    crt_session_id: str
     rt_offsets: tuple[int, ...]
     concomitant_offsets: tuple[int, ...]
     adjuvant_cycles: tuple[AdjuvantCycle, ...]
@@ -905,9 +922,13 @@ class Timeline:
 
     @property
     def rt_offsets_total(self) -> tuple[int, ...]:
-        """All N_FRACTIONS fraction offsets (weekdays from the CRT start),
-        the dropped ones included."""
-        return weekday_offsets(self.preop_date, self.crt_start_offset, N_FRACTIONS)
+        """All N_FRACTIONS fraction offsets (``fraction_offsets`` from the
+        CRT start), the dropped ones included."""
+        return fraction_offsets(self.crt_start_offset, N_FRACTIONS)
+
+    def crt_offset(self, offset: int) -> int:
+        """An offset after the pre-op scan as days relative to the CRT start."""
+        return int(offset) - self.crt_start_offset
 
     @property
     def snapshot_offsets(self) -> dict[str, int]:
@@ -945,15 +966,29 @@ class Timeline:
         chemo_offsets, chemo_doses = self.chemo_schedule
 
         def dated(offsets: Sequence[int]) -> list[dict[str, Any]]:
-            return [{"date": self.date_of(o).isoformat(), "offset_days": int(o)} for o in offsets]
+            return [
+                {"date": self.date_of(o).isoformat(), "offset_days": int(o), "crt_offset_days": self.crt_offset(o)}
+                for o in offsets
+            ]
 
         return {
             "preop_date": self.preop_date.isoformat(),
             "model_day": "t_pre + offset_days, t_pre = the row's preop_time (the seed is day 0)",
+            "protocol_anchor": PROTOCOL_ANCHOR,
+            "crt_offset_days": "days relative to the CRT start session's day (t3), the calendar dates are for reference",
             "sessions": [{**s.record(), "offset_days": self.snapshot_offsets[s.id]} for s in self.sessions],
             "resection": {"date": self.date_of(self.resection_offset).isoformat(), "offset_days": self.resection_offset},
-            "crt_start": {"date": self.date_of(self.crt_start_offset).isoformat(), "offset_days": self.crt_start_offset},
-            "last_crt_day": {"date": self.date_of(self.last_crt_offset).isoformat(), "offset_days": self.last_crt_offset},
+            "crt_start": {
+                "session": self.crt_session_id,
+                "date": self.date_of(self.crt_start_offset).isoformat(),
+                "offset_days": self.crt_start_offset,
+                "crt_offset_days": 0,
+            },
+            "last_crt_day": {
+                "date": self.date_of(self.last_crt_offset).isoformat(),
+                "offset_days": self.last_crt_offset,
+                "crt_offset_days": self.crt_offset(self.last_crt_offset),
+            },
             "rt_fractions": dated(self.rt_offsets),
             "n_rt_fractions": len(self.rt_offsets),
             "n_rt_fractions_dropped": self.n_rt_dropped,
@@ -964,12 +999,14 @@ class Timeline:
             "adjuvant_start": {
                 "date": self.date_of(self.last_crt_offset + ADJUVANT_DELAY_DAYS).isoformat(),
                 "offset_days": self.last_crt_offset + ADJUVANT_DELAY_DAYS,
+                "crt_offset_days": self.crt_offset(self.last_crt_offset + ADJUVANT_DELAY_DAYS),
             },
             "adjuvant_cycles": [
                 {
                     "cycle": c.number,
                     "start_date": self.date_of(c.start_offset).isoformat(),
                     "start_offset_days": c.start_offset,
+                    "start_crt_offset_days": self.crt_offset(c.start_offset),
                     "days": dated(c.offsets),
                     "n_days": len(c.offsets),
                     "n_days_dropped": c.n_dropped,
@@ -986,28 +1023,29 @@ class Timeline:
         }
 
 
-def weekday_offsets(preop_date: date, start_offset: int, n: int) -> tuple[int, ...]:
-    """The first n calendar weekdays (Mon-Fri) from the start offset, as
-    offsets after the pre-op date."""
-    offsets: list[int] = []
-    offset = int(start_offset)
-    while len(offsets) < n:
-        if (preop_date + timedelta(days=offset)).weekday() < 5:
-            offsets.append(offset)
-        offset += 1
-    return tuple(offsets)
+def fraction_offsets(start_offset: int, n: int) -> tuple[int, ...]:
+    """
+    The first n fraction days of the Stupp pattern from the CRT start
+    day: start + 7 w + d for w = 0, 1, ... and d = 0..FRACTIONS_PER_WEEK - 1
+    (FRACTIONS_PER_WEEK on, 7 - FRACTIONS_PER_WEEK off per week), as
+    offsets after the pre-op date. Calendar weekdays play no part.
+    """
+    start = int(start_offset)
+    return tuple(start + 7 * (i // FRACTIONS_PER_WEEK) + i % FRACTIONS_PER_WEEK for i in range(int(n)))
 
 
 def build_timeline(sessions: Sequence[Session], protocol: Protocol) -> Timeline:
     """
-    The clinical timeline of the module docstring on the patient's
-    calendar: the sessions (the pre-op one first, then by date), the
-    resection RESECTION_DAYS_BEFORE_POSTOP days before the post-op scan,
-    the CRT from the CRT start session's date (N_FRACTIONS fractions on
-    weekdays, CONCOMITANT_DAYS daily TMZ days), the adjuvant cycles from
+    The clinical timeline of the module docstring as day offsets after
+    the pre-op scan: the sessions (the pre-op one first, then by date),
+    the resection RESECTION_DAYS_BEFORE_POSTOP days before the post-op
+    scan, the CRT anchored on the CRT start session's day t3
+    (N_FRACTIONS fractions at t3 + 7 w + d, ``fraction_offsets``;
+    CONCOMITANT_DAYS daily TMZ days from t3), the adjuvant cycles from
     ADJUVANT_DELAY_DAYS after the last CRT day in ADJUVANT_CYCLE_DAYS
     cycles of ADJUVANT_DAYS_ON days, as many as start by the last session
     date, and every event after the last session dropped (counted).
+    Calendar weekdays are not used (``PROTOCOL_ANCHOR``).
 
     Raises:
         ValueError: The resection falls before the pre-op scan or after
@@ -1028,7 +1066,7 @@ def build_timeline(sessions: Sequence[Session], protocol: Protocol) -> Timeline:
         raise ValueError(f"the resection ({resection} days after the pre-op scan) precedes the pre-op scan.")
     if resection >= offset[crt.id]:
         raise ValueError(f"the resection (day {resection}) is not before the CRT start (day {offset[crt.id]}).")
-    rt_all = weekday_offsets(preop.date, offset[crt.id], protocol.n_fractions)
+    rt_all = fraction_offsets(offset[crt.id], protocol.n_fractions)
     concomitant_all = tuple(offset[crt.id] + i for i in range(protocol.concomitant_days))
     last_crt = max(rt_all[-1], concomitant_all[-1])
     adjuvant_start = last_crt + protocol.adjuvant_delay_days
@@ -1047,6 +1085,7 @@ def build_timeline(sessions: Sequence[Session], protocol: Protocol) -> Timeline:
         sessions=sessions,
         resection_offset=resection,
         crt_start_offset=offset[crt.id],
+        crt_session_id=crt.id,
         rt_offsets=rt_kept,
         concomitant_offsets=concomitant_kept,
         adjuvant_cycles=tuple(cycles),
@@ -1059,12 +1098,14 @@ def build_timeline(sessions: Sequence[Session], protocol: Protocol) -> Timeline:
 
 def format_timeline(timeline: Timeline) -> str:
     """The printed calendar and cycle table of a timeline."""
-    lines = ["timeline (model day = t_pre + offset; t_pre = the row's preop_time):"]
-    lines.append(f"  {'date':<12}{'day':<5}{'offset':>7}  event")
+    lines = [
+        f"timeline (model day = t_pre + offset; t_pre = the row's preop_time; {PROTOCOL_ANCHOR.replace('ses-03', timeline.crt_session_id)}; "
+        "the dates are the calendar's, for reference):",
+        f"  {'date':<12}{'offset':>7}{'CRT day':>9}  event",
+    ]
 
     def row(offset: int, event: str) -> str:
-        d = timeline.date_of(offset)
-        return f"  {d.isoformat():<12}{WEEKDAY_NAMES[d.weekday()]:<5}{offset:>+7d}  {event}"
+        return f"  {timeline.date_of(offset).isoformat():<12}{offset:>+7d}{timeline.crt_offset(offset):>+9d}  {event}"
 
     events: list[tuple[int, int, str]] = []
     for s in timeline.sessions:
@@ -1072,7 +1113,7 @@ def format_timeline(timeline: Timeline) -> str:
         events.append((timeline.snapshot_offsets[s.id], 0, f"scan {s.id} ({s.label}){flag}: snapshot"))
     events.append((timeline.resection_offset, 1, f"resection ({RESECTION_DAYS_BEFORE_POSTOP} days before the post-op scan)"))
     rt, conc = timeline.rt_offsets, timeline.concomitant_offsets
-    events.append((timeline.crt_start_offset, 2, f"CRT start: RT fraction 1 of {N_FRACTIONS}, TMZ {timeline.concomitant_dose:g} mg/m^2 day 1 of {CONCOMITANT_DAYS}"))
+    events.append((timeline.crt_start_offset, 2, f"CRT start ({timeline.crt_session_id}, CRT day 0): RT fraction 1 of {N_FRACTIONS}, TMZ {timeline.concomitant_dose:g} mg/m^2 day 1 of {CONCOMITANT_DAYS}"))
     if rt:
         events.append((rt[-1], 3, f"RT fraction {len(rt)} (last within the run; {timeline.n_rt_dropped} dropped after the horizon)"))
     if conc:
@@ -1085,18 +1126,34 @@ def format_timeline(timeline: Timeline) -> str:
     for offset, _, text in sorted(events):
         lines.append(row(offset, text))
     lines.append(
-        f"  fractions: {len(rt)} on weekdays {timeline.date_of(rt[0]) if rt else '-'} .. {timeline.date_of(rt[-1]) if rt else '-'}; "
-        f"concomitant TMZ: {len(conc)} days; adjuvant: {sum(len(c.offsets) for c in timeline.adjuvant_cycles)} days in "
+        f"  fractions: {len(rt)} at CRT days {_ranges(timeline.crt_offset(o) for o in rt)}; "
+        f"concomitant TMZ: {len(conc)} days at CRT days {_ranges(timeline.crt_offset(o) for o in conc)}; "
+        f"adjuvant: {sum(len(c.offsets) for c in timeline.adjuvant_cycles)} days in "
         f"{len(timeline.adjuvant_cycles)} cycle(s) ({ADJUVANT_DAYS_ON} on / {ADJUVANT_CYCLE_DAYS - ADJUVANT_DAYS_ON} off)"
     )
-    lines.append("adjuvant cycle table:")
-    lines.append(f"  {'cycle':<6}{'start':<12}{'end':<12}{'days on':>8}{'dropped':>8}{'dose':>8}")
+    lines.append("adjuvant cycle table (CRT day = days after the CRT start; dates for reference):")
+    lines.append(f"  {'cycle':<6}{'start':<12}{'end':<12}{'CRT days':>12}{'days on':>8}{'dropped':>8}{'dose':>8}")
     if not timeline.adjuvant_cycles:
         lines.append("  (none: the first cycle would start after the last session)")
     for c in timeline.adjuvant_cycles:
         end = timeline.date_of(c.offsets[-1]) if c.offsets else timeline.date_of(c.start_offset)
-        lines.append(f"  {c.number:<6}{timeline.date_of(c.start_offset).isoformat():<12}{end.isoformat():<12}{len(c.offsets):>8}{c.n_dropped:>8}{c.dose:>8g}")
+        crt_days = _ranges(timeline.crt_offset(o) for o in c.offsets) if c.offsets else "-"
+        lines.append(
+            f"  {c.number:<6}{timeline.date_of(c.start_offset).isoformat():<12}{end.isoformat():<12}{crt_days:>12}"
+            f"{len(c.offsets):>8}{c.n_dropped:>8}{c.dose:>8g}"
+        )
     return "\n".join(lines)
+
+
+def _ranges(values: Iterable[int]) -> str:
+    """Sorted integers as comma-separated runs, e.g. '0-4, 7-11, 14'."""
+    runs: list[list[int]] = []
+    for v in sorted(int(v) for v in values):
+        if runs and v == runs[-1][1] + 1:
+            runs[-1][1] = v
+        else:
+            runs.append([v, v])
+    return ", ".join(f"{a}-{b}" if a != b else f"{a}" for a, b in runs) or "-"
 
 
 # --- search space ---
@@ -2250,7 +2307,9 @@ def analyze_sweep(
 
 
 def _add_design_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--search-space", default=str(DEFAULT_SEARCH_SPACE), help="search-space JSON")
+    parser.add_argument(
+        "--search-space", default=str(DEFAULT_SEARCH_SPACE), help=f"search-space JSON (default {DEFAULT_SEARCH_SPACE.name})"
+    )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="base config JSON")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="parent of the sweep directory")
     parser.add_argument("--name", required=True, help="sweep directory name")

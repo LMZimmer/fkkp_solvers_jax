@@ -20,7 +20,7 @@
   "time_after_resection": 120.0,
   "chemo_kill_rate": {"min": 1.0e-3, "max": 3.5e-2, "scale": "log"},
   "chemo_decay_rate": 9.24,
-  "rt_alpha": {"min": 0.005, "max": 0.2, "scale": "log"},
+  "rt_alpha": {"min": 0.001, "max": 0.2, "scale": "log"},
   "rt_alpha_beta_ratio": {"min": 4.0, "max": 12.0, "scale": "linear"},
   "gaussian_seed_scale": 1.0,
   "seed": {

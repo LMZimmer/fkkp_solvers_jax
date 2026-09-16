@@ -1,6 +1,6 @@
 """Helpers shared by the Stupp scripts: the treatment-course figure (3x3
 montage of axial slices plus the total mass over time with the treatment
-events marked).
+events marked) and the marking of the treatment events on a time axis.
 
 ``render`` imports matplotlib when called, so matplotlib is needed only by
 callers that draw the figure, not by the solvers.
@@ -73,6 +73,41 @@ def session_blocks(days: np.ndarray, max_gap: float = 1.0) -> list[tuple[float, 
     return blocks
 
 
+def mark_treatment_events(ax: Any, params: dict[str, Any]) -> None:
+    """
+    Mark the treatment events of a run on a time axis: the resection as a
+    line, the radiotherapy days as lines split by whether chemotherapy is
+    given the same day, and the chemotherapy-only days (daily sessions,
+    many of them) as one shaded band per contiguous block of sessions.
+    Every kind gets one legend entry.
+
+    Args:
+        ax: A matplotlib Axes with time in days on the x axis.
+        params: The solver's resolved parameters (resection_time,
+            rt_times, chemo_times).
+    """
+    ax.axvline(
+        float(params["resection_time"]), color=CAVITY_COLOR, linewidth=1.5, label="resection"
+    )
+    rt_days = np.atleast_1d(np.asarray(params["rt_times"], dtype=np.float64))
+    ct_days = np.atleast_1d(np.asarray(params["chemo_times"], dtype=np.float64))
+    with_ct = np.isin(rt_days, ct_days)
+    for days, label, color in (
+        (rt_days[with_ct], "radio- + chemotherapy", "blue"),
+        (rt_days[~with_ct], "radiotherapy only", "purple"),
+    ):
+        for index, t in enumerate(days):
+            ax.axvline(
+                float(t), color=color, linewidth=0.6, alpha=0.4, label=label if index == 0 else None
+            )
+    ct_only = np.sort(ct_days[~np.isin(ct_days, rt_days)])
+    for index, (start, end) in enumerate(session_blocks(ct_only)):
+        ax.axvspan(
+            start - 0.5, end + 0.5, color="green", alpha=0.25, linewidth=0,
+            label="chemotherapy only" if index == 0 else None,
+        )
+
+
 def render(
     outfile_stem: Path,
     header: str,
@@ -126,29 +161,7 @@ def render(
 
     ax = fig.add_subplot(grid[n_row, :n_col])
     ax.plot(times, masses, "ko-", markersize=3, label="mass")
-    ax.axvline(
-        float(params["resection_time"]), color=CAVITY_COLOR, linewidth=1.5, label="resection"
-    )
-    # Radiotherapy days as lines, split by whether chemotherapy is given the
-    # same day; chemotherapy-only days (daily sessions, many of them) as one
-    # shaded band per contiguous block of sessions.
-    rt_days = np.atleast_1d(np.asarray(params["rt_times"], dtype=np.float64))
-    ct_days = np.atleast_1d(np.asarray(params["chemo_times"], dtype=np.float64))
-    with_ct = np.isin(rt_days, ct_days)
-    for days, label, color in (
-        (rt_days[with_ct], "radio- + chemotherapy", "blue"),
-        (rt_days[~with_ct], "radiotherapy only", "purple"),
-    ):
-        for index, t in enumerate(days):
-            ax.axvline(
-                float(t), color=color, linewidth=0.6, alpha=0.4, label=label if index == 0 else None
-            )
-    ct_only = np.sort(ct_days[~np.isin(ct_days, rt_days)])
-    for index, (start, end) in enumerate(session_blocks(ct_only)):
-        ax.axvspan(
-            start - 0.5, end + 0.5, color="green", alpha=0.25, linewidth=0,
-            label="chemotherapy only" if index == 0 else None,
-        )
+    mark_treatment_events(ax, params)
     ax.set_yscale("log")
     # The panel ends with the run: events scheduled after the last recorded
     # day (the end of the run) never fired.
