@@ -38,16 +38,19 @@ space; all on the sweep's grid, checked), np.rot90 orientation, panels
 in time order in rows of --columns (default 4), and a volume-vs-time
 panel below with the treatment events marked (fisher_kpp_jax.util.
 mark_treatment_events) and the session moments as ticks:
-  segmentations   the session's labels overlaid (necrotic, edema,
-                  enhancing, cavity, one colour each); below, the
-                  reference core volume per session
-  model           the recorded field overlaid (inferno, densities below
+  segmentations   the session's labels overlaid in the palette of
+                  PredictGBM's scripts/visualize_respond_10.py (necrosis
+                  orange, edema blue, enhancing violet, cavity green;
+                  alpha 0.6 as there); below, the reference core volume
+                  per session
+  model           the recorded field overlaid (inferno at alpha 0.75 as
+                  PredictGBM's prediction overlay, densities below
                   --display-threshold transparent) with the core
                   threshold as a white contour and the session's cavity
-                  outlined; below, the thresholded core volume along the
-                  run, the session values marked, the reference core
-                  volumes as hollow markers, and the per-session Dice in
-                  each panel
+                  outlined in the palette's green; below, the thresholded
+                  core volume along the run, the session values marked,
+                  the reference core volumes as hollow markers, and the
+                  per-session Dice in each panel
 Written into <output-dir>/<run-name>/ (exist_ok=False, nothing outside
 it): config.json, result.json, initial_cell_density.nii.gz and
 final_cell_density.nii.gz (fisher_kpp_jax.Result.save), the session
@@ -95,7 +98,7 @@ from scipy.ndimage import center_of_mass  # noqa: E402
 
 from fisher_kpp_jax import StuppFKPPSolver, read_config  # noqa: E402
 from fisher_kpp_jax.config import jsonable  # noqa: E402
-from fisher_kpp_jax.util import CAVITY_COLOR, mark_treatment_events  # noqa: E402
+from fisher_kpp_jax.util import mark_treatment_events  # noqa: E402
 from patient_sensitivity_analysis import (  # noqa: E402
     DEFAULT_OUTPUT_DIR,
     LABEL_CAVITY,
@@ -121,18 +124,24 @@ INFER_GRID: NDArray = np.round(np.arange(0.05, 0.95 + 1e-9, 0.01), 2)
 # Background image per session below <root>/<patient>/<session>/.
 PREOP_T1C = Path("skull_stripped") / "t1c_skullstripped.nii.gz"
 LATER_T1C = Path("longitudinal") / "t1c_warped_longitudinal.nii.gz"
+# Segmentation palette, legend and overlay alphas of PredictGBM's
+# scripts/visualize_respond_10.py (SEG_COLORS, SEG_LABELS and its imshow
+# calls), so the figures read like that project's patient plots.
 LABEL_NAMES: dict[int, str] = {
-    LABEL_NECROTIC: "necrotic",
-    LABEL_EDEMA: "edema",
-    LABEL_ENHANCING: "enhancing",
-    LABEL_CAVITY: "cavity",
+    LABEL_NECROTIC: "Necrosis / non-enhancing",
+    LABEL_EDEMA: "Edema",
+    LABEL_ENHANCING: "Enhancing tumor",
+    LABEL_CAVITY: "Resection cavity",
 }
 LABEL_COLORS: dict[int, tuple[float, float, float, float]] = {
-    LABEL_NECROTIC: (0.95, 0.85, 0.20, 0.85),
-    LABEL_EDEMA: (0.25, 0.65, 0.95, 0.65),
-    LABEL_ENHANCING: (0.95, 0.35, 0.15, 0.85),
-    LABEL_CAVITY: (*CAVITY_COLOR[:3], 0.75),
+    LABEL_NECROTIC: (1.0, 127 / 255, 0.0, 1.0),
+    LABEL_EDEMA: (30 / 255, 144 / 255, 1.0, 1.0),
+    LABEL_ENHANCING: (138 / 255, 43 / 255, 226 / 255, 1.0),
+    LABEL_CAVITY: (34 / 255, 139 / 255, 34 / 255, 1.0),
 }
+SEGMENTATION_ALPHA = 0.6
+FIELD_ALPHA = 0.75
+CAVITY_OUTLINE_COLOR = LABEL_COLORS[LABEL_CAVITY]
 CORE_CONTOUR_COLOR = "white"
 MODEL_COLOR = "black"
 REFERENCE_COLOR = (0.85, 0.25, 0.10, 1.0)
@@ -288,7 +297,8 @@ def render_segmentations(
     ):
         ax.imshow(np.rot90(background[:, :, z]), cmap="gray", interpolation="none")
         ax.imshow(
-            np.rot90(label_volume[:, :, z]), cmap=cmap, vmin=-0.5, vmax=len(colors) - 0.5, interpolation="none"
+            np.rot90(label_volume[:, :, z]), cmap=cmap, vmin=-0.5, vmax=len(colors) - 0.5,
+            alpha=SEGMENTATION_ALPHA, interpolation="none",
         )
         ax.set_title(session_title(session, moment), fontsize=12, fontweight="bold", pad=8)
         ax.axis("off")
@@ -335,7 +345,7 @@ def render_model(
         ax.imshow(np.rot90(background[:, :, z]), cmap="gray", interpolation="none")
         field_slice = np.rot90(field[:, :, z])
         image = ax.imshow(
-            np.ma.masked_less(field_slice, display_threshold), cmap="inferno", alpha=0.85,
+            np.ma.masked_less(field_slice, display_threshold), cmap="inferno", alpha=FIELD_ALPHA,
             vmin=0.0, vmax=1.0, interpolation="none",
         )
         core = np.rot90(((field >= threshold) & reference.valid)[:, :, z])
@@ -343,7 +353,7 @@ def render_model(
             ax.contour(core.astype(float), levels=[0.5], colors=[CORE_CONTOUR_COLOR], linewidths=1.0)
         cavity = np.rot90((~reference.valid)[:, :, z])
         if cavity.any():
-            ax.contour(cavity.astype(float), levels=[0.5], colors=[CAVITY_COLOR], linewidths=1.2)
+            ax.contour(cavity.astype(float), levels=[0.5], colors=[CAVITY_OUTLINE_COLOR], linewidths=1.2)
         ax.set_title(session_title(session, moment), fontsize=12, fontweight="bold", pad=8)
         ax.text(
             0.02, 0.02, f"Dice core {value:.2f}", transform=ax.transAxes, color="white", fontsize=10, va="bottom"
