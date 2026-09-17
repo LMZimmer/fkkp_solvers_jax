@@ -18,16 +18,32 @@ row's core_threshold column (sampled mode records it per row; in
 profiled mode the column is absent and the script falls back to infer).
 --core-threshold infer maximises the mean over all sessions of the Dice
 between the segmented core and the thresholded field over the grid
-0.05..0.95 step 0.01. A number fixes it. Masks follow the sweep: the
-reference core is labels 1 (necrotic) and 3 (enhancing), the pre-op
-segmentation relabelled 4 -> 3; the model core is field >= threshold;
-the label-4 (cavity) voxels of a post-op session's own segmentation are
-removed from both masks (``reference_masks``). The session frames are
+0.05..0.95 step 0.01. A number fixes it. Masks follow the sweep
+(``session_references``): the reference core is labels 1 (necrotic) and
+3 (enhancing), the pre-op segmentation relabelled 4 -> 3; the model
+core is field >= threshold; in a post-op session a necrotic voxel that
+an earlier post-op session labelled cavity counts as cavity, and the
+session's label-4 (cavity) voxels are then removed from both masks. The
+segmentation overlay of the panels shows the raw labels; the Dice, the
+volumes, the cavity outline and the threshold inference use the
+corrected masks. The session frames are
 rounded for storage as the sweep rounds its fields before the masks are
 taken, so the per-session Dice and volumes equal the sweep's. The
 volume curve between sessions has no segmentation to exclude with, so
 the curve is the plain thresholded volume; the session markers on it
 carry the exclusion, as the Dice does.
+
+Schedule. --schedule current (the default) rebuilds the clinical
+timeline from spec.json's sessions and protocol doses with the patient
+script's schedule constants as they are now (``build_timeline``) and
+puts its model days at the row's preop_time into the config
+(resection_time, time_after_resection, rt_times, chemo_times,
+chemo_doses), so a run of an older sweep is re-solved under the current
+protocol definition (sweeps before 2026-09-17 used 14-day adjuvant
+cycles, the script 28-day ones since); the differences to the sweep's
+config are printed and recorded. --schedule sweep solves the config as
+the sweep saved it. Under the current schedule the per-session Dice and
+volumes are those of the new solve, not the sweep's logged values.
 
 Two figures, the same layout: one panel per session on the axial slice
 through the centre of mass of the pre-op reference core (or --slice-z),
@@ -35,14 +51,19 @@ the session's own T1c as the background (pre-op:
 skull_stripped/t1c_skullstripped.nii.gz; later sessions:
 longitudinal/t1c_warped_longitudinal.nii.gz, registered to the pre-op
 space; all on the sweep's grid, checked), np.rot90 orientation, panels
-in time order in rows of --columns (default 4), and a volume-vs-time
-panel below with the treatment events marked (fisher_kpp_jax.util.
-mark_treatment_events) and the session moments as ticks:
+in time order in rows of --columns (default 4), each titled
+"<session> <label> (day <n>)" with the clinical day relative to the
+post-op scan (day 0; the pre-op scan negative; from spec.json's dates),
+and a volume-vs-time panel below in model days (the seed is day 0, the
+pre-op scan at the row's preop_time) with the treatment events marked
+(fisher_kpp_jax.util.mark_treatment_events); no figure title (the run,
+its parameters and the threshold are in run_summary.json and
+config.json):
   segmentations   the session's labels overlaid in the palette of
                   PredictGBM's scripts/visualize_respond_10.py (necrosis
                   orange, edema blue, enhancing violet, cavity green;
                   alpha 0.6 as there); below, the reference core volume
-                  per session
+                  per session, each point labelled with its session id
   model           the recorded field overlaid (inferno at alpha 0.75 as
                   PredictGBM's prediction overlay, densities below
                   --display-threshold transparent) with the core
@@ -57,7 +78,8 @@ final_cell_density.nii.gz (fisher_kpp_jax.Result.save), the session
 frames <session>_cell_density.nii.gz, segmentations.pdf/.png,
 model.pdf/.png and run_summary.json (the best row and its criterion
 value, the threshold and how it was chosen, the slice, per session the
-moment, recorded day, Dice, model and reference core volume, and the
+model moment, post-op day, recorded day, Dice, model and reference core
+volume, excluded cavity and relabelled voxel counts, and the
 snapshot days and volumes of the curve).
 
 Run from the project root, e.g.:
@@ -72,7 +94,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -105,14 +127,18 @@ from patient_sensitivity_analysis import (  # noqa: E402
     LABEL_EDEMA,
     LABEL_ENHANCING,
     LABEL_NECROTIC,
+    LABEL_POSTOP,
     LABEL_PREOP,
     PREOP_TIME_FACTOR,
+    Protocol,
     Reference,
+    Session,
+    build_timeline,
     dice,
     load_segmentation,
-    reference_masks,
     relabel_preop,
     run_snapshots,
+    session_references,
     session_snapshot_days,
     snapshot_file,
 )
@@ -170,6 +196,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "maximised on a grid) or a number",
     )
     parser.add_argument(
+        "--schedule",
+        choices=("current", "sweep"),
+        default="current",
+        help="'current' (default) rebuilds the treatment schedule with the patient script's present "
+        "protocol constants; 'sweep' solves the config as the sweep saved it",
+    )
+    parser.add_argument(
         "--snapshot-interval-days", type=float, default=2.0, help="spacing of the curve frames (default 2)"
     )
     parser.add_argument("--output-dir", required=True, help="parent of the run directory")
@@ -187,6 +220,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--columns", type=int, default=4, help="panels per row (default 4)")
     return parser.parse_args(argv)
+
+
+SCHEDULE_KEYS = ("resection_time", "time_after_resection", "rt_times", "chemo_times", "chemo_doses")
+
+
+def current_schedule(config: dict[str, Any], spec: dict[str, Any], preop_time: float) -> dict[str, Any]:
+    """
+    Replace the config's schedule (SCHEDULE_KEYS) with the timeline of
+    spec.json's sessions and protocol doses under the patient script's
+    present schedule constants, at preop_time.
+
+    Returns:
+        The record of the change: the protocol used, the sweep's own
+        cycle length, the keys whose values changed, and the chemo
+        session count and total dose before and after.
+    """
+    sessions = [
+        Session(s["id"], s["label"], date.fromisoformat(s["date"]), bool(s.get("approximate", False)))
+        for s in spec["patient"]["sessions"]
+    ]
+    doses = spec["protocol"]
+    protocol = Protocol(
+        concomitant_dose=float(doses["concomitant_dose_mg_m2"]),
+        adjuvant_first_dose=float(doses["adjuvant_first_cycle_dose_mg_m2"]),
+        adjuvant_later_dose=float(doses["adjuvant_later_cycles_dose_mg_m2"]),
+        base_cycle_days=doses.get("base_config_cycle_days"),
+    )
+    days = build_timeline(sessions, protocol).model_days(preop_time)
+    before = {key: config[key] for key in SCHEDULE_KEYS}
+    changed = [key for key in SCHEDULE_KEYS if not np.array_equal(np.asarray(before[key], dtype=np.float64), np.asarray(days[key], dtype=np.float64))]
+    for key in SCHEDULE_KEYS:
+        config[key] = days[key]
+    return {
+        "source": "current",
+        "protocol": protocol.record(),
+        "sweep_adjuvant_cycle_days": doses.get("adjuvant_cycle_days"),
+        "changed_keys": changed,
+        "chemo_sessions": {"sweep": len(before["chemo_times"]), "current": len(days["chemo_times"])},
+        "chemo_total_dose_mg_m2": {"sweep": float(np.sum(before["chemo_doses"])), "current": float(np.sum(days["chemo_doses"]))},
+        "chemo_times": {"sweep": list(before["chemo_times"]), "current": list(days["chemo_times"])},
+    }
 
 
 def best_row(qoi_rows: list[dict[str, str]], criterion: str) -> dict[str, str]:
@@ -245,9 +319,18 @@ def recorded_frame(times: NDArray, frames: NDArray, day: float) -> tuple[float, 
     return float(times[int(matches[0])]), frames[int(matches[0])]
 
 
-def session_title(session: dict[str, Any], moment: float) -> str:
-    approx = "*" if session.get("approximate") else ""
-    return f"{session['id']} {session['label']} {session['date']}{approx} (day {moment:.0f})"
+def postop_days(sessions: list[dict[str, Any]]) -> list[int]:
+    """The clinical day of every session relative to the post-op scan
+    (label postop, day 0; the pre-op scan negative), from spec.json's dates."""
+    postops = [s for s in sessions if s["label"] == LABEL_POSTOP]
+    if len(postops) != 1:
+        raise ValueError(f"expected one session labelled {LABEL_POSTOP}, got {[s['id'] for s in postops]}.")
+    origin = date.fromisoformat(postops[0]["date"])
+    return [(date.fromisoformat(s["date"]) - origin).days for s in sessions]
+
+
+def session_title(session: dict[str, Any], postop_day: int) -> str:
+    return f"{session['id']} {session['label']} (day {postop_day})"
 
 
 def _figure(n_panels: int, n_col: int) -> tuple[Any, list[Any], Any]:
@@ -265,10 +348,8 @@ def _figure(n_panels: int, n_col: int) -> tuple[Any, list[Any], Any]:
     return fig, axes, (bottom, colorbar_ax)
 
 
-def _finish_curve(ax: Any, params: dict[str, Any], moments: list[float], stopping_time: float) -> None:
+def _finish_curve(ax: Any, params: dict[str, Any], stopping_time: float) -> None:
     mark_treatment_events(ax, params)
-    for k, t in enumerate(moments):
-        ax.axvline(t, color="gray", linestyle=":", linewidth=0.9, label="scan" if k == 0 else None)
     ax.set_xlim(-0.01 * stopping_time, 1.01 * stopping_time)
     ax.set_xlabel("time [days]", fontsize=12)
     ax.set_ylabel("core volume [mL]", fontsize=12)
@@ -278,12 +359,12 @@ def _finish_curve(ax: Any, params: dict[str, Any], moments: list[float], stoppin
 
 def render_segmentations(
     outfile_stem: Path,
-    header: str,
     sessions: list[dict[str, Any]],
     labels: list[NDArray],
     backgrounds: list[NDArray],
     z: int,
     moments: list[float],
+    days: list[int],
     reference_volumes: list[float],
     params: dict[str, Any],
     stopping_time: float,
@@ -292,15 +373,15 @@ def render_segmentations(
     fig, axes, (bottom, colorbar_ax) = _figure(len(sessions), n_col)
     colors = [(0, 0, 0, 0)] + [LABEL_COLORS[k] for k in sorted(LABEL_COLORS)]
     cmap = ListedColormap(colors)
-    for ax, session, label_volume, background, moment in zip(
-        axes, sessions, labels, backgrounds, moments, strict=True
+    for ax, session, label_volume, background, day in zip(
+        axes, sessions, labels, backgrounds, days, strict=True
     ):
         ax.imshow(np.rot90(background[:, :, z]), cmap="gray", interpolation="none")
         ax.imshow(
             np.rot90(label_volume[:, :, z]), cmap=cmap, vmin=-0.5, vmax=len(colors) - 0.5,
             alpha=SEGMENTATION_ALPHA, interpolation="none",
         )
-        ax.set_title(session_title(session, moment), fontsize=12, fontweight="bold", pad=8)
+        ax.set_title(session_title(session, day), fontsize=12, fontweight="bold", pad=8)
         ax.axis("off")
     colorbar_ax.axis("off")
     colorbar_ax.legend(
@@ -310,8 +391,14 @@ def render_segmentations(
     bottom.plot(
         moments, reference_volumes, "o-", color=REFERENCE_COLOR, markersize=6, label="segmented core"
     )
-    _finish_curve(bottom, params, moments, stopping_time)
-    fig.suptitle(header, horizontalalignment="left", x=0.02, fontsize=14, fontweight="bold")
+    for session, moment, volume in zip(sessions, moments, reference_volumes, strict=True):
+        bottom.annotate(
+            session["id"], (moment, volume), xytext=(0, 7), textcoords="offset points",
+            ha="center", va="bottom", fontsize=8, color=REFERENCE_COLOR,
+        )
+    low, high = bottom.get_ylim()
+    bottom.set_ylim(low, high + 0.08 * (high - low))  # room for the label above the highest point
+    _finish_curve(bottom, params, stopping_time)
     fig.savefig(str(outfile_stem) + ".png", dpi=110)
     fig.savefig(str(outfile_stem) + ".pdf", format="pdf")
     plt.close(fig)
@@ -319,7 +406,6 @@ def render_segmentations(
 
 def render_model(
     outfile_stem: Path,
-    header: str,
     sessions: list[dict[str, Any]],
     fields: list[NDArray],
     references: list[Reference],
@@ -328,6 +414,7 @@ def render_model(
     threshold: float,
     display_threshold: float,
     moments: list[float],
+    days: list[int],
     dices: list[float],
     model_volumes: list[float],
     reference_volumes: list[float],
@@ -339,8 +426,8 @@ def render_model(
 ) -> None:
     fig, axes, (bottom, colorbar_ax) = _figure(len(sessions), n_col)
     image = None
-    for ax, session, field, reference, background, moment, value in zip(
-        axes, sessions, fields, references, backgrounds, moments, dices, strict=True
+    for ax, session, field, reference, background, day, value in zip(
+        axes, sessions, fields, references, backgrounds, days, dices, strict=True
     ):
         ax.imshow(np.rot90(background[:, :, z]), cmap="gray", interpolation="none")
         field_slice = np.rot90(field[:, :, z])
@@ -354,7 +441,7 @@ def render_model(
         cavity = np.rot90((~reference.valid)[:, :, z])
         if cavity.any():
             ax.contour(cavity.astype(float), levels=[0.5], colors=[CAVITY_OUTLINE_COLOR], linewidths=1.2)
-        ax.set_title(session_title(session, moment), fontsize=12, fontweight="bold", pad=8)
+        ax.set_title(session_title(session, day), fontsize=12, fontweight="bold", pad=8)
         ax.text(
             0.02, 0.02, f"Dice core {value:.2f}", transform=ax.transAxes, color="white", fontsize=10, va="bottom"
         )
@@ -367,8 +454,7 @@ def render_model(
         moments, reference_volumes, "o", markerfacecolor="none", markeredgecolor=REFERENCE_COLOR,
         markersize=7, markeredgewidth=1.5, label="segmented core",
     )
-    _finish_curve(bottom, params, moments, stopping_time)
-    fig.suptitle(header, horizontalalignment="left", x=0.02, fontsize=14, fontweight="bold")
+    _finish_curve(bottom, params, stopping_time)
     fig.savefig(str(outfile_stem) + ".png", dpi=110)
     fig.savefig(str(outfile_stem) + ".pdf", format="pdf")
     plt.close(fig)
@@ -396,6 +482,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # The sweep's snapshot rule for the session moments, plus the curve frames.
     config = read_config(config_path, solver=StuppFKPPSolver)
+    if args.schedule == "current":
+        schedule = current_schedule(config, spec, as_float(design_record[PREOP_TIME_FACTOR]))
+        print(
+            f"schedule rebuilt with the current protocol (adjuvant cycle {schedule['protocol']['adjuvant_cycle_days']} d; "
+            f"the sweep used {schedule['sweep_adjuvant_cycle_days']} d): changed {schedule['changed_keys'] or 'nothing'}; "
+            f"chemo sessions {schedule['chemo_sessions']['sweep']} -> {schedule['chemo_sessions']['current']}, "
+            f"total dose {schedule['chemo_total_dose_mg_m2']['sweep']:g} -> {schedule['chemo_total_dose_mg_m2']['current']:g} mg/m^2"
+        )
+    else:
+        schedule = {"source": "sweep", "sweep_adjuvant_cycle_days": spec["protocol"].get("adjuvant_cycle_days")}
     probe = StuppFKPPSolver(config)
     n_steps, dt = probe.resolve_time_stepping()
     del probe
@@ -425,7 +521,7 @@ def main(argv: list[str] | None = None) -> int:
     patient = spec["patient"]["patient"]
     fields: list[NDArray] = []
     recorded_days: list[float] = []
-    references: list[Reference] = []
+    segmentations: list[NDArray] = []
     labels: list[NDArray] = []
     backgrounds: list[NDArray] = []
     for session in sessions:
@@ -444,9 +540,16 @@ def main(argv: list[str] | None = None) -> int:
         if segmentation.shape != shape:
             raise ValueError(f"{session['segmentation']}: shape {segmentation.shape} differs from the run's grid {shape}.")
         preop = session["label"] == LABEL_PREOP
-        references.append(reference_masks(segmentation, preop, sid))
+        segmentations.append(segmentation)
         labels.append(relabel_preop(segmentation) if preop else segmentation)
         backgrounds.append(load_volume(session_background(patient_root, patient, session), shape))
+    # The sweep's reference masks: the later sessions corrected with the
+    # earlier sessions' cavities before their own cavity is excluded. The
+    # overlay (labels) stays the raw segmentation.
+    references: list[Reference] = session_references(segmentations, sessions)
+    for reference in references:
+        if reference.n_relabelled:
+            print(f"  {reference.session}: {reference.n_relabelled} necrotic voxels counted as cavity (earlier cavities)")
 
     if args.core_threshold == "logged":
         threshold = logged_threshold(row)
@@ -471,27 +574,17 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("the pre-op reference core is empty; pass --slice-z.")
     z = args.slice_z if args.slice_z is not None else int(round(center_of_mass(preop_core)[2]))
     session_moments = [float(moments[s["id"]]) for s in sessions]
+    session_postop_days = postop_days(sessions)
     for session, value, mv, rv in zip(sessions, dices, model_volumes, reference_volumes, strict=True):
         print(f"  {session['id']}: Dice core {value:.3f}, model {mv:.2f} mL, segmented {rv:.2f} mL")
 
-    header_run = (
-        f"{patient}, {row['row_name']} ({args.criterion} {criterion_value:.3f}), core threshold {threshold:g} "
-        f"({threshold_source}), slice z={z}"
-    )
-    header_params = (
-        f"D {params['white_matter_diffusivity']:.3g} mm^2/d, rho {params['rho']:.3g} /d, "
-        f"ratio {params['diffusivity_ratio']:.3g}, t_pre {as_float(design_record[PREOP_TIME_FACTOR]):.1f} d, "
-        f"alpha {params['rt_alpha']:.3g} /Gy, a/b {params['rt_alpha_beta_ratio']:.3g} Gy, "
-        f"kill {params['chemo_kill_rate']:.3g} /(mg/m^2)"
-    )
-    header = f"{header_run}\n{header_params}"
     render_segmentations(
-        run_dir / "segmentations", header, sessions, labels, backgrounds, z, session_moments,
+        run_dir / "segmentations", sessions, labels, backgrounds, z, session_moments, session_postop_days,
         reference_volumes, params, stopping_time, args.columns,
     )
     render_model(
-        run_dir / "model", header, sessions, fields, references, backgrounds, z, threshold,
-        args.display_threshold, session_moments, dices, model_volumes, reference_volumes, times,
+        run_dir / "model", sessions, fields, references, backgrounds, z, threshold,
+        args.display_threshold, session_moments, session_postop_days, dices, model_volumes, reference_volumes, times,
         curve_volumes, params, stopping_time, args.columns,
     )
     write_json(
@@ -507,6 +600,7 @@ def main(argv: list[str] | None = None) -> int:
             "criterion_value": criterion_value,
             "core_threshold": threshold,
             "core_threshold_source": threshold_source,
+            "schedule": schedule,
             "slice_z": z,
             "voxel_volume_ml": voxel_volume_ml,
             "dt": result.dt,
@@ -518,15 +612,19 @@ def main(argv: list[str] | None = None) -> int:
                     "label": s["label"],
                     "date": s["date"],
                     "moment": m,
+                    "postop_day": pd,
                     "recorded_day": d,
                     "dice_core": v,
                     "model_core_volume_ml": mv,
                     "reference_core_volume_ml": rv,
+                    "n_cavity_excluded": r.n_cavity,
+                    "n_necrotic_relabelled_cavity": r.n_relabelled,
                     "background": str(session_background(patient_root, patient, s)),
                     "file": snapshot_file(s["id"]),
                 }
-                for s, m, d, v, mv, rv in zip(
-                    sessions, session_moments, recorded_days, dices, model_volumes, reference_volumes, strict=True
+                for s, m, pd, d, v, mv, rv, r in zip(
+                    sessions, session_moments, session_postop_days, recorded_days, dices, model_volumes,
+                    reference_volumes, references, strict=True,
                 )
             ],
             "curve_days": times.tolist(),

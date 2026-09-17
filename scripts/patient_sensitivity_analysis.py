@@ -27,12 +27,18 @@ later sessions analysed are --sessions (which must hold the post-op
 session, the source of the resection cavity) and must all be after the
 pre-op scan. Labels of every tumour segmentation: 1 necrotic, 2 edema,
 3 enhancing, 4 cavity; the pre-op segmentation is relabelled 4 -> 3
-before use. The design step reads the tsv, loads every segmentation,
-prints the label counts per session, the dose map's range and nonzero
-volume and checks the shapes and affines against the pre-op
-segmentation's (nothing is resampled; a mismatch is an error) before
-sampling anything (``check_patient_data``; the record goes into
-spec.json under data_checks).
+before use. In a later session a necrotic voxel that any earlier later
+session of the design labelled cavity counts as cavity
+(``correct_cavity_labels``: the segmentation algorithm sometimes labels
+the resection cavity necrotic in one session and cavity again in the
+next; the correction uses the union of the earlier sessions' label 4,
+the pre-op's label 4 not among them); the files on disk are not
+changed. The design step reads the tsv, loads every segmentation,
+prints the label counts per session and the relabelled voxel counts,
+the dose map's range and nonzero volume and checks the shapes and
+affines against the pre-op segmentation's (nothing is resampled; a
+mismatch is an error) before sampling anything (``check_patient_data``;
+the record goes into spec.json under data_checks).
 
 Clinical schedule (fixed), defined on model days relative to the CRT
 start session and NOT on calendar weekdays (the follow-up dates of the
@@ -48,15 +54,15 @@ t3 .. t3 + 41, with the concomitant dose of the base config's protocol
 (``protocol_from_config``: 75 mg/m^2); adjuvant TMZ from
 ADJUVANT_DELAY_DAYS (28) days after the last CRT day (the later of the
 last fraction and the last concomitant day, t3 + 41, so the first
-cycle starts on t3 + 69), ADJUVANT_DAYS_ON (5) days on then 9 off in
-ADJUVANT_CYCLE_DAYS (14) cycles (t3 + 69..73, t3 + 83..87, ...) with
+cycle starts on t3 + 69), ADJUVANT_DAYS_ON (5) days on then 23 off in
+ADJUVANT_CYCLE_DAYS (28) cycles (t3 + 69..73, t3 + 97..101, ...) with
 the base config's per-cycle doses (150 mg/m^2 in cycle 1, 200
 afterwards), as many cycles as start before the last session date, a
 cycle truncated at the end of the run; every event after the last
-session is dropped and counted. NOTE: the base config's own protocol
-uses 28-day adjuvant cycles; the 14-day cycle is this analysis's
-definition, and the concomitant and adjuvant dose values are the only
-things taken from the config's schedule. The design step prints the
+session is dropped and counted. NOTE: the schedule constants are this
+analysis's definition (the base config's own schedule is not used
+beyond its dose values; sweeps before 2026-09-17 ran 14-day cycles,
+recorded in their spec.json as adjuvant_cycle_days). The design step prints the
 timeline table (calendar dates for reference, offsets after the pre-op
 scan and relative to the CRT start) and the cycle table
 (``build_timeline``, ``format_timeline``); spec.json's timeline holds
@@ -155,8 +161,9 @@ Both modes analyse their QoIs through the atlas's ``analyze_response``
 QoIs, per session s (prefixed by the session id, e.g. ses03_) and region
 r in {core, whole}, with u the session's snapshot field, dV the voxel
 volume (mm^3) and, in the post-op sessions, every label-4 voxel of THAT
-session's segmentation excluded from the model and the reference masks
-(``load_reference``; the pre-op session excludes nothing):
+session's segmentation, after the cavity correction above, excluded
+from the model and the reference masks (``session_references``; the
+pre-op session excludes nothing):
   model core  = u >= core_threshold;  reference core  = labels {1, 3}
   model whole = u >= edema_threshold; reference whole = labels {1, 2, 3}
   dice_<r>           Dice of the row thresholds; NaN when both masks are
@@ -221,8 +228,9 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR; --name required):
                        recorded days)
     run_status.csv     appended as runs finish (STATUS_COLUMNS)
     qoi.csv            one line per Saltelli row (QOI columns)
-    qoi_summary.json   run counts, NaN counts per session, the per-QoI
-                       run/block accounting
+    qoi_summary.json   run counts, NaN counts and relabelled cavity
+                       voxels per session, the label conventions, the
+                       per-QoI run/block accounting
     sobol.csv, sobol_summary.json, figures/   as the atlas script writes them
 
 Run from the project root, e.g.:
@@ -351,7 +359,12 @@ LABEL_CONVENTIONS: dict[str, Any] = {
     "reference_core": list(CORE_LABELS),
     "reference_whole": list(WHOLE_LABELS),
     "preop_relabel": {str(k): v for k, v in PREOP_RELABEL.items()},
-    "postop_exclusion": f"label {LABEL_CAVITY} voxels of the session's own segmentation are removed from the model and the reference masks",
+    "postop_exclusion": f"label {LABEL_CAVITY} voxels of the session's own segmentation, after the cavity correction, are removed from the model and the reference masks",
+    "cavity_correction": (
+        f"in a later session, label {LABEL_NECROTIC} voxels that any earlier later session of the design labelled "
+        f"{LABEL_CAVITY} count as {LABEL_CAVITY} (the union of the earlier sessions' label {LABEL_CAVITY}; the pre-op "
+        "segmentation contributes none); the files on disk are unchanged"
+    ),
 }
 
 # The clinical schedule.
@@ -362,7 +375,7 @@ N_FRACTIONS = CRT_WEEKS * FRACTIONS_PER_WEEK  # 30, at t3 + 7 w + d (``fraction_
 CONCOMITANT_DAYS = 7 * CRT_WEEKS  # 42 daily TMZ days from t3
 ADJUVANT_DELAY_DAYS = 28  # after the last CRT day
 ADJUVANT_DAYS_ON = 5
-ADJUVANT_CYCLE_DAYS = 14  # 5 on / 9 off (the base config's protocol has 28)
+ADJUVANT_CYCLE_DAYS = 28  # 5 on / 23 off (sweeps before 2026-09-17 used 14)
 PROTOCOL_ANCHOR = "ses-03 = day 0 of CRT week 1; weekdays from the calendar are not used"
 # The dose map's maximum should be the total prescribed dose, about 60 Gy.
 RT_TOTAL_DOSE_PLAUSIBLE_GY: tuple[float, float] = (50.0, 70.0)
@@ -692,6 +705,7 @@ def check_patient_data(data: PatientData) -> dict[str, Any]:
             )
 
     print(f"patient {data.patient} ({data.root}); grid {list(shape)}, voxel {zooms} mm; pre-op affine:\n{affine}")
+    earlier_cavity: NDArray | None = None
     for session in data.sessions:
         if session.id == data.preop.id:
             segmentation, image = preop_seg, preop_image
@@ -709,8 +723,15 @@ def check_patient_data(data: PatientData) -> dict[str, Any]:
             relabelled = relabel_preop(segmentation)
             entry["label_counts_after_relabel"] = _label_counts(relabelled)
             note = f"; after 4 -> 3: {entry['label_counts_after_relabel']}"
-        elif session.id == data.cavity_session:
-            note = f"; cavity (label {LABEL_CAVITY}): {counts.get(str(LABEL_CAVITY), 0)} voxels"
+        else:
+            corrected, n_relabelled = correct_cavity_labels(segmentation, earlier_cavity)
+            entry["n_necrotic_relabelled_cavity"] = n_relabelled
+            entry["label_counts_after_cavity_correction"] = _label_counts(corrected)
+            note = f"; necrotic -> cavity by earlier cavities: {n_relabelled} voxels"
+            if session.id == data.cavity_session:
+                note += f"; cavity (label {LABEL_CAVITY}): {counts.get(str(LABEL_CAVITY), 0)} voxels"
+            cavity = corrected == LABEL_CAVITY
+            earlier_cavity = cavity if earlier_cavity is None else earlier_cavity | cavity
         record["sessions"][session.id] = entry
         flag = "~" if session.approximate else ""
         print(f"  {session.id} ({session.label}, {flag}{session.date}): labels {counts}{note}")
@@ -1837,8 +1858,12 @@ class Reference:
         core: Labels CORE_LABELS, the cavity excluded.
         whole: Labels WHOLE_LABELS, the cavity excluded.
         valid: The voxels kept: all but the session's label-4 voxels
-            (all voxels for the pre-op session).
+            after the cavity correction (all voxels for the pre-op
+            session).
         n_cavity: The excluded voxels.
+        n_relabelled: The necrotic voxels the cavity correction turned
+            into cavity (0 for the pre-op session or without earlier
+            cavities).
     """
 
     session: str
@@ -1846,19 +1871,49 @@ class Reference:
     whole: NDArray
     valid: NDArray
     n_cavity: int
+    n_relabelled: int = 0
 
 
-def reference_masks(segmentation: NDArray, preop: bool, session: str = "") -> Reference:
+def correct_cavity_labels(segmentation: NDArray, earlier_cavity: NDArray | None) -> tuple[NDArray, int]:
     """
-    The reference masks of a segmentation: the pre-op one relabelled
-    4 -> 3 and nothing excluded; a post-op one with its label-4 voxels
-    excluded from the masks (and, through ``valid``, from the model).
+    A later session's segmentation with every necrotic voxel (label
+    LABEL_NECROTIC) that lies in ``earlier_cavity`` (the union of the
+    earlier later sessions' cavity, label LABEL_CAVITY) relabelled
+    LABEL_CAVITY. Nothing else changes; None leaves the labels as they
+    are.
+
+    Returns:
+        (corrected copy, number of relabelled voxels).
     """
     segmentation = np.asarray(segmentation)
+    if earlier_cavity is None:
+        return np.array(segmentation, copy=True), 0
+    earlier_cavity = np.asarray(earlier_cavity, dtype=bool)
+    if earlier_cavity.shape != segmentation.shape:
+        raise ValueError(f"earlier cavity shape {earlier_cavity.shape} differs from the segmentation's {segmentation.shape}.")
+    relabel = (segmentation == LABEL_NECROTIC) & earlier_cavity
+    corrected = np.array(segmentation, copy=True)
+    corrected[relabel] = LABEL_CAVITY
+    return corrected, int(relabel.sum())
+
+
+def reference_masks(
+    segmentation: NDArray, preop: bool, session: str = "", earlier_cavity: NDArray | None = None
+) -> Reference:
+    """
+    The reference masks of a segmentation: the pre-op one relabelled
+    4 -> 3 and nothing excluded; a post-op one corrected with the
+    earlier sessions' cavity (``correct_cavity_labels``; None for the
+    first later session) and its label-4 voxels then excluded from the
+    masks (and, through ``valid``, from the model).
+    """
+    segmentation = np.asarray(segmentation)
+    n_relabelled = 0
     if preop:
         segmentation = relabel_preop(segmentation)
         valid = np.ones(segmentation.shape, dtype=bool)
     else:
+        segmentation, n_relabelled = correct_cavity_labels(segmentation, earlier_cavity)
         valid = segmentation != LABEL_CAVITY
     return Reference(
         session=session,
@@ -1866,13 +1921,39 @@ def reference_masks(segmentation: NDArray, preop: bool, session: str = "") -> Re
         whole=np.isin(segmentation, WHOLE_LABELS) & valid,
         valid=valid,
         n_cavity=int((~valid).sum()),
+        n_relabelled=n_relabelled,
     )
 
 
-def load_reference(path: str | Path, preop: bool, session: str = "") -> Reference:
-    """``reference_masks`` of a segmentation file."""
-    segmentation, _ = load_segmentation(path)
-    return reference_masks(segmentation, preop, session)
+def session_references(segmentations: Sequence[NDArray], sessions: Sequence[Mapping[str, Any]]) -> list[Reference]:
+    """
+    The reference masks of a design's sessions (spec.json's patient
+    sessions: the pre-op one first, then the later ones by date), each
+    later session corrected with the union of the cavities of the later
+    sessions before it (``reference_masks``).
+
+    Args:
+        segmentations: The raw label volumes, one per session, in the
+            sessions' order.
+        sessions: Records with "id" and "label".
+    """
+    references: list[Reference] = []
+    earlier_cavity: NDArray | None = None
+    for segmentation, session in zip(segmentations, sessions, strict=True):
+        preop = session["label"] == LABEL_PREOP
+        reference = reference_masks(segmentation, preop, session["id"], None if preop else earlier_cavity)
+        references.append(reference)
+        if not preop:
+            cavity = ~reference.valid
+            earlier_cavity = cavity if earlier_cavity is None else earlier_cavity | cavity
+    return references
+
+
+def load_session_references(sessions: Sequence[Mapping[str, Any]]) -> list[Reference]:
+    """``session_references`` of the sessions' segmentation files
+    (records with "id", "label" and "segmentation")."""
+    segmentations = [load_segmentation(session["segmentation"])[0] for session in sessions]
+    return session_references(segmentations, sessions)
 
 
 def dice(a: NDArray, b: NDArray) -> float:
@@ -2031,14 +2112,16 @@ def field_qois(density: NDArray, zooms: Sequence[float], seed_voxel: Sequence[in
     return {name: qois[name] for name in (*FIELD_QOIS, "voxel_volume")}
 
 
-_REFERENCE_CACHE: dict[str, Reference] = {}
+_REFERENCE_CACHE: dict[tuple[str, ...], list[Reference]] = {}
 
 
-def _cached_reference(path: str, preop: bool, session: str) -> Reference:
-    """A session's reference masks, cached per process."""
-    if path not in _REFERENCE_CACHE:
-        _REFERENCE_CACHE[path] = load_reference(path, preop, session)
-    return _REFERENCE_CACHE[path]
+def _cached_references(sessions: Sequence[Mapping[str, Any]]) -> list[Reference]:
+    """The design's reference masks (``load_session_references``),
+    cached per process on the segmentation files."""
+    key = tuple(str(session["segmentation"]) for session in sessions)
+    if key not in _REFERENCE_CACHE:
+        _REFERENCE_CACHE[key] = load_session_references(sessions)
+    return _REFERENCE_CACHE[key]
 
 
 def session_records(
@@ -2127,9 +2210,8 @@ def run_qoi_records(
     seed_voxel = tuple(int(rows[0][f"seed_voxel_{ijk}"]) for ijk in "ijk")
     row_thresholds = [(float(r["core_threshold"]), float(r["edema_threshold"])) for r in records]
     dice_core_postop: list[list[float]] = [[] for _ in records]
-    for session in sessions:
+    for session, reference in zip(sessions, _cached_references(sessions), strict=True):
         prefix = session["prefix"]
-        reference = _cached_reference(session["segmentation"], session["label"] == LABEL_PREOP, session["id"])
         density, zooms = _load_field(fields[session["id"]], wm.shape, wm_zooms)
         shared, per_row = session_records(
             density, reference, zooms, seed_voxel, wm, row_thresholds, threshold_mode, min_threshold
@@ -2214,17 +2296,23 @@ def qoi_summary(
 ) -> dict[str, Any]:
     """
     The qoi_summary.json record: the row and run counts, the mean wall
-    time of a run-one subprocess, per session the NaN counts (Dice with
-    both masks empty, empty model masks at the row thresholds, empty
-    references, NaN log_vol_ratio, extinct fields) and per analysed QoI
+    time of a run-one subprocess, the label conventions the masks
+    followed, per session the excluded cavity voxels, the necrotic
+    voxels relabelled cavity and the NaN counts (Dice with both masks
+    empty, empty model masks at the row thresholds, empty references,
+    NaN log_vol_ratio, extinct fields) and per analysed QoI
     ``response_accounting``.
     """
     successes = [r for r in records if _is_success(r)]
     n_blocks, size = int(spec["N"]), int(spec["block_size"])
     per_session: dict[str, Any] = {}
+    references = {r.session: r for r in load_session_references(spec_sessions(spec))}
     for session in spec_sessions(spec):
         prefix = session["prefix"]
-        entry: dict[str, Any] = {}
+        entry: dict[str, Any] = {
+            "n_cavity_excluded": references[session["id"]].n_cavity,
+            "n_necrotic_relabelled_cavity": references[session["id"]].n_relabelled,
+        }
         for region in REGIONS:
             entry[f"n_nan_dice_{region}"] = sum(1 for r in successes if not np.isfinite(as_float(r.get(f"{prefix}dice_{region}"))))
             entry[f"n_zero_dice_{region}"] = sum(1 for r in successes if as_float(r.get(f"{prefix}dice_{region}")) == 0)
@@ -2251,6 +2339,7 @@ def qoi_summary(
         "n_blocks_total": n_blocks,
         "threshold_mode": spec["threshold_mode"],
         "thresholds": spec["thresholds"],
+        "label_conventions": LABEL_CONVENTIONS,
         "mass_floor_voxels": MASS_FLOOR_VOXELS,
         "n_nan_dice_mean_core": sum(1 for r in successes if not np.isfinite(as_float(r.get("dice_mean_core")))),
         "per_session": per_session,

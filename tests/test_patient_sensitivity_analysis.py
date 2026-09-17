@@ -4,7 +4,7 @@ from scripts/), fast only: no patient data, no solver run.
 (1) The clinical timeline from synthetic session dates, anchored on the
 CRT start session's day t3 whatever its weekday (resection three days
 before the post-op scan, 30 fractions at t3 + 7 w + d, 42 TMZ days from
-t3, the adjuvant start at t3 + 69, 14-day cycles of 5 days on with the
+t3, the adjuvant start at t3 + 69, 28-day cycles of 5 days on with the
 config's per-cycle doses, truncation at the last session, every model
 day shifted by preop_time, the CRT-relative offsets and the anchor line
 of the spec record), the protocol doses read from the shipped base
@@ -91,7 +91,7 @@ def _crt_offsets(t3: int) -> tuple[list[int], list[int], list[int]]:
     for a CRT start at offset t3: t3 + 7 w + d, t3 .. t3 + 41, t3 + 69."""
     fractions = [t3 + 7 * w + d for w in range(6) for d in range(5)]
     concomitant = [t3 + i for i in range(42)]
-    return fractions, concomitant, [t3 + 69 + 14 * c for c in range(20)]
+    return fractions, concomitant, [t3 + 69 + 28 * c for c in range(20)]
 
 
 @pytest.mark.parametrize("t3", [40, 43])  # Monday and Thursday for a pre-op on Wednesday 2020-01-01
@@ -158,18 +158,18 @@ def test_timeline_protocol_anchored_on_crt_start(t3: int):
 def test_timeline_adjuvant_cycles_and_truncation(t3: int):
     preop = date(2020, 1, 1)
     fractions, concomitant, adjuvant_starts = _crt_offsets(t3)
-    # Last scan at t3 + 109: the adjuvant phase starts at t3 + 69 and the
-    # cycles at t3 + 69, 83, 97 (5 days each, the third t3 + 97..101); the
-    # fourth (t3 + 111) starts after the horizon.
-    horizon = t3 + 109
+    # Last scan at t3 + 137: the adjuvant phase starts at t3 + 69 and the
+    # cycles at t3 + 69, 97, 125 (5 days each, the third t3 + 125..129); the
+    # fourth (t3 + 153) starts after the horizon.
+    horizon = t3 + 137
     sessions = _sessions(preop, {"ses-02": 15, "ses-03": t3, "ses-04": horizon}, {"ses-02": "postop"})
     timeline = psa.build_timeline(sessions, PROTOCOL)
     cycles = timeline.adjuvant_cycles
-    assert [c.start_offset for c in cycles] == adjuvant_starts[:3] == [t3 + 69, t3 + 83, t3 + 97]
+    assert [c.start_offset for c in cycles] == adjuvant_starts[:3] == [t3 + 69, t3 + 97, t3 + 125]
     assert [c.dose for c in cycles] == [150.0, 200.0, 200.0]
     assert all(c.offsets == tuple(c.start_offset + i for i in range(5)) for c in cycles)
     assert [timeline.crt_offset(o) for c in cycles for o in c.offsets] == [
-        *range(69, 74), *range(83, 88), *range(97, 102)
+        *range(69, 74), *range(97, 102), *range(125, 130)
     ]
     assert all(c.n_dropped == 0 for c in cycles)
     chemo_offsets, chemo_doses = timeline.chemo_schedule
@@ -177,7 +177,7 @@ def test_timeline_adjuvant_cycles_and_truncation(t3: int):
     assert chemo_offsets == sorted(chemo_offsets) and chemo_offsets[:42] == concomitant
     assert sum(chemo_doses) == pytest.approx(42 * 75 + 5 * 150 + 10 * 200)
     record = timeline.record()
-    assert [c["start_crt_offset_days"] for c in record["adjuvant_cycles"]] == [69, 83, 97]
+    assert [c["start_crt_offset_days"] for c in record["adjuvant_cycles"]] == [69, 97, 125]
     assert [d["crt_offset_days"] for d in record["adjuvant_cycles"][0]["days"]] == list(range(69, 74))
     assert record["chemo_offsets"] == chemo_offsets and record["chemo_total_dose_mg_m2"] == pytest.approx(sum(chemo_doses))
     # All offsets shift by preop_time; the resection offset is unchanged.
@@ -185,10 +185,10 @@ def test_timeline_adjuvant_cycles_and_truncation(t3: int):
     assert days["chemo_times"] == pytest.approx([60.0 + o for o in chemo_offsets])
     assert days["rt_times"] == pytest.approx([60.0 + o for o in fractions])
     assert days["resection_time"] == pytest.approx(60.0 + 12)
-    # A last scan inside a cycle truncates it: t3 + 99 keeps t3 + 97, 98, 99.
-    sessions = _sessions(preop, {"ses-02": 15, "ses-03": t3, "ses-04": t3 + 99}, {"ses-02": "postop"})
+    # A last scan inside a cycle truncates it: t3 + 127 keeps t3 + 125, 126, 127.
+    sessions = _sessions(preop, {"ses-02": 15, "ses-03": t3, "ses-04": t3 + 127}, {"ses-02": "postop"})
     truncated = psa.build_timeline(sessions, PROTOCOL).adjuvant_cycles
-    assert truncated[-1].offsets == (t3 + 97, t3 + 98, t3 + 99) and truncated[-1].n_dropped == 2
+    assert truncated[-1].offsets == (t3 + 125, t3 + 126, t3 + 127) and truncated[-1].n_dropped == 2
     assert len(truncated) == 3
     # A last scan before the CRT end drops fractions and TMZ days: at
     # t3 + 7 the fractions 0-4 and 7 (6) and the TMZ days 0-7 (8) remain.
@@ -220,7 +220,7 @@ def test_protocol_from_shipped_config():
     assert protocol.adjuvant_later_dose == 200.0
     assert protocol.base_cycle_days == 28.0
     assert protocol.n_fractions == 30 and protocol.concomitant_days == 42
-    assert protocol.adjuvant_cycle_days == 14 and protocol.adjuvant_days_on == 5 and protocol.adjuvant_delay_days == 28
+    assert protocol.adjuvant_cycle_days == 28 and protocol.adjuvant_days_on == 5 and protocol.adjuvant_delay_days == 28
     bad = dict(base)
     bad["rt_times"] = base["rt_times"][:-1]
     with pytest.raises(ValueError, match="fractions"):
