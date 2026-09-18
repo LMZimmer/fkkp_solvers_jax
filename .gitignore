@@ -32,3 +32,5 @@ htmlcov/
 
 # Run outputs (sweeps, forward solves)
 runs/
+# Copied run summaries inside committed results folders are kept
+!results/**/runs/
