@@ -1,0 +1,31 @@
+{
+  "solver": "StuppFKPPSolver",
+  "_note": "Search space of scripts/identifiability_experiments.py (2026-09-16): the truth cohort of formed-front, patient-sized tumours grown from small seeds, sampled in the front speed v, the front width lambda and the growth efolds a = rho T_r with the seed width in mm, in the format of stupp_fkpp_sigma_v2_search_space.json (factors {\"min\", \"max\", \"scale\"}, fixed overrides as plain values, derived groups with \"derives\"). The seed position is not sampled by the script (one fixed voxel), the three fraction entries are kept as the loader requires them; keys starting with '_' are comments.",
+  "_growth_efolds": "growth_efolds is a factor of the script, not a solver parameter (\"script\": true): the script strips it before handing the file to the loader, samples it with the six solver factors and derives resection_time = growth_efolds / rho, rejecting candidates outside 5-1000 days. The range 1-12 e-folds spans a tumour that has barely left the linear regime to one whose front has travelled 12 front widths beyond the seed.",
+  "_scales": "Rates and scales spanning a decade or more are log-uniform (front_speed_mm_per_day, front_width_mm, chemo_kill_rate, rt_alpha, seed_sigma_mm, growth_efolds); the seed peak density is uniform on its admissible band.",
+  "_growth_band": "v = front_speed_mm_per_day (0.03-0.25 mm/day) and lambda = front_width_mm (1-8 mm) give D = v lambda / 2 and rho = v / (2 lambda), i.e. D in [0.015, 1] mm^2/day and rho in [0.0019, 0.125] /day; the cap of 8 mm admits the broad fronts the design's compact / broad split (2 mm) contrasts with.",
+  "_seed_band": "seed_peak_density 0.6-1 (an enhancing core from day 0) and seed_sigma_mm 1-5 mm: small seeds, so the pre-operative size and shape come from the growth rather than from the seed, and the ratio s = sigma / lambda runs from 0.125 to 5.",
+  "_treatment": "chemo_kill_rate 5e-5-1e-2 /day per mg/m^2 and rt_alpha 5e-4-0.1 /Gy, both a decade below the sensitivity ranges, so that the 120-day log kill Lambda = 60 rt_alpha (1 + 2 / 8) + chemo_kill_rate 4900 / 9.24 (0.06-13 e-folds) straddles 120 rho and both visibility cells fill; chemo_decay_rate 9.24 /day, rt_alpha_beta_ratio 8 Gy and diffusivity_ratio 10 are fixed at the base config's values.",
+  "_units": "front_speed_mm_per_day mm/day; front_width_mm mm; growth_efolds dimensionless (rho times resection_time); the derived white_matter_diffusivity mm^2/day and rho 1/day; chemo_kill_rate 1/day per mg/m^2; chemo_decay_rate 1/day; rt_alpha 1/Gy; rt_alpha_beta_ratio Gy; diffusivity_ratio dimensionless; seed_peak_density a cell density; seed_sigma_mm mm; the derived gaussian_seed_diffusion_time mm^2 and gaussian_seed_mass density times mm^3.",
+  "_sources": "Ranges of 2026-09-16 set for the identifiability cohort: the growth band follows stupp_fkpp_sigma_v2_search_space.json with the front width cap raised from 4 to 8 mm, the seed band is a design choice (small seeds), and the treatment ranges are the sensitivity ranges widened downward by a decade so that the untreated regrowth 120 rho and the log kill Lambda cross within the cohort; the growth_efolds range is a design choice.",
+  "growth": {
+    "derives": ["white_matter_diffusivity", "rho"],
+    "front_speed_mm_per_day": {"min": 0.03, "max": 0.25, "scale": "log"},
+    "front_width_mm": {"min": 1.0, "max": 8.0, "scale": "log"}
+  },
+  "growth_efolds": {"min": 1.0, "max": 12.0, "scale": "log", "script": true},
+  "diffusivity_ratio": 10.0,
+  "chemo_kill_rate": {"min": 5.0e-5, "max": 1.0e-2, "scale": "log"},
+  "chemo_decay_rate": 9.24,
+  "rt_alpha": {"min": 5.0e-4, "max": 0.1, "scale": "log"},
+  "rt_alpha_beta_ratio": 8.0,
+  "gaussian_seed_scale": 1.0,
+  "seed": {
+    "derives": ["gaussian_seed_mass", "gaussian_seed_diffusion_time"],
+    "seed_peak_density": {"min": 0.6, "max": 1.0, "scale": "linear"},
+    "seed_sigma_mm": {"min": 1.0, "max": 5.0, "scale": "log"}
+  },
+  "gaussian_seed_x_fraction": {"min": 0.0, "max": 1.0, "scale": "linear"},
+  "gaussian_seed_y_fraction": {"min": 0.0, "max": 1.0, "scale": "linear"},
+  "gaussian_seed_z_fraction": {"min": 0.0, "max": 1.0, "scale": "linear"}
+}
