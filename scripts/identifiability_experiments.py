@@ -301,7 +301,7 @@ patient's step; the fisher and invariance subcommands step at the fixed
   fixed      BASE_STEPS_PER_DAY = 12 steps/day for every patient (the
              base config's dt = 1/12 day).
   stability  per patient dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D_wm)),
-             DT_MAX = 0.5 d, DT_SAFETY = 0.5, dx the grid spacing (1 mm
+             DT_MAX = 0.5 d, DT_SAFETY = 0.25, dx the grid spacing (1 mm
              on the atlas, 4 mm with --smoke) and D_wm the patient's
              white_matter_diffusivity, rounded down to an integer number
              of steps per day (steps_per_day = ceil(1 / dt)), raised to
@@ -310,10 +310,11 @@ patient's step; the fisher and invariance subcommands step at the fixed
              ``solver_step_estimate``) so that the truth is stepped as
              requested, and capped at 12 steps/day, the floor of the
              step (``steps_per_day_for``). On the atlas that is
-             ceil(12 D) steps/day between 2 and 12: 2 for D below
-             1/6 mm^2/day (about half of the admissible candidates), 12
-             at the corner D = 1. DT_MAX is half a day because the frame
-             rounding needs a step of at most half a day.
+             ceil(24 D) steps/day between 2 and 12: 2 for D below
+             1/12 mm^2/day (a quarter of the admissible candidates), 12
+             for D at or above 11/24 mm^2/day (a tenth). DT_MAX is half
+             a day because the frame rounding needs a step of at most
+             half a day.
 The solver takes a run's step as ceil(horizon steps_per_day) steps, so
 the effective step divides the horizon exactly and is at most
 1 / steps_per_day (``requested_steps``; a warning names the rounding).
@@ -781,7 +782,7 @@ frames 3.5 s + 2.2 ms per step (1 908 steps: 7.7 s; the treatment terms,
 the frame upsamplings and the maps' downsampling are the extra). A new
 step count compiles the scan again (1-3 s). With T_r the resection time
 in days and k the patient's steps per day (12 in the fixed mode, 2-12
-in the stability mode, 2 for about half of the cohort), a growth stage
+in the stability mode, 2 for about a quarter of the cohort), a growth stage
 is k T_r steps and a treated run k (T_r + 120) steps (experiment 1) or
 k (T_r + 180) (experiments 2-4); the figures below are for 12 steps/day
 and shrink with k.
@@ -943,7 +944,7 @@ DT_MODES: tuple[str, ...] = ("fixed", "stability")
 DEFAULT_DT_MODE = "stability"
 BASE_STEPS_PER_DAY = 12
 DT_MAX = 0.5  # days
-DT_SAFETY = 0.5  # of the explicit diffusion limit dx^2 / (6 D)
+DT_SAFETY = 0.25  # of the explicit diffusion limit dx^2 / (6 D): dt = dx^2 / (24 D) before the rounding and the caps
 SOLVER_STEP_FLOOR = 100  # the solver's estimate over a horizon T: max(8 D T / dx^2 + 100, 1.1 rho T) steps
 VISIBILITY_HORIZON = 120.0  # days; visibility_margin = VISIBILITY_HORIZON rho - log_kill_total (a design column, not a cell split)
 TR_MIN = 5.0  # days; a candidate below it is rejected, a substitute T_0 below it skipped

@@ -799,25 +799,27 @@ def test_frame_days_and_log_kill_and_selection(cohort):
     with pytest.raises(ValueError, match="lambda-mode"):
         ide.parse_lambda_modes("neither")
     assert ide.parse_tr_bounds(None) == (5.0, 3000.0) and ide.parse_tr_bounds("10, 20") == (10.0, 20.0)
-    # The time step: fixed is 12 steps/day; stability is dt = min(0.5, 0.5 dx^2 / (6 D))
+    # The time step: fixed is 12 steps/day; stability is dt = min(0.5, 0.25 dx^2 / (6 D))
     # rounded to whole steps per day, raised to the solver's estimate at T_r, capped at 12.
     assert ide.DT_MODES == ("fixed", "stability") and ide.DEFAULT_DT_MODE == "stability" and ide.BASE_STEPS_PER_DAY == 12
-    assert ide.DT_MAX == 0.5 and ide.DT_SAFETY == 0.5
+    assert ide.DT_MAX == 0.5 and ide.DT_SAFETY == 0.25
     assert ide.steps_per_day_for("fixed", 0.05, 0.01, 300.0, 1.0) == 12 and ide.steps_per_day_for("fixed", 1.0, 0.1, 5.0, 4.0) == 12
-    assert ide.steps_per_day_for("stability", 0.5, 0.01, 1000.0, 1.0) == 6  # dt = 1 / (12 D) = 1/6 d
-    assert ide.steps_per_day_for("stability", 0.2, 0.01, 1000.0, 1.0) == 3  # 1 / (12 D) = 0.417 d -> 3 steps/day
-    assert ide.steps_per_day_for("stability", 0.05, 0.01, 1000.0, 1.0) == 2  # 1.67 d capped at DT_MAX 0.5 d
-    assert ide.steps_per_day_for("stability", 1.0, 0.1, 1000.0, 1.0) == 12  # the floor: never finer than 12
+    assert ide.steps_per_day_for("stability", 0.5, 0.01, 1000.0, 1.0) == 12  # dt = 1 / (24 D) = 1/12 d
+    assert ide.steps_per_day_for("stability", 0.25, 0.01, 1000.0, 1.0) == 6  # 1 / (24 D) = 1/6 d
+    assert ide.steps_per_day_for("stability", 0.2, 0.01, 1000.0, 1.0) == 5  # 1 / (24 D) = 0.208 d -> 5 steps/day
+    assert ide.steps_per_day_for("stability", 0.05, 0.01, 1000.0, 1.0) == 2  # 0.83 d capped at DT_MAX 0.5 d
+    assert ide.steps_per_day_for("stability", 1.0, 0.1, 1000.0, 1.0) == 12  # the floor: 1/24 d would be 24/day, never finer than 12
     assert ide.steps_per_day_for("stability", 0.2, 0.01, 1000.0, 4.0) == 2  # the smoke's 4 mm voxels: DT_MAX everywhere
-    assert ide.solver_step_estimate(0.2, 0.01, 40.0, 1.0) == int(np.ceil(8 * 0.2 * 40 + 100))
-    assert ide.steps_per_day_for("stability", 0.2, 0.01, 40.0, 1.0) == int(np.ceil(164 / 40))  # the solver's estimate at T_r binds
+    assert ide.solver_step_estimate(0.1, 0.01, 40.0, 1.0) == int(np.ceil(8 * 0.1 * 40 + 100))
+    assert ide.steps_per_day_for("stability", 0.1, 0.01, 40.0, 1.0) == int(np.ceil(132 / 40)) == 4  # the solver's estimate at T_r binds (the formula gives 3)
     assert ide.steps_per_day_for("stability", 1.0, 0.1, 5.0, 1.0) == 12  # the estimate would need 28/day: capped
     for diffusivity in (0.015, 0.05, 0.2, 0.5, 1.0):
         for t_r in (5.0, 40.0, 300.0, 1000.0):
             for dx in (1.0, 4.0):
                 steps = ide.steps_per_day_for("stability", diffusivity, 0.02, t_r, dx)
                 assert isinstance(steps, int) and 2 <= steps <= 12 and steps >= 1
-                assert 1.0 / steps <= min(0.5, 0.5 * dx**2 / (6 * diffusivity)) + 1e-12
+                # The formula's step, unless the floor of 12 steps/day is finer than it.
+                assert 1.0 / steps <= max(min(ide.DT_MAX, ide.DT_SAFETY * dx**2 / (6 * diffusivity)), 1.0 / ide.BASE_STEPS_PER_DAY) + 1e-12
                 assert steps * t_r >= min(12 * t_r, ide.solver_step_estimate(diffusivity, 0.02, t_r, dx)) - 1e-9
     with pytest.raises(ValueError, match="dt-mode"):
         ide.steps_per_day_for("adaptive", 0.1, 0.01, 100.0, 1.0)
