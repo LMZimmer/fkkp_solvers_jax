@@ -2,7 +2,8 @@
 """Five identifiability experiments on the pre-resection growth time of
 the Stupp-protocol forward model, fisher_kpp_jax.StuppFKPPSolver, on
 atlas tissue maps, over a cohort of formed-front, patient-sized tumours
-grown from small seeds.
+grown from small seeds, stratified by front width and by how far the
+front has travelled beyond the seed (maturity).
 
 Background. The plain Fisher-KPP model du/dt = D lap u + rho u (1 - u)
 maps the parameters (D, rho, T) to the same field as (lambda D,
@@ -20,7 +21,7 @@ after it), so a tumor twice as fast that is resected at half its age is
 irradiated and dosed for the same number of days while it regrows twice
 as fast. Experiment 0 measures how far the treated frames move under the
 rescaling that leaves the pre-resection field unchanged. Experiment 1
-asks, locally at each of 32 truths, whether the growth time T_r has an
+asks, locally at each truth, whether the growth time T_r has an
 effect on the observations (smoothed threshold maps of the density at
 five days) that the other parameters (v, lambda_f, alpha, k_ct, and the
 seed's peak and width) cannot reproduce: the Fisher information of the
@@ -64,7 +65,8 @@ the script's default atlas (--white-matter-pbmap, --gray-matter-pbmap:
 the BraTS MNI152 maps of PredictGBM, 182 x 218 x 182 at 1 mm). The base
 config is the script's default, fisher_kpp_jax/configs/StuppFKPPSolver.json
 (--config), whose resection_cavity and rt_dose must be null and which
-must set a time step; the design sets its precision to f64, its
+must set a time step (the fixed mode's, see Time step below); the
+design sets its precision to f64, its
 gaussian_seed_floor to 0 (recorded in spec.json and base_config.json;
 the base config's 0.1 would erase the light seeds of experiment 2 and
 the seed derivation requires the peak above the floor) and, with
@@ -77,18 +79,16 @@ the nearest voxel with wm + gm >= min_tissue_fraction,
 ``seed_geometry``, which leaves it where it is on the atlas; a grid too
 small to hold it, such as the tests' 24^3 phantom, falls back to the
 base config's fractions, the grid centre); its fractions (v + 0.5) / n
-go into every config. The time step is the
-base config's 12 steps/day (dt = 1/12 day; the solver raises a coarser
-request to its stability estimate, which never binds in the growth band
-on the atlas but does for short horizons on small test grids: every run
-checks that the solver kept the intended dt and refuses to continue
-otherwise). The schedule of every run is the base config's truncated to
-the run's horizon (``truncate_schedule``) and shifted by
-resection_time - 100 (``SHIFTED_TIME_KEYS``), so the treatment keeps its
-offsets after surgery; the treated stage is stepped on the growth
-stage's grid of times (``align_treated_config``: n_steps = n_growth +
-ceil(time_after_resection / dt), resection_time stated as
-(n_growth - 1/2) dt so that step n_growth resects). Every run's config
+go into every config. The time step is the patient's (Time step below;
+steps_per_day in every config). The schedule of every run is the base
+config's truncated to the run's horizon (``truncate_schedule``) and
+shifted by resection_time - 100 (``SHIFTED_TIME_KEYS``), so the
+treatment keeps its offsets after surgery; the treated stage is stepped
+on the growth stage's grid of times (``align_treated_config``: n_steps =
+n_growth + ceil(time_after_resection / dt), resection_time stated as
+(n_growth - 1/2) dt so that step n_growth resects; the treated stage
+checks that the solver kept that dt and refuses to continue otherwise).
+Every run's config
 is saved (config.json in its directory: the aligned config with the
 maps' paths and the frames' days as snapshot_times) so that
 StuppFKPPSolver(read_config(path)) reproduces it; the solves themselves
@@ -116,9 +116,10 @@ resection_time + offset + 1, so it receives moment - 1).
          n_growth - 1 at (n_growth - 1) dt, before the resection step
          zeroes the cavity (the pre-resection state; it equals the
          growth stage's state one step before the density the cavity is
-         thresholded from); tests/test_identifiability_experiments.py
-         checks that it is nonzero inside the cavity and that the state
-         one step later is zero there
+         thresholded from: 2 h earlier at 12 steps/day, 12 h at 2);
+         tests/test_identifiability_experiments.py checks that it is
+         nonzero inside the cavity and that the state one step later is
+         zero there
   d34    the end of the Sunday closing the third CRT week (offset 34,
          moment 35: before Monday's fraction), as the script's mid_crt
   d55    the end of the Sunday closing the sixth CRT week (offset 55,
@@ -127,8 +128,8 @@ resection_time + offset + 1, so it receives moment - 1).
   d80    the end of day 80, the day before the first adjuvant dose at
          offset 81 (the design checks the base schedule), moment 81
   d120   the moment resection_time + 120, the horizon of experiment 1
-         (1-3 h before it at 12 steps/day; no dose is scheduled within a
-         day of it)
+         (between half a step and one and a half steps before it; no
+         dose is scheduled within a day of it)
   d180   the moment resection_time + 180, the horizon of experiment 2
 Experiment 1 records pre, d34, d55, d80, d120; experiment 2 also d180.
 Experiments 3 and 4 record the six frames of experiment 2.
@@ -199,9 +200,18 @@ seed_sigma_mm), transformed with the ranges (``transform_factor``) and
 derived with the groups (``SearchSpace.derive``: white_matter_diffusivity,
 rho, gaussian_seed_mass, gaussian_seed_diffusion_time,
 seed_enhancing_radius_mm, s = sigma / lambda); resection_time =
-growth_efolds / rho, and a candidate with resection_time below 5 days or
-above --tr-max (default 1000) is rejected and counted. Per candidate the
-total log kill of the 120-day schedule
+growth_efolds / rho. A candidate whose seed is wider than
+SEED_WIDTH_CAP = 1.5 front widths (seed_sigma_mm > 1.5 front_width_mm)
+is rejected first (seed_wide: the pre-operative shape would be the
+seed's, not the growth's), then one with resection_time below 5 days or
+above --tr-max (default 1000); both are counted. Per candidate the
+maturity
+  maturity = 2 growth_efolds front_width_mm^2 / seed_sigma_mm^2
+           = ell lambda / sigma^2
+with ell = v T_r = 2 a lambda the front travel: the travel over the
+seed's forgetting distance sigma^2 / lambda (``maturity``; a mature
+truth has forgotten its seed, an immature one still carries it), and
+the total log kill of the 120-day schedule
   Lambda = n d alpha (1 + d / (alpha/beta)) + k_ct D_tot / gamma
          = 60 alpha (1 + 2 / 8) + k_ct 4900 / 9.24
 with n = 30 fractions of d = 2 Gy, D_tot the chemotherapy dose within the
@@ -209,15 +219,16 @@ with n = 30 fractions of d = 2 Gy, D_tot the chemotherapy dose within the
 5 x 200) and gamma = chemo_decay_rate, and the visibility margin
 120 rho - Lambda (the e-folds the untreated regrowth gains on the log
 kill by day 120; its sign says whether the truth regrows past the
-treatment by then). The cells (``cell_of``):
-  compact_visible     front_width_mm <= 2 mm, visibility_margin >= 0
-  compact_invisible   front_width_mm <= 2 mm, visibility_margin < 0
-  broad_visible       front_width_mm > 2 mm,  visibility_margin >= 0
-  broad_invisible     front_width_mm > 2 mm,  visibility_margin < 0
+treatment by then; a design column, not a cell split). The cells
+(``cell_of``; LAMBDA_SPLIT = 2 mm, MATURITY_SPLIT = 15):
+  compact_immature    front_width_mm <= 2 mm, maturity < 15
+  compact_mature      front_width_mm <= 2 mm, maturity >= 15
+  broad_immature      front_width_mm > 2 mm,  maturity < 15
+  broad_mature        front_width_mm > 2 mm,  maturity >= 15
 Size screening (``screen_cohort``): per cell the admissible candidates
 are taken in sequence order and each one gets a growth-only solve (the
-truth's growth path, ``solve_growth`` at the base time step) to its
-resection_time; from its density on the 1 mm grid (the solver upsamples
+truth's growth path, ``solve_growth`` at the candidate's time step) to
+its resection_time; from its density on the 1 mm grid (the solver upsamples
 a coarser grid) the equivalent-sphere radii r_core_mm of {u >= 0.6} and
 r_whole_mm of {u >= 0.3} on the tissue mask ((3 V / 4 pi)^(1/3)) and the
 volume ratio whole / core (``size_screen``); a candidate is accepted
@@ -227,13 +238,13 @@ are provisional), one with an empty core is rejected, and a solve that
 fails rejects the candidate (counted; three failures in a row stop the
 design). The screening runs on one device (--gpus, '' the CPU), is
 resumable (screen/c<candidate>/screen.json holds the candidate's
-factors, sizes and wall time; a record of another candidate under the
-same index, i.e. another seed or search space, is refused) and stops
-when every cell holds 8 patients (PATIENTS_PER_CELL); a cell that cannot
+factors, step, sizes and wall time; a record of another candidate under
+the same index, i.e. another seed, search space or time step, is
+refused) and stops when every cell holds --patients-per-cell patients
+(PATIENTS_PER_CELL = 4, 16 patients; 1 with --smoke); a cell that cannot
 be filled from the points fails the design with the counts. The
-patients are p00-p31 in cell order, the first of each cell flagged for
-the finite-difference check of experiment 1 (fd_check) and the default
-patients of the profile.
+patients are p00-p15 in cell order, the first of each cell flagged for
+the finite-difference check of experiment 1 (fd_check).
   design.csv    patient, cell, candidate (the Sobol' index), u_<factor>
                 for the seven factors, the seven factors
                 (front_speed_mm_per_day, front_width_mm, growth_efolds,
@@ -243,14 +254,15 @@ patients of the profile.
                 seed_enhancing_radius_mm, s (= sigma / lambda), rho_T_r
                 (= growth_efolds), ell_mm (= v resection_time),
                 log_kill_rt, log_kill_ct, log_kill_total,
-                visibility_margin, r_core_mm, r_whole_mm,
+                visibility_margin, maturity, r_core_mm, r_whole_mm,
                 whole_core_ratio, R_over_lambda (= r_whole_mm / lambda),
-                fd_check
+                steps_per_day, dt (the patient's time step), fd_check
   spec.json     the settings: base config and search space paths, the
                 tissue maps, grid shape, precision, gaussian_seed_floor,
                 resolution_factor, smoke and the smoke settings, the
                 design seed and candidate count, patients_per_cell, the
                 cells and their splits (lambda_split_mm,
+                maturity_split, the maturity formula, the seed width cap;
                 visibility_horizon_days), the sampled and the script
                 factors with their ranges, the fixed overrides and
                 parameters, the seed voxel (seed_target_voxel and
@@ -259,22 +271,85 @@ patients of the profile.
                 --seed-voxel; the snapped seed_voxel,
                 seed_snap_distance_voxels, seed_fractions,
                 default_seed_voxel), the tissue threshold and seedable
-                count, the time step, the treatment derivation settings,
+                count, the time step (the base config's setting, dt_mode
+                and the modes' formulas), the treatment derivation settings,
                 the schedules within both horizons (``truncate_schedule``
                 records), the log-kill formula and its constants, the
                 visibility formula, the screening (tr_min, tr_max, the
                 bands, the levels, the device, the counts: candidates,
-                rejections by resection_time, solves, acceptances,
+                rejections by seed width and by resection_time, solves,
+                acceptances,
                 failures, and per cell the candidates, the admissible
                 ones, the screened, accepted and failed ones and the
                 rejections by reason; the wall time), the frame moments,
                 the CRT snapshot offsets, the horizons and frames per
                 experiment, the lambda set, the experiment 1-4 settings
+                and the summaries' maturity strata
   screen/c<candidate>/screen.json   the screening record of every solved
                 candidate (accepted or not)
   base_config.json, search_space.json
   configs/<patient>.json   the truth config of experiment 1 (120-day
                 horizon, maps null, schedule truncated and shifted)
+
+Time step (--dt-mode fixed | stability, default stability; the design
+records it as spec.json's dt_mode and the patients' steps in
+design.csv, and substitute, seedfix, profile and all must name the same
+mode, ``check_dt_mode``, so that every solve of a patient, the truth,
+the screening, every fit evaluation and every treated run, uses that
+patient's step; the fisher and invariance subcommands step at the fixed
+12 steps/day whatever the mode).
+  fixed      BASE_STEPS_PER_DAY = 12 steps/day for every patient (the
+             base config's dt = 1/12 day).
+  stability  per patient dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D_wm)),
+             DT_MAX = 0.5 d, DT_SAFETY = 0.5, dx the grid spacing (1 mm
+             on the atlas, 4 mm with --smoke) and D_wm the patient's
+             white_matter_diffusivity, rounded down to an integer number
+             of steps per day (steps_per_day = ceil(1 / dt)), raised to
+             the solver's own estimate at the truth's resection_time
+             (ceil(max(8 D T_r / dx^2 + 100, 1.1 rho T_r) / T_r),
+             ``solver_step_estimate``) so that the truth is stepped as
+             requested, and capped at 12 steps/day, the floor of the
+             step (``steps_per_day_for``). On the atlas that is
+             ceil(12 D) steps/day between 2 and 12: 2 for D below
+             1/6 mm^2/day (about half of the admissible candidates), 12
+             at the corner D = 1. DT_MAX is half a day because the frame
+             rounding needs a step of at most half a day.
+The solver takes a run's step as ceil(horizon steps_per_day) steps, so
+the effective step divides the horizon exactly and is at most
+1 / steps_per_day (``requested_steps``; a warning names the rounding).
+The schedule's sessions and fractions lie on whole days after the
+resection, so with a whole number of steps per day every impulse falls
+at a step boundary to that rounding, as at 12 steps/day; the cavity and
+dose maps are derived from the growth stage's final state as before. A
+solve whose horizon needs more than the patient's steps (a fit
+evaluation at a short T_0 or T_r, where the solver's estimate of
+8 D T / dx^2 + 100 steps exceeds T steps_per_day) is refined by the
+solver to its estimate, as it is in the fixed mode; the record then
+carries the solver's dt beside the patient's steps_per_day, and the
+truth's record flags it (dt_refined, ``dt_refined``: more steps than
+``requested_steps``; the screening's screen.json too, and the design
+reports any accepted patient it happened to, which needs a T_r below 25
+days). Every fit record and every row of experiments 2-4 carries
+growth_n_steps, steps_per_day (the patient's) and dt (the solver's).
+
+Subcommand dt-check (--patients ids or ranges, default the fd_check
+patients; one device). Per patient (``dt_check_patient``) the truth of
+experiments 2-4 (the growth stage, its own cavity and dose map, the
+treated stage to d180 with the six frames) once at the fixed step and
+once at the stability step (``steps_per_day_for`` per mode, whatever
+the design's mode; runs/dt_check/<patient>/fixed/ and stability/), and
+the stability run's pre and d180 frames compared with the fixed run's
+(``compare_to``, the fixed run's dose map).
+  dt_check.csv     patient, cell, maturity, resection_time,
+                   white_matter_diffusivity, grid_spacing_mm, per mode
+                   steps_per_day, dt, dt_refined, n_growth, n_steps and
+                   wall_time_s (<key>_fixed, <key>_stability), and
+                   pre_ / d180_ dice_core, dice_edema, mass_rel,
+                   mass_beyond_edema_rel of the stability run against
+                   the fixed run
+  runs/dt_check/<patient>/   fixed/, stability/ (each as a truth
+                   directory) and dt_check.json (the record with the
+                   row, the resume marker)
 
 Subcommand invariance (experiment 0). One patient: the base config's D,
 rho and resection_time (--white-matter-diffusivity, --rho,
@@ -311,8 +386,11 @@ difference is reported.
                    the field(s); maps/ the shared cavity and dose
 
 Subcommand fisher (experiment 1). Per patient (``fisher_patient``):
-  1. The truth: the growth stage at 12 steps/day (runs/fisher/<patient>/
-     truth/growth/), its density at resection_time
+  1. The truth: the growth stage at the fixed step of 12 steps/day,
+     whatever the design's dt mode (the scaled-dt T_r column below steps
+     at dt e^{+-h}, which a half-day step would push past the frame
+     rounding's limit; runs/fisher/<patient>/truth/growth/), its density
+     at resection_time
      (pre_resection_cell_density.nii.gz), the maps derived from it
      (resection_cavity.nii.gz, rt_dose.nii.gz, treatment.json) and the
      treated stage over the 120-day horizon with the frames pre, d34,
@@ -464,17 +542,18 @@ schedule truncated to it: 62 sessions, 6 900 mg/m^2, all 30 fractions;
 cycle 4 ends at offset 169, cycle 5 is dropped). Per patient
 (``substitute_patient``): the truth as in experiment 1 with the frames
 pre, d34, d55, d80, d120, d180 and the observation region of its six
-frames; then for each deficit delta_a in --delta-a (default -2, -0.5,
-0.5, 2 e-folds) the growth time T_0 = T_r - delta_a / rho (delta_a > 0:
+frames; then for each deficit delta_a in --delta-a (default -1, -0.5,
+0.5, 1 e-folds) the growth time T_0 = T_r - delta_a / rho (delta_a > 0:
 T_0 earlier than the truth; ``deficit_schedule``), skipped when T_0 lies
 below 5 days or above the design's --tr-max (recorded in substitute.json
 and as a row with NaN metrics), and per objective, with v and lambda at
 the truth, the seed position fixed and the floor 0, the seed (logit of
 the peak on (0.05, 1], log sigma; peak = 0.05 + 0.95 sigmoid(z),
 ``bounded_from_unbounded``) is fitted by scipy's Nelder-Mead (--maxfev
-evaluations at most, default 150, 20 with --smoke; the initial simplex
-x0, x0 + (0.5, 0), x0 + (0, 0.2); xatol 1e-3, fatol 1e-6) so that the
-growth-only field at T_0 (FKPPSolver, 12 steps/day) matches the truth's
+evaluations at most, default 60 (SUBSTITUTE_MAXFEV), 20 with --smoke;
+the initial simplex x0, x0 + (0.5, 0), x0 + (0, 0.2); xatol 1e-3,
+fatol 1e-6) so that the growth-only field at T_0 (FKPPSolver at the
+patient's step) matches the truth's
 density at resection_time on the region's voxels (``fit_seed``):
   B   1 - the mean over c in {0.6, 0.3} of the soft Dice
       2 sum s s* / (sum s^2 + sum s*^2) of the smoothed indicators
@@ -499,12 +578,12 @@ frames, and compared with the truth's frames by ``compare_fields``.
                    one row per patient with objective "truth" (delta_a 0,
                    T_0 = T_r, the truth against itself, for the reference
                    masses): patient, cell, delta_a, T_0, rho_T_0, rho_T_r,
-                   objective, skipped, rule_peak, rule_sigma_mm,
+                   maturity, objective, skipped, rule_peak, rule_sigma_mm,
                    initial_peak, initial_sigma_mm, initial_from_rule,
                    fitted_peak, fitted_sigma_mm, n_evaluations,
                    objective_initial, objective_achieved, growth_n_steps,
-                   dt, wall_time_s (the fit), and <frame>_<metric> for
-                   the six frames
+                   steps_per_day, dt, wall_time_s (the fit), and
+                   <frame>_<metric> for the six frames
   figures/substitute_<frame>_objective_B.{png,pdf}   for d120 and d180:
                    every comparison metric against delta_a (linear
                    axis), the (patient, delta_a) points coloured by cell
@@ -518,9 +597,10 @@ frames, and compared with the truth's frames by ``compare_fields``.
                    with the delta_a values, the skipped pairs and the
                    medians (``substitute_medians``): per objective and
                    delta_a, per cell, over all patients and per stratum
-                   R_over_lambda >= 10 / < 10, the row count, the skipped
-                   rows (excluded) and the median of every d120_ and
-                   d180_ metric
+                   maturity >= 15 / < 15 (maturity_ge_15, maturity_lt_15;
+                   ``row_groups``), the row count, the skipped rows
+                   (excluded) and the median of every d120_ and d180_
+                   metric
 
 Subcommand seedfix (experiment 3). The mirror of experiment 2: the seed
 is held at a small standard seed, --seed-peak (default 0.6) and
@@ -533,10 +613,10 @@ frames, ``load_truth_run``, its stored fields being the float32 ones
 rounded for storage; otherwise the truth is solved into
 runs/seedfix/<patient>/truth) and the observation region of its six
 frames; then per lambda mode of --lambda-mode (fixed | free | both, the
-default both; the fixed mode runs first), with objective B, the seed
+default fixed; the fixed mode runs first), with objective B, the seed
 voxel at the truth and the growth-only solve path of ``fit_seed``
-(FKPPSolver at 12 steps/day, n_steps = ceil(12 T_r), so every evaluation
-has its own step count and compiles its own scan):
+(FKPPSolver at the patient's step, n_steps = ceil(T_r steps_per_day), so
+every evaluation has its own step count and compiles its own scan):
   fixed   with v and lambda at the truth, log T_r is fitted on
           [log 5, log 3000] (--tr-bounds, days) by scipy's bounded Brent
           search (minimize_scalar; at most --maxfev evaluations, xatol
@@ -548,12 +628,13 @@ has its own step count and compiles its own scan):
           at most, the initial simplex x0, x0 + (0.5, 0), x0 + (0, 0.2),
           xatol 1e-3, fatol 1e-6) in the unbounded coordinates of
           ``bounded_from_unbounded``, log T_r on [log 5, log 3000] and
-          log lambda on [log 1, log 8] mm (LAMBDA_BOUNDS), D = v lambda / 2
-          and rho = v / (2 lambda) re-derived from the current lambda at
-          every evaluation; the start is the fixed mode's optimum
-          (T_r*, the truth's lambda) when its fit.json exists in the
-          patient's directory, else the geometric midpoints of both
-          brackets (``fit_growth_time_free``); directory B_free_lambda/
+          log lambda on [log 0.5, log 8] mm (LAMBDA_BOUNDS),
+          D = v lambda / 2 and rho = v / (2 lambda) re-derived from the
+          current lambda at every evaluation; the start is the fixed
+          mode's optimum (T_r*, the truth's lambda) when its fit.json
+          exists in the patient's directory and did not hit a bound,
+          else the geometric midpoints of both brackets
+          (``fit_growth_time_free``); directory B_free_lambda/
 so that the growth-only field at T_r from the fixed seed matches the
 truth's density at resection on the region's voxels; the best evaluation
 is the fit, and bound_hit flags a fit whose log T_r (or, in the free
@@ -570,38 +651,42 @@ recording the six frames, and compared with the truth's frames by
                    own seed and lambda): patient, cell, lambda_mode,
                    objective, fitted_T_r, fitted_lambda_mm,
                    lambda_truth_mm, rho_T_r_fitted (with the fitted rho),
-                   rho_T_r, R_over_lambda (the design's), seed_peak,
-                   seed_sigma_mm, n_evaluations, objective_initial,
-                   objective_achieved, bound_hit, growth_n_steps, dt,
-                   wall_time_s (the fit), and <frame>_<metric> for the
-                   six frames
+                   rho_T_r, R_over_lambda and maturity (the design's),
+                   seed_peak, seed_sigma_mm, n_evaluations,
+                   objective_initial, objective_achieved, bound_hit,
+                   growth_n_steps, steps_per_day, dt, wall_time_s (the
+                   fit), and <frame>_<metric> for the six frames
   seedfix_summary.json   the assembly record (as substitute_summary.json)
                    with the seed's record, the lambda modes and the
                    medians (``seedfix_medians``): per lambda mode, per
                    cell, over all patients and per stratum
-                   R_over_lambda >= 10 / < 10, the patient count,
+                   maturity >= 15 / < 15, the patient count,
                    n_bound_hit and, over the patients whose fit did not
                    hit a bound, the median of |rho_fitted T_r_fitted -
                    rho T_r| (abs_rho_T_r_error), of |log(lambda_fitted /
                    lambda)| (abs_log_lambda_error) and of every d120_ and
                    d180_ metric
   figures/seedfix_<frame>_<lambda_mode>.{png,pdf}   for d120 and d180:
-                   every comparison metric against the truth's
-                   R_over_lambda (log axis, a vertical line at 10), one
-                   marker per patient coloured by cell (hollow for a
-                   bound hit)
+                   every comparison metric against the truth's maturity
+                   (log axis), one marker per patient coloured by cell
+                   (hollow for a bound hit)
   runs/seedfix/<patient>/   truth/ (unless experiment 2's is reused),
                    observation.json, B/ and B_free_lambda/ (fit.json:
                    the fit's record with the bounds, the start and the
                    history; row.json; run/ with the treated run),
                    seedfix.json (the record with wall_time_s, the resume
-                   marker; a mode whose row.json exists is reused)
+                   marker; a mode whose row.json exists is reused, and a
+                   reused row.json or fit.json must carry the current
+                   seed_peak and seed_sigma_mm, else the pass raises
+                   naming both seeds, ``check_reused_seed``)
 
 Subcommand profile (experiment 4). Experiment 3's fixed-lambda fit
 profiled over the width of the standard seed: per patient of --patients
-(default the fd_check patient of each cell, 4 patients) and per sigma_0
-in --sigmas (default 2, 3, 5 mm), with the peak --seed-peak (default
-0.6), the fixed-lambda fit of the growth time (``fit_growth_time``,
+(default per cell the fd_check patient and the next accepted patient in
+design order, 8 patients; with --smoke the fd_check patients alone, 4;
+``profile_default_patients``) and per sigma_0 in --sigmas (default 1,
+1.5, 2, 3, 4, 6 mm; 2, 4 with --smoke), with the peak --seed-peak
+(default 0.6), the fixed-lambda fit of the growth time (``fit_growth_time``,
 objective B, --tr-bounds, --maxfev), the treated run at the fitted T_r
 with the truth's maps, alpha and k_ct and the six-frame comparison,
 exactly the path of ``seedfix_patient``'s fixed mode
@@ -610,10 +695,10 @@ exactly the path of ``seedfix_patient``'s fixed mode
 runs/profile/<patient>/truth.
   profile.csv      one row per patient x sigma_0: patient, cell,
                    sigma_mm, seed_peak, fitted_T_r, rho_T_r_fitted,
-                   rho_T_r, R_over_lambda, bound_hit, objective_initial,
-                   objective_achieved, n_evaluations, growth_n_steps, dt,
-                   wall_time_s (the fit), and <frame>_<metric> for the
-                   six frames
+                   rho_T_r, R_over_lambda, maturity, bound_hit,
+                   objective_initial, objective_achieved, n_evaluations,
+                   growth_n_steps, steps_per_day, dt, wall_time_s (the
+                   fit), and <frame>_<metric> for the six frames
   figures/profile_objective.{png,pdf}   objective_achieved against
                    sigma_0, one line per patient coloured by cell (a
                    bound hit hollow)
@@ -621,30 +706,33 @@ runs/profile/<patient>/truth.
                    mass_rel against sigma_0, the same way
   profile_summary.json   the assembly record with the seed peak, the
                    sigmas and the medians (``profile_medians``): per
-                   sigma_0 and group (cells, all, the R_over_lambda
-                   strata) the patient count, n_bound_hit and, excluding
+                   sigma_0 and group (cells, all, the maturity strata)
+                   the patient count, n_bound_hit and, excluding
                    the bound hits, the medians of fitted_T_r,
                    rho_T_r_fitted, objective_achieved and the d120_ and
                    d180_ metrics
   runs/profile/<patient>/   truth/ (unless reused), observation.json,
                    sigma_<sigma_0>/ (fit.json, row.json, run/),
                    profile.json (the resume marker; a sigma_0 whose
-                   row.json exists is reused)
+                   row.json exists is reused when it carries the current
+                   peak and that sigma_0, ``check_reused_seed``)
 
 Subcommand all runs design (skipped when spec.json exists; on the first
-device of --gpus), then substitute, seedfix and profile in order over
-the devices (--maxfev bounds every fit; --delta-a, --seed-peak,
---seed-sigma-mm, --lambda-mode, --sigmas, --tr-bounds, --tr-max and the
-band arguments are taken as by the subcommands). --patients restricts
-substitute, seedfix and profile to ids or ranges (p03, p00-p07, all);
-without it the profile takes the fd_check patients. The invariance and
-fisher subcommands run on their own.
+device of --gpus), then substitute, seedfix (the fixed lambda mode by
+default) and profile in order over the devices, each with its own
+defaults (--maxfev bounds every fit; --dt-mode, --delta-a, --seed-peak,
+--seed-sigma-mm, --lambda-mode, --sigmas, --tr-bounds, --tr-max,
+--patients-per-cell and the band arguments are taken as by the
+subcommands). --patients restricts substitute, seedfix and profile to
+ids or ranges (p03, p00-p07, all); without it the profile takes its
+default patients. The invariance, fisher and dt-check subcommands run
+on their own.
 
 Devices. --gpus is a comma-separated list of CUDA device ids, '' the
 CPU (the default is the sensitivity script's slots, 1,2,3,6; ','
-names two CPU workers). The design's screening and the invariance
-experiment run on one device (the first of the list under all; their
-subcommands refuse more). With one device, or one selected patient,
+names two CPU workers). The design's screening, the invariance
+experiment and dt-check run on one device (the first of the list under
+all; their subcommands refuse more). With one device, or one selected patient,
 fisher, substitute, seedfix and profile solve in this process. With
 several devices they dispatch
 (``dispatch``): the selected patients, in design order, are cut into
@@ -663,11 +751,12 @@ any worker returned nonzero. The device split (devices, blocks, return
 codes, logs, wall times) goes into <experiment>_summary.json; a later
 single-process pass keeps the last split. Workers are ordinary passes,
 so a dispatch is resumable like any other. --smoke uses
-resolution_factor 0.25, the first patient of each cell (4 patients),
-K = 8, maxfev 20 and the CPU, so that the whole pipeline finishes in
-minutes; the design records it (spec.json: smoke) and the later
-subcommands follow the record. The tests use the same settings on a
-phantom.
+resolution_factor 0.25, one patient per cell (the design accepts one,
+4 patients, and the arms take the first of each cell), K = 8, maxfev 20,
+the profile widths 2 and 4 mm and the CPU, so that the whole pipeline
+finishes in minutes; the design records it (spec.json: smoke) and the
+later subcommands follow the record. The tests use the same settings on
+a phantom.
 
 Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
 /mnt/Drive4/lucas/stupp_identifiability; --name required):
@@ -676,9 +765,11 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR
     screen/c<candidate>/screen.json
     configs/<patient>.json
     runs/invariance/, runs/fisher/<patient>/, runs/substitute/<patient>/,
-    runs/seedfix/<patient>/, runs/profile/<patient>/
+    runs/seedfix/<patient>/, runs/profile/<patient>/,
+    runs/dt_check/<patient>/
     invariance.csv, fisher.csv, fisher_regions.csv, fisher_fd_check.csv,
-    fisher_runs.csv, substitute.csv, seedfix.csv, profile.csv
+    fisher_runs.csv, substitute.csv, seedfix.csv, profile.csv,
+    dt_check.csv
     <experiment>_summary.json
     figures/
 
@@ -689,9 +780,12 @@ In one process on the same class of card a growth-only atlas solve takes
 frames 3.5 s + 2.2 ms per step (1 908 steps: 7.7 s; the treatment terms,
 the frame upsamplings and the maps' downsampling are the extra). A new
 step count compiles the scan again (1-3 s). With T_r the resection time
-in days, a growth stage is 12 T_r steps and a treated run 12 (T_r + 120)
-steps (experiment 1) or 12 (T_r + 180) (experiments 2-4).
-  design       one growth-only solve per screened candidate (12 T_r
+in days and k the patient's steps per day (12 in the fixed mode, 2-12
+in the stability mode, 2 for about half of the cohort), a growth stage
+is k T_r steps and a treated run k (T_r + 120) steps (experiment 1) or
+k (T_r + 180) (experiments 2-4); the figures below are for 12 steps/day
+and shrink with k.
+  design       one growth-only solve per screened candidate (k T_r
                steps, T_r up to --tr-max: 2-20 s each with the
                recompilation); the number screened depends on the
                acceptance rate of the bands (a few solves per accepted
@@ -702,35 +796,39 @@ steps (experiment 1) or 12 (T_r + 180) (experiments 2-4).
                runs (10 more for the four fd_check patients), the noise
                (K = 64: about 2 min on the CPU side), the metrics of 80
                (130) frames and the analysis (least squares on 4 million
-               rows): 5-12 min per patient, about 4-5 h for the 32
+               rows): 5-12 min per patient, about 2-3 h for the 16
                patients on one GPU; about 500 MB per fd_check patient
                (W.npz 116 MB, 29 run directories of about 12 MB), about
-               16 GB in total.
-  substitute   per patient the truth and 4 fits of up to 150 growth-only
-               solves of 12 T_0 steps (0.85 s per evaluation at T_0 = 30
-               days, 3.1 s at 150, about 15 s at 1 000) plus 4 treated
-               runs: 20-60 min per patient depending on T_0, so 10-30 h
-               for the cohort on one GPU; --gpus 1,2,3,6 dispatches 8
-               patients to each of four devices. About 33 MB per patient.
-  seedfix      per patient 2 fits (the fixed mode 10-20 Brent
-               evaluations, the free mode up to 150 Nelder-Mead
-               evaluations, each a growth-only solve with its own step
-               count and compilation, 5-40 s) plus 2 treated runs:
-               10-60 min per patient.
-  profile      per patient 3 fixed-mode fits and 3 treated runs, 4
-               patients: 20-60 min in total.
+               8 GB in total.
+  substitute   per patient the truth and 4 fits of up to 60 growth-only
+               solves of k T_0 steps (0.85 s per evaluation at T_0 = 30
+               days, 3.1 s at 150, about 15 s at 1 000 at 12 steps/day)
+               plus 4 treated runs: 10-30 min per patient depending on
+               T_0, so 3-8 h for the cohort on one GPU; --gpus 1,2,3,6
+               dispatches 4 patients to each of four devices. About
+               33 MB per patient.
+  seedfix      per patient 1 fixed-mode fit (10-20 Brent evaluations,
+               each a growth-only solve with its own step count and
+               compilation, 5-40 s; the free mode, when asked for, up to
+               150 Nelder-Mead evaluations) plus 1 treated run: 5-30 min
+               per patient.
+  profile      per patient 6 fixed-mode fits and 6 treated runs, 8
+               patients: 1-3 h in total over the devices.
+  dt-check     per patient two truths (2 growth and 2 treated solves):
+               1-2 min per patient, 4 patients by default.
   --smoke      the whole pipeline on the CPU (maxfev 20, 4 mm voxels):
                tens of minutes; the design's screening at 4 mm takes
                2-5 s per candidate.
 
 Run from the project root, e.g. (ID = /mnt/Drive4/lucas/stupp_identifiability):
-  python scripts/identifiability_experiments.py design --name id_2026-09-16 --gpus 1
-  python scripts/identifiability_experiments.py substitute --name id_2026-09-16 --gpus 1,2,3,6
-  python scripts/identifiability_experiments.py seedfix --name id_2026-09-16 --gpus 1,2,3,6
-  python scripts/identifiability_experiments.py profile --name id_2026-09-16 --gpus 1,2,3,6
-  python scripts/identifiability_experiments.py invariance --name id_2026-09-16 --gpus 1
-  python scripts/identifiability_experiments.py fisher --name id_2026-09-16 --gpus 1,2,3,6
-  python scripts/identifiability_experiments.py all --name id_2026-09-16 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py design --name id_2026-09-19 --gpus 1
+  python scripts/identifiability_experiments.py dt-check --name id_2026-09-19 --gpus 1
+  python scripts/identifiability_experiments.py substitute --name id_2026-09-19 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py seedfix --name id_2026-09-19 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py profile --name id_2026-09-19 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py invariance --name id_2026-09-19 --gpus 1
+  python scripts/identifiability_experiments.py fisher --name id_2026-09-19 --gpus 1,2,3,6
+  python scripts/identifiability_experiments.py all --name id_2026-09-19 --gpus 1,2,3,6
   python scripts/identifiability_experiments.py all --smoke --output-dir runs/ --name smoke
 Every subcommand but design needs the design directory; the CSVs and
 figures are reassembled from the records present at the end of each
@@ -807,7 +905,7 @@ sa = load_sensitivity_analysis()
 
 # --- settings ---
 
-EXPERIMENTS: tuple[str, ...] = ("design", "invariance", "fisher", "substitute", "seedfix", "profile")
+EXPERIMENTS: tuple[str, ...] = ("design", "invariance", "fisher", "substitute", "seedfix", "profile", "dt-check")
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_identifiability")
 DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_identifiability_search_space.json"
 DEFAULT_GPUS: str = str(sa.DEFAULT_GPUS)  # the sensitivity script's slots, "1,2,3,6"
@@ -822,14 +920,32 @@ PRECISION = "f64"
 SEED_FLOOR = 0.0  # gaussian_seed_floor of the whole cohort (the base config's 0.1 is replaced)
 DESIGN_SEED = 1
 DEFAULT_LOG2_CANDIDATES = 10  # 1024 Sobol' points to fill the four cells from
-PATIENTS_PER_CELL = 8
+PATIENTS_PER_CELL = 4  # 16 patients
 # A search-space entry carrying this key with a true value is a factor of
 # this script, not a solver parameter; ``load_script_search_space`` strips
 # it before the shared loader sees the file.
 SCRIPT_FACTOR_KEY = "script"
 GROWTH_EFOLDS_FACTOR = "growth_efolds"  # a = rho T_r; resection_time = growth_efolds / rho
 LAMBDA_SPLIT = 2.0  # front_width_mm at or below / above: compact / broad
-VISIBILITY_HORIZON = 120.0  # days; visibility_margin = VISIBILITY_HORIZON rho - log_kill_total
+# maturity = 2 growth_efolds front_width_mm^2 / seed_sigma_mm^2 = ell lambda / sigma^2
+# (ell = v T_r = 2 a lambda the front travel): below / at or above: immature / mature.
+MATURITY_SPLIT = 15.0
+SEED_WIDTH_CAP = 1.5  # a candidate with seed_sigma_mm > SEED_WIDTH_CAP front_width_mm is rejected (seed_wide)
+# The time step (--dt-mode, ``steps_per_day_for``). fixed: BASE_STEPS_PER_DAY
+# steps per day for every patient (the base config's 12). stability: per
+# patient dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D_wm)) rounded down to an
+# integer number of steps per day, never finer than BASE_STEPS_PER_DAY
+# (the floor of the step) and never coarser than the solver's own
+# estimate at the truth's resection_time (``solver_step_estimate``), so
+# that the truth is stepped as requested; DT_MAX is half a day because
+# the frame rounding (``frame_days``) needs a step of at most half a day.
+DT_MODES: tuple[str, ...] = ("fixed", "stability")
+DEFAULT_DT_MODE = "stability"
+BASE_STEPS_PER_DAY = 12
+DT_MAX = 0.5  # days
+DT_SAFETY = 0.5  # of the explicit diffusion limit dx^2 / (6 D)
+SOLVER_STEP_FLOOR = 100  # the solver's estimate over a horizon T: max(8 D T / dx^2 + 100, 1.1 rho T) steps
+VISIBILITY_HORIZON = 120.0  # days; visibility_margin = VISIBILITY_HORIZON rho - log_kill_total (a design column, not a cell split)
 TR_MIN = 5.0  # days; a candidate below it is rejected, a substitute T_0 below it skipped
 DEFAULT_TR_MAX = 1000.0  # days; --tr-max, the candidates above it are rejected
 MAX_CONSECUTIVE_SCREEN_FAILURES = 3  # the screening aborts after this many failed solves in a row
@@ -847,11 +963,11 @@ SAMPLED_FACTORS: tuple[str, ...] = (
     sa.SEED_SIGMA_FACTOR,
 )
 FIXED_PARAMETERS: tuple[str, ...] = ("diffusivity_ratio", "rt_alpha_beta_ratio", "chemo_decay_rate")
-CELLS: dict[str, tuple[bool, bool]] = {  # cell name -> (broad: front_width_mm > LAMBDA_SPLIT, visible: visibility_margin >= 0)
-    "compact_visible": (False, True),
-    "compact_invisible": (False, False),
-    "broad_visible": (True, True),
-    "broad_invisible": (True, False),
+CELLS: dict[str, tuple[bool, bool]] = {  # cell name -> (broad: front_width_mm > LAMBDA_SPLIT, mature: maturity >= MATURITY_SPLIT)
+    "compact_immature": (False, False),
+    "compact_mature": (False, True),
+    "broad_immature": (True, False),
+    "broad_mature": (True, True),
 }
 DESIGN_DERIVED: tuple[str, ...] = (
     "white_matter_diffusivity",
@@ -876,8 +992,11 @@ DESIGN_COLUMNS: list[str] = [
     "log_kill_ct",
     "log_kill_total",
     "visibility_margin",
+    "maturity",
     *SIZE_COLUMNS,
     "R_over_lambda",
+    "steps_per_day",
+    "dt",
     "fd_check",
 ]
 SCREEN_DIR = "screen"  # <design>/screen/c<candidate>/screen.json, the screening's resume records
@@ -964,8 +1083,9 @@ SINGULAR_TOLERANCE = 1e-14  # an eigenvalue of F below it times the largest coun
 
 # Experiment 2: the substitute's growth time T_0 = T_r - delta_a / rho per
 # deficit delta_a in e-folds (delta_a > 0: T_0 earlier than the truth).
-SUBSTITUTE_DELTA_A: tuple[float, ...] = (-2.0, -0.5, 0.5, 2.0)
-MAXFEV = 150
+SUBSTITUTE_DELTA_A: tuple[float, ...] = (-1.0, -0.5, 0.5, 1.0)
+MAXFEV = 150  # --maxfev of the seedfix and profile fits
+SUBSTITUTE_MAXFEV = 60  # --maxfev of the substitute fits
 PEAK_MIN = 0.05  # the fitted peak lies in (PEAK_MIN, PEAK_MAX]
 PEAK_MAX = 1.0
 LOGIT_CLIP = 1e-4  # the inverse map keeps the unit-interval argument in [LOGIT_CLIP, 1 - LOGIT_CLIP]
@@ -977,18 +1097,18 @@ LOG_EPS = 1e-6  # log(u + LOG_EPS) in the log metrics and objective A
 
 # Experiment 3.
 TR_BOUNDS: tuple[float, float] = (5.0, 3000.0)  # the fitted growth time's range in days (--tr-bounds)
-LAMBDA_BOUNDS: tuple[float, float] = (1.0, 8.0)  # the fitted front width's range in mm (the free-lambda mode)
+LAMBDA_BOUNDS: tuple[float, float] = (0.5, 8.0)  # the fitted front width's range in mm (the free-lambda mode)
 LAMBDA_MODES: tuple[str, ...] = ("fixed", "free")  # --lambda-mode fixed | free | both
+DEFAULT_LAMBDA_MODE = "fixed"
 LAMBDA_MODE_DIRS: dict[str, str] = {"fixed": "B", "free": "B_free_lambda"}  # runs/seedfix/<patient>/<dir>/
 SCALAR_XATOL = 1e-3  # the bounded search's tolerance in log T_r
 SEED_SOURCE = "argument"  # the fixed seed comes from --seed-peak and --seed-sigma-mm
 DEFAULT_SEED_PEAK = 0.6
 DEFAULT_SEED_SIGMA_MM = 2.0
 BOUND_TOLERANCE = 1e-2  # a fitted log parameter within it of a bound counts as a bound hit
-R_OVER_LAMBDA_SPLIT = 10.0  # the stratum R_over_lambda >= / < it of the summaries and the figures' vertical line
 
 # Experiment 4 (profile).
-PROFILE_SIGMAS: tuple[float, ...] = (2.0, 3.0, 5.0)  # the fixed seed widths sigma_0 in mm (--sigmas)
+PROFILE_SIGMAS: tuple[float, ...] = (1.0, 1.5, 2.0, 3.0, 4.0, 6.0)  # the fixed seed widths sigma_0 in mm (--sigmas)
 
 # Metrics (``compare_fields``).
 MASS_NAMES: tuple[str, ...] = ("mass", "mass_out_of_field", "mass_beyond_edema")  # each with ref_<name> and <name>_rel
@@ -1007,12 +1127,12 @@ METRIC_NAMES: list[str] = [
     "log_vol_ratio_edema",
     *(f"qoi_{name}" for name in sa.QOI_NAMES),
 ]
-# The metrics plotted against lambda / delta_a / R_over_lambda (the QoIs
-# are plotted in a second figure).
+# The metrics plotted against lambda / delta_a / maturity (the QoIs are
+# plotted in a second figure).
 PLOTTED_METRICS: list[str] = [name for name in METRIC_NAMES if not name.startswith("qoi_") and not name.startswith("ref_")]
 PLOTTED_QOIS: list[str] = [f"qoi_{name}" for name in sa.FINAL_ANALYSED_QOIS]
 
-COLOR_CELLS: dict[str, str] = {"compact_visible": "#2a78d6", "compact_invisible": "#eb6834", "broad_visible": "#2a9d8f", "broad_invisible": "#8a4fbf"}
+COLOR_CELLS: dict[str, str] = {"compact_immature": "#2a78d6", "compact_mature": "#eb6834", "broad_immature": "#2a9d8f", "broad_mature": "#8a4fbf"}
 COLOR_TEXT = "#0b0b0b"
 COLOR_LINES: tuple[str, ...] = ("#2a78d6", "#eb6834", "#2a9d8f", "#8a4fbf", "#c9a227", "#52514e", "#d64a8a", "#7a5c2e")
 
@@ -1023,9 +1143,11 @@ class Smoke:
     evaluations, the CPU."""
 
     resolution_factor: float = 0.25  # the solver's zoom factor: 4 mm voxels on the 1 mm atlas
+    patients_per_cell: int = 1  # the smoke design's cohort: one patient per cell
     n_patients: int = 4  # the first patient of each cell
     draws: int = 8
     maxfev: int = 20
+    sigmas: tuple[float, ...] = (2.0, 4.0)  # the profile's seed widths
 
 
 SMOKE = Smoke()
@@ -1057,7 +1179,14 @@ class Patient:
     seed_peak: float
     seed_sigma: float
     r_over_lambda: float = float("nan")  # the design's R_over_lambda (r_whole_mm / front_width_mm); NaN off the design
+    maturity: float = float("nan")  # the design's maturity (``maturity``); NaN off the design
     fd_check: bool = False  # the design's fd_check flag (the first patient of each cell)
+    steps_per_day: int | None = None  # the patient's time step (``steps_per_day_for``); None: the base config's setting
+
+    @property
+    def dt(self) -> float | None:
+        """1 / steps_per_day in days; None without a step of its own."""
+        return None if self.steps_per_day is None else 1.0 / float(self.steps_per_day)
 
     @property
     def growth(self) -> dict[str, float]:
@@ -1084,15 +1213,19 @@ class Patient:
         """(log v, log lambda, log T_r, log alpha, log k_ct)."""
         return np.log([self.front_speed, self.front_width, self.resection_time, self.rt_alpha, self.chemo_kill_rate])
 
-    def solver_values(self) -> dict[str, float]:
-        """The StuppFKPPSolver parameters the patient sets."""
-        return {
+    def solver_values(self) -> dict[str, Any]:
+        """The StuppFKPPSolver parameters the patient sets (its time step
+        as steps_per_day, with n_steps and dt unset, when it has one)."""
+        values: dict[str, Any] = {
             **self.growth,
             **self.seed,
             "resection_time": float(self.resection_time),
             "rt_alpha": float(self.rt_alpha),
             "chemo_kill_rate": float(self.chemo_kill_rate),
         }
+        if self.steps_per_day is not None:
+            values.update({"n_steps": None, "dt": None, "steps_per_day": int(self.steps_per_day)})
+        return values
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> Patient:
@@ -1108,7 +1241,9 @@ class Patient:
             seed_peak=float(record[sa.SEED_PEAK_FACTOR]),
             seed_sigma=float(record[sa.SEED_SIGMA_FACTOR]),
             r_over_lambda=sa.as_float(record.get("R_over_lambda")),
+            maturity=sa.as_float(record.get("maturity")),
             fd_check=str(record.get("fd_check")) == "True",
+            steps_per_day=None if str(record.get("steps_per_day", "")).strip() == "" else int(float(record["steps_per_day"])),
         )
 
     @classmethod
@@ -1127,6 +1262,7 @@ class Patient:
             chemo_kill_rate=float(config["chemo_kill_rate"]),
             seed_peak=float(sa.seed_peak_density(config["gaussian_seed_mass"], tau)),
             seed_sigma=float(np.sqrt(2.0 * tau)),
+            steps_per_day=None if config.get("steps_per_day") is None else int(config["steps_per_day"]),
         )
 
 
@@ -1194,6 +1330,8 @@ def load_cohort(root: str | Path) -> Cohort:
     voxel = tuple(int(v) for v in spec["seed_voxel"])
     fractions = tuple(float(v) for v in spec["seed_fractions"])
     patients = [Patient.from_record(record) for record in sa.read_csv(root / "design.csv")]
+    if base.get("steps_per_day") is not None:  # a design without the column (before --dt-mode) steps at the base config's rate
+        patients = [replace(p, steps_per_day=int(base["steps_per_day"])) if p.steps_per_day is None else p for p in patients]
     return Cohort(
         root=root,
         spec=dict(spec),
@@ -1387,13 +1525,67 @@ def visibility_margin(rho: NDArray | float, log_kill_total: NDArray | float) -> 
     return VISIBILITY_HORIZON * np.asarray(rho, dtype=np.float64) - np.asarray(log_kill_total, dtype=np.float64)
 
 
-def cell_of(front_width: float, margin: float) -> str:
+def solver_step_estimate(diffusivity: float, rho: float, horizon: float, dx: float) -> int:
+    """The solver's own stability estimate of the step count over a
+    horizon in days: ceil(max(8 D T / dx^2 + SOLVER_STEP_FLOOR, 1.1 rho T))
+    (``_time_step_count`` of FKPPSolver and StuppFKPPSolver, dx the
+    smallest grid spacing in mm); the solver raises a coarser request to
+    it."""
+    t = float(horizon)
+    n = max(t * float(diffusivity) / float(dx) ** 2 * 8.0 + SOLVER_STEP_FLOOR, t * float(rho) * 1.1)
+    return int(np.ceil(n))
+
+
+def steps_per_day_for(mode: str, diffusivity: float, rho: float, resection_time: float, dx: float) -> int:
+    """
+    The steps per day of a patient's solves. "fixed": BASE_STEPS_PER_DAY.
+    "stability": dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D)) with D the
+    patient's white-matter diffusivity (mm^2/day) and dx the grid spacing
+    (mm), rounded down to an integer number of steps per day
+    (ceil(1 / dt)), then raised to the solver's estimate at the truth's
+    resection_time (ceil(``solver_step_estimate`` / resection_time)) so
+    that the truth's growth stage is stepped as requested, and capped at
+    BASE_STEPS_PER_DAY, the finest step (the solver may still refine a
+    solve that needs more than that many steps per day, as it does in
+    the fixed mode).
+    """
+    if mode not in DT_MODES:
+        raise ValueError(f"--dt-mode must be one of {DT_MODES}, got {mode!r}.")
+    if mode == "fixed":
+        return BASE_STEPS_PER_DAY
+    diffusivity, dx, t_r = float(diffusivity), float(dx), float(resection_time)
+    if not (diffusivity > 0 and dx > 0 and t_r > 0):
+        raise ValueError(f"the stability step needs D > 0, dx > 0 and resection_time > 0, got {diffusivity!r}, {dx!r}, {t_r!r}.")
+    dt = min(DT_MAX, DT_SAFETY * dx**2 / (6.0 * diffusivity))
+    steps = int(np.ceil(1.0 / dt - 1e-9))
+    steps = max(steps, int(np.ceil(solver_step_estimate(diffusivity, rho, t_r, dx) / t_r - 1e-9)))
+    return int(min(max(steps, 1), BASE_STEPS_PER_DAY))
+
+
+def grid_spacing_mm(base: Mapping[str, Any], zooms: Sequence[float]) -> float:
+    """The smallest spacing of the solver's grid in mm: the smallest voxel
+    size over the base config's resolution_factor (4 mm in the smoke)."""
+    return float(min(float(z) for z in zooms)) / float(base["resolution_factor"])
+
+
+def maturity(growth_efolds: NDArray | float, front_width: NDArray | float, seed_sigma: NDArray | float) -> NDArray:
+    """2 growth_efolds front_width_mm^2 / seed_sigma_mm^2 = ell lambda /
+    sigma^2 (ell = v T_r = 2 a lambda the front travel): the front travel
+    over the seed's forgetting distance sigma^2 / lambda; at or above
+    MATURITY_SPLIT the truth is mature, below it immature."""
+    a = np.asarray(growth_efolds, dtype=np.float64)
+    width = np.asarray(front_width, dtype=np.float64)
+    sigma = np.asarray(seed_sigma, dtype=np.float64)
+    return 2.0 * a * width**2 / sigma**2
+
+
+def cell_of(front_width: float, maturity: float) -> str:
     """The cell of a candidate: (front_width_mm at or below / above
-    LAMBDA_SPLIT: compact / broad) x (visibility_margin at or above /
-    below 0: visible / invisible)."""
-    broad, visible = front_width > LAMBDA_SPLIT, margin >= 0.0
-    for name, (is_broad, is_visible) in CELLS.items():
-        if is_broad == broad and is_visible == visible:
+    LAMBDA_SPLIT: compact / broad) x (maturity below / at or above
+    MATURITY_SPLIT: immature / mature)."""
+    broad, mature = front_width > LAMBDA_SPLIT, maturity >= MATURITY_SPLIT
+    for name, (is_broad, is_mature) in CELLS.items():
+        if is_broad == broad and is_mature == mature:
             return name
     raise AssertionError("unreachable")
 
@@ -1414,8 +1606,10 @@ def sample_candidates(
     sampled factors (unit cube, 2 ** log2_candidates points) transformed
     with the factors' ranges (the search space's and the script's) and
     derived with the space's groups; resection_time = growth_efolds / rho,
-    ell_mm = v resection_time, the log kill (``total_log_kill``) and the
-    visibility margin; the cell (``cell_of``) and "rejected": None, or
+    ell_mm = v resection_time, the log kill (``total_log_kill``), the
+    visibility margin and the maturity (``maturity``); the cell
+    (``cell_of``) and "rejected": None, or "seed_wide" for a seed_sigma_mm
+    above SEED_WIDTH_CAP front_width_mm (checked first), else
     "T_r_below_min" / "T_r_above_max" for a resection_time outside
     [TR_MIN, tr_max].
 
@@ -1446,13 +1640,19 @@ def sample_candidates(
         float(base["chemo_decay_rate"]),
     )
     margin = visibility_margin(rho, kill["log_kill_total"])
+    widths = values[sa.GROWTH_WIDTH_FACTOR]
+    sigmas = values[sa.SEED_SIGMA_FACTOR]
+    mature = maturity(values[GROWTH_EFOLDS_FACTOR], widths, sigmas)
     records: list[dict[str, Any]] = []
     for i in range(len(u)):
         t_r = float(resection_time[i])
-        rejected = "T_r_below_min" if t_r < TR_MIN else ("T_r_above_max" if t_r > float(tr_max) else None)
+        if float(sigmas[i]) > SEED_WIDTH_CAP * float(widths[i]):
+            rejected: str | None = "seed_wide"
+        else:
+            rejected = "T_r_below_min" if t_r < TR_MIN else ("T_r_above_max" if t_r > float(tr_max) else None)
         record: dict[str, Any] = {
             "candidate": int(i),
-            "cell": cell_of(float(values[sa.GROWTH_WIDTH_FACTOR][i]), float(margin[i])),
+            "cell": cell_of(float(widths[i]), float(mature[i])),
             "rejected": rejected,
         }
         record.update({f"u_{name}": float(u[i, column]) for column, name in enumerate(SAMPLED_FACTORS)})
@@ -1463,6 +1663,7 @@ def sample_candidates(
         record["ell_mm"] = float(values[sa.GROWTH_SPEED_FACTOR][i]) * t_r
         record.update({key: float(kill[key][i]) for key in ("log_kill_rt", "log_kill_ct", "log_kill_total")})
         record["visibility_margin"] = float(margin[i])
+        record["maturity"] = float(mature[i])
         records.append(record)
     return records
 
@@ -1479,6 +1680,8 @@ def candidate_patient(record: Mapping[str, Any]) -> Patient:
         chemo_kill_rate=float(record["chemo_kill_rate"]),
         seed_peak=float(record[sa.SEED_PEAK_FACTOR]),
         seed_sigma=float(record[sa.SEED_SIGMA_FACTOR]),
+        maturity=float(record["maturity"]),
+        steps_per_day=None if record.get("steps_per_day") is None else int(record["steps_per_day"]),
     )
 
 
@@ -1525,23 +1728,39 @@ def accept_sizes(sizes: Mapping[str, Any], bands: SizeBands = DEFAULT_BANDS) -> 
     return None
 
 
+def requested_steps(horizon: float, steps_per_day: int) -> int:
+    """The step count of a horizon in days at a whole number of steps per
+    day, as the solver translates it: ceil(horizon steps_per_day) (the
+    effective step horizon / n is then at most 1 / steps_per_day)."""
+    return int(np.ceil(float(horizon) * int(steps_per_day) - 1e-9))
+
+
+def dt_refined(n_steps: int, horizon: float, patient: Patient) -> bool:
+    """Whether a growth solve over the horizon took more steps than the
+    patient's own step asks for (the solver's estimate was stricter);
+    False for a patient without a step of its own."""
+    return patient.steps_per_day is not None and int(n_steps) > requested_steps(horizon, patient.steps_per_day)
+
+
 def screen_candidate(cohort: Cohort, record: Mapping[str, Any], screen_dir: Path) -> dict[str, Any]:
     """
     The screening record of a candidate: read back from
     screen_dir/c<candidate>/screen.json when it exists (its factor values
     must match the candidate's, else the design was resumed with another
     seed or search space), otherwise the growth-only solve of the
-    candidate to its resection_time (the truth's growth path: the base
-    time step, the cohort's seed voxel; ``solve_growth``) measured by
+    candidate to its resection_time (the truth's growth path: the
+    candidate's time step, the cohort's seed voxel; ``solve_growth``) measured by
     ``size_screen`` on the 1 mm grid and written there.
 
     Returns:
-        candidate, the sampled factors, resection_time, rho, n_core,
-        n_whole, r_core_mm, r_whole_mm, whole_core_ratio, max_density,
-        n_steps, dt, wall_time_s, failed and error (the solver's message
-        when the solve raised; the sizes are then NaN).
+        candidate, the sampled factors, resection_time, rho,
+        steps_per_day (the candidate's step), n_core, n_whole, r_core_mm,
+        r_whole_mm, whole_core_ratio, max_density, n_steps, dt (the
+        solver's), dt_refined (the solver stepped finer than requested),
+        wall_time_s, failed and error (the solver's message when the solve
+        raised; the sizes are then NaN).
     """
-    keys = (*SAMPLED_FACTORS, "resection_time", "rho")
+    keys = (*SAMPLED_FACTORS, "resection_time", "rho", "steps_per_day")
     path = screen_dir / f"c{int(record['candidate']):04d}" / SCREEN_FILE
     if path.is_file():
         stored = read_record(path)
@@ -1549,21 +1768,24 @@ def screen_candidate(cohort: Cohort, record: Mapping[str, Any], screen_dir: Path
             if not np.isclose(float(stored[name]), float(record[name]), rtol=1e-9, atol=0.0):
                 raise ValueError(
                     f"{path} holds another candidate ({name} {stored[name]!r}, the design's {record[name]!r}): "
-                    "the design was resumed with a different seed or search space; remove the directory."
+                    "the design was resumed with a different seed, search space or time step; remove the directory."
                 )
         return stored
     patient = candidate_patient(record)
     out: dict[str, Any] = {"candidate": int(record["candidate"]), "cell": str(record["cell"])}
-    out.update({name: float(record[name]) for name in keys})
+    out.update({name: float(record[name]) for name in keys if name != "steps_per_day"})
+    out["steps_per_day"] = int(record["steps_per_day"])
     start = time.perf_counter()
     try:
         result = solve_growth(cohort, growth_config(patient_config(cohort, patient, FISHER_HORIZON)))
     except RuntimeError as error:
         out.update({name: float("nan") for name in ("n_core", "n_whole", *SIZE_COLUMNS, "max_density", "n_steps", "dt")})
-        out.update({"failed": True, "error": str(error)})
+        out.update({"dt_refined": None, "failed": True, "error": str(error)})
     else:
         out.update(size_screen(np.asarray(result.final_state["cell_density"], dtype=np.float64), cohort.tissue, cohort.zooms))
-        out.update({"n_steps": result.n_steps, "dt": result.dt, "failed": False, "error": None})
+        assert result.dt is not None
+        assert result.n_steps is not None
+        out.update({"n_steps": result.n_steps, "dt": result.dt, "dt_refined": dt_refined(result.n_steps, patient.resection_time, patient), "failed": False, "error": None})
     out["wall_time_s"] = time.perf_counter() - start
     path.parent.mkdir(parents=True, exist_ok=True)
     write_record(path, out)
@@ -1579,7 +1801,8 @@ def screen_cohort(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
     The size screening: per cell (CELLS' order) the admissible candidates
-    (not rejected by their resection_time) are screened in sequence order
+    (not rejected by their seed width or resection_time) are screened in
+    sequence order
     (``screen_candidate``, ``accept_sizes``) until patients_per_cell are
     accepted. A failed solve rejects the candidate and is counted;
     MAX_CONSECUTIVE_SCREEN_FAILURES failures in a row raise. When a cell
@@ -1590,13 +1813,15 @@ def screen_cohort(
         (records, counts): the design records (``DESIGN_COLUMNS``; ids
         p00, p01, ... in cell order, the first of each cell flagged
         fd_check, R_over_lambda = r_whole_mm / front_width_mm) and the
-        counts: n_candidates, n_rejected_T_r_below_min,
-        n_rejected_T_r_above_max, n_screened, n_accepted, n_solve_failed
-        and per cell n_candidates, n_admissible, n_screened, n_accepted,
-        n_solve_failed and n_rejected by reason.
+        counts: n_candidates, n_rejected_seed_wide,
+        n_rejected_T_r_below_min, n_rejected_T_r_above_max, n_screened,
+        n_accepted, n_solve_failed and per cell n_candidates,
+        n_admissible, n_screened, n_accepted, n_solve_failed and
+        n_rejected by reason.
     """
     counts: dict[str, Any] = {
         "n_candidates": len(candidates),
+        "n_rejected_seed_wide": sum(1 for c in candidates if c["rejected"] == "seed_wide"),
         "n_rejected_T_r_below_min": sum(1 for c in candidates if c["rejected"] == "T_r_below_min"),
         "n_rejected_T_r_above_max": sum(1 for c in candidates if c["rejected"] == "T_r_above_max"),
         "n_screened": 0,
@@ -1622,7 +1847,7 @@ def screen_cohort(
                 break
             screened = screen_candidate(cohort, candidate, screen_dir)
             cell_counts["n_screened"] += 1
-            label = f"c{int(candidate['candidate']):04d} ({cell}, T_r {candidate['resection_time']:.0f} d)"
+            label = f"c{int(candidate['candidate']):04d} ({cell}, T_r {candidate['resection_time']:.0f} d, maturity {candidate['maturity']:.1f})"
             if screened["failed"]:
                 cell_counts["n_solve_failed"] += 1
                 consecutive += 1
@@ -1651,7 +1876,8 @@ def screen_cohort(
     if short:
         raise ValueError(
             f"the cells {short} could not be filled with {patients_per_cell} patients each from {len(candidates)} Sobol' points "
-            f"(counts {json.dumps(jsonable(counts))}); raise --log2-candidates or widen the bands."
+            f"(compact / broad at front_width_mm {LAMBDA_SPLIT:g}, immature / mature at maturity {MATURITY_SPLIT:g}, seeds wider than "
+            f"{SEED_WIDTH_CAP:g} front widths rejected; counts {json.dumps(jsonable(counts))}); raise --log2-candidates or widen the bands."
         )
     records: list[dict[str, Any]] = []
     for cell in CELLS:
@@ -1680,6 +1906,7 @@ def make_design(
     tr_max: float = DEFAULT_TR_MAX,
     bands: SizeBands = DEFAULT_BANDS,
     patients_per_cell: int = PATIENTS_PER_CELL,
+    dt_mode: str = DEFAULT_DT_MODE,
     device: str = "",
 ) -> Path:
     """
@@ -1714,6 +1941,9 @@ def make_design(
             rejected; also the cap of the substitute arm's T_0.
         bands: The size screening's acceptance bands (``SizeBands``).
         patients_per_cell: Patients accepted per cell.
+        dt_mode: The time step of every patient's solves ("fixed" |
+            "stability", ``steps_per_day_for``; recorded in spec.json and
+            per patient in design.csv).
         device: The screening device, for the record ('' the CPU).
 
     Returns:
@@ -1741,6 +1971,8 @@ def make_design(
         raise ValueError(f"the base config {config_path} sets none of {list(sa.TIME_STEP_KEYS)}; set steps_per_day.")
     if int(patients_per_cell) < 1:
         raise ValueError(f"patients_per_cell must be at least 1, got {patients_per_cell!r}.")
+    if dt_mode not in DT_MODES:
+        raise ValueError(f"dt_mode must be one of {DT_MODES}, got {dt_mode!r}.")
     base["precision"] = PRECISION
     base["gaussian_seed_floor"] = SEED_FLOOR
     base["snapshot_times"] = None
@@ -1798,12 +2030,16 @@ def make_design(
     n_fractions = int(schedules["fisher"]["n_fractions"])
     chemo_total_dose = float(schedules["fisher"]["chemo_total_dose"])
     candidates = sample_candidates(space, script_factors, base, treatment, chemo_total_dose, n_fractions, log2_candidates, seed, tr_max)
+    wm_array, gm_array, zooms, affine = load_tissue(base)
+    dx = grid_spacing_mm(base, zooms)
+    for candidate in candidates:
+        steps = steps_per_day_for(dt_mode, candidate["white_matter_diffusivity"], candidate["rho"], candidate["resection_time"], dx)
+        candidate["steps_per_day"], candidate["dt"] = steps, 1.0 / steps
     root.mkdir(parents=True, exist_ok=True)
     for sub in ("configs", "runs", "figures", SCREEN_DIR):
         (root / sub).mkdir(exist_ok=True)
     shutil.copyfile(search_space_path, root / "search_space.json")
     write_config(base, root / "base_config.json")
-    wm_array, gm_array, zooms, affine = load_tissue(base)
     screening_cohort = Cohort(
         root=root,
         spec={"treatment": treatment, "min_tissue_fraction": min_tissue_fraction},
@@ -1819,8 +2055,8 @@ def make_design(
     )
     print(
         f"screening {len(candidates)} candidates ({sum(1 for c in candidates if c['rejected'] is None)} with T_r in "
-        f"[{TR_MIN:g}, {tr_max:g}] days) for {patients_per_cell} patients per cell on {device or 'cpu'}"
-        f"{' (resumed)' if resumed else ''}",
+        f"[{TR_MIN:g}, {tr_max:g}] days and a seed at most {SEED_WIDTH_CAP:g} front widths wide) for {patients_per_cell} patients per cell on "
+        f"{device or 'cpu'}, dt mode {dt_mode} (dx {dx:g} mm){' (resumed)' if resumed else ''}",
         flush=True,
     )
     start = time.perf_counter()
@@ -1839,13 +2075,23 @@ def make_design(
         "gaussian_seed_floor": SEED_FLOOR,
         "resolution_factor": float(base["resolution_factor"]),
         "smoke": bool(smoke),
-        "smoke_settings": {"resolution_factor": SMOKE.resolution_factor, "n_patients": SMOKE.n_patients, "draws": SMOKE.draws, "maxfev": SMOKE.maxfev},
+        "smoke_settings": {
+            "resolution_factor": SMOKE.resolution_factor,
+            "patients_per_cell": SMOKE.patients_per_cell,
+            "n_patients": SMOKE.n_patients,
+            "draws": SMOKE.draws,
+            "maxfev": SMOKE.maxfev,
+            "sigmas": list(SMOKE.sigmas),
+        },
         "design_seed": int(seed),
         "log2_candidates": int(log2_candidates),
         "n_candidates": 2 ** int(log2_candidates),
         "patients_per_cell": int(patients_per_cell),
-        "cells": {name: {"broad": broad, "visible": visible} for name, (broad, visible) in CELLS.items()},
+        "cells": {name: {"broad": broad, "mature": mature} for name, (broad, mature) in CELLS.items()},
         "lambda_split_mm": LAMBDA_SPLIT,
+        "maturity_split": MATURITY_SPLIT,
+        "maturity": {"formula": "maturity = 2 growth_efolds front_width_mm^2 / seed_sigma_mm^2 (= ell lambda / sigma^2); mature at or above maturity_split"},
+        "seed_width_cap": {"formula": f"a candidate with seed_sigma_mm > {SEED_WIDTH_CAP:g} front_width_mm is rejected (seed_wide)", "cap": SEED_WIDTH_CAP},
         "visibility_horizon_days": VISIBILITY_HORIZON,
         "sampled_factors": list(SAMPLED_FACTORS),
         "script_factors": list(script_factors),
@@ -1861,6 +2107,18 @@ def make_design(
         "min_tissue_fraction": min_tissue_fraction,
         "n_seedable_voxels": geometry.n_voxels,
         "time_step": {key: base[key] for key in sa.TIME_STEP_KEYS},
+        "dt_mode": dt_mode,
+        "dt_modes": {
+            "fixed": f"{BASE_STEPS_PER_DAY} steps per day for every patient (the base config's)",
+            "stability": (
+                f"per patient dt = min({DT_MAX:g}, {DT_SAFETY:g} dx^2 / (6 D_wm)) rounded down to an integer number of steps per day, raised to the "
+                f"solver's estimate ceil(max(8 D T_r / dx^2 + {SOLVER_STEP_FLOOR}, 1.1 rho T_r) / T_r) and capped at {BASE_STEPS_PER_DAY} steps per day"
+            ),
+            "dt_max_days": DT_MAX,
+            "dt_safety": DT_SAFETY,
+            "base_steps_per_day": BASE_STEPS_PER_DAY,
+            "grid_spacing_mm": dx,
+        },
         "treatment": {**treatment, "n_fractions": n_fractions, "rt_total_dose_gy": treatment["rt_dose_per_fraction_gy"] * n_fractions},
         "schedules": schedules,
         "log_kill": {
@@ -1869,7 +2127,7 @@ def make_design(
             "chemo_decay_rate": float(base["chemo_decay_rate"]),
             "rt_alpha_beta_ratio": float(base["rt_alpha_beta_ratio"]),
         },
-        "visibility": {"formula": f"visibility_margin = {VISIBILITY_HORIZON:g} rho - Lambda; visible at or above 0"},
+        "visibility": {"formula": f"visibility_margin = {VISIBILITY_HORIZON:g} rho - Lambda; at or above 0 the untreated regrowth outruns the log kill by day {VISIBILITY_HORIZON:g} (a design column, not a cell split)"},
         "screening": {
             "tr_min": TR_MIN,
             "tr_max": float(tr_max),
@@ -1909,7 +2167,7 @@ def make_design(
             "T_0": "T_r - delta_a / rho; skipped below T_0_min or above T_0_max",
             "T_0_min": TR_MIN,
             "T_0_max": float(tr_max),
-            "maxfev": SMOKE.maxfev if smoke else MAXFEV,
+            "maxfev": SMOKE.maxfev if smoke else SUBSTITUTE_MAXFEV,
             "peak_range": [PEAK_MIN, PEAK_MAX],
             "objectives": list(OBJECTIVES),
             "simplex_steps": list(SIMPLEX_STEPS),
@@ -1923,9 +2181,16 @@ def make_design(
             "objectives": list(OBJECTIVES),
             "bound_tolerance": BOUND_TOLERANCE,
             "simplex_steps": list(SIMPLEX_STEPS),
-            "R_over_lambda_split": R_OVER_LAMBDA_SPLIT,
+            "default_lambda_mode": DEFAULT_LAMBDA_MODE,
         },
-        "profile": {"sigmas": list(PROFILE_SIGMAS), "seed_peak": DEFAULT_SEED_PEAK, "objective": OBJECTIVES[0], "maxfev": SMOKE.maxfev if smoke else MAXFEV},
+        "profile": {
+            "sigmas": list(SMOKE.sigmas if smoke else PROFILE_SIGMAS),
+            "seed_peak": DEFAULT_SEED_PEAK,
+            "objective": OBJECTIVES[0],
+            "maxfev": SMOKE.maxfev if smoke else MAXFEV,
+            "patients": "per cell the fd_check patient and the next accepted one (the fd_check patients alone with smoke)",
+        },
+        "summary_strata": {"maturity_split": MATURITY_SPLIT, "groups": [f"maturity_ge_{MATURITY_SPLIT:g}", f"maturity_lt_{MATURITY_SPLIT:g}"]},
         "n_patients": len(records),
     }
     sa.write_json(root / "spec.json", spec)
@@ -2160,7 +2425,10 @@ def treated_run(
     result.config = aligned
     result.affine = cohort.affine
     result.save(run_dir, overwrite=True)
-    sa.write_json(run_dir / FRAMES_FILE, {"resection_time": float(config["resection_time"]), "dt": dt, "n_growth": n_growth, "frames": record})
+    sa.write_json(
+        run_dir / FRAMES_FILE,
+        {"resection_time": float(config["resection_time"]), "dt": dt, "steps_per_day": config.get("steps_per_day"), "n_growth": n_growth, "frames": record},
+    )
     if growth is not None:
         save_growth(growth, run_dir)
     assert result.n_steps is not None and result.wall_time_s is not None
@@ -2195,11 +2463,22 @@ class TruthRun:
     def dt(self) -> float:
         return self.run.dt
 
+    def stepping(self) -> dict[str, Any]:
+        """The record entries of the truth's time step: n_growth, dt (the
+        solver's), steps_per_day (the patient's) and dt_refined."""
+        return {
+            "n_growth": self.n_growth,
+            "dt": self.dt,
+            "steps_per_day": self.patient.steps_per_day,
+            "dt_refined": dt_refined(self.n_growth, self.patient.resection_time, self.patient),
+        }
+
 
 def truth_run(cohort: Cohort, patient: Patient, horizon: float, frames: Sequence[str], run_dir: Path) -> TruthRun:
     """
-    A patient's truth: the growth stage at the base config's time step
-    (saved into run_dir/growth), its density at resection_time (saved as
+    A patient's truth: the growth stage at the patient's time step (the
+    base config's without one; saved into run_dir/growth), its density at
+    resection_time (saved as
     pre_resection_cell_density.nii.gz), the maps derived from it
     (``derive_maps``) and the treated stage with them (``treated_run``).
     """
@@ -2210,6 +2489,8 @@ def truth_run(cohort: Cohort, patient: Patient, horizon: float, frames: Sequence
     save_field(run_dir / sa.PRE_RESECTION_FILE, density, cohort.affine)
     maps = derive_maps(cohort, density, len(config["rt_times"]), run_dir)
     assert growth.n_steps is not None and growth.dt is not None
+    if dt_refined(growth.n_steps, patient.resection_time, patient):
+        print(f"  {patient.id}: the solver stepped the truth at dt={growth.dt:g} instead of {patient.dt:g} (its estimate was stricter)", flush=True)
     run = treated_run(cohort, config, maps, growth.n_steps, growth.dt, frames, run_dir, growth)
     return TruthRun(patient=patient, config=config, run=run, maps=maps, density=density)
 
@@ -2885,6 +3166,7 @@ class SeedFit:
     value: float
     growth_n_steps: int
     dt: float
+    steps_per_day: int | None
     history: list[dict[str, float]]
     wall_time_s: float
 
@@ -2903,6 +3185,7 @@ class SeedFit:
             "objective_initial": self.value_initial,
             "objective_achieved": self.value,
             "growth_n_steps": self.growth_n_steps,
+            "steps_per_day": self.steps_per_day,
             "dt": self.dt,
             "wall_time_s": self.wall_time_s,
             "history": self.history,
@@ -2922,7 +3205,7 @@ def fit_seed(
     """
     Fit the seed (logit of the peak on (PEAK_MIN, PEAK_MAX], log sigma)
     of a growth-only run of T_0 days (the patient's v, lambda, the
-    cohort's seed voxel, the base config's time step) to the truth's
+    cohort's seed voxel and time step) to the truth's
     density at resection (reference) on the region's voxels, by
     Nelder-Mead (scipy.optimize.minimize; at most maxfev evaluations, the
     initial simplex x0, x0 + (SIMPLEX_STEPS[0], 0), x0 + (0,
@@ -2972,6 +3255,7 @@ def fit_seed(
         value=best["value"],
         growth_n_steps=int(stepping["n_steps"]),
         dt=stepping["dt"],
+        steps_per_day=patient.steps_per_day,
         history=history,
         wall_time_s=time.perf_counter() - start,
     )
@@ -3007,7 +3291,7 @@ def substitute_row(
     skipped: str | None = None,
 ) -> dict[str, Any]:
     """A substitute.csv record: the patient, delta_a, T_0, rho T_0, rho T_r,
-    the objective, skipped (the reason, '' for a run pair), the fit (the
+    the design's maturity, the objective, skipped (the reason, '' for a run pair), the fit (the
     truth's seed for the "truth" row) and the metrics per frame as
     <frame>_<metric> (NaN for the frames not given, i.e. a skipped
     pair)."""
@@ -3018,13 +3302,14 @@ def substitute_row(
         "T_0": float(t0),
         "rho_T_0": patient.rho * float(t0),
         "rho_T_r": patient.rho * patient.resection_time,
+        "maturity": patient.maturity,
         "objective": objective,
         "skipped": skipped or "",
     }
     if fit is not None:
         row.update({key: value for key, value in fit.record().items() if key not in ("history", "objective", "T_0")})
     elif objective == "truth":
-        row.update({"fitted_peak": patient.seed_peak, "fitted_sigma_mm": patient.seed_sigma})
+        row.update({"fitted_peak": patient.seed_peak, "fitted_sigma_mm": patient.seed_sigma, "steps_per_day": patient.steps_per_day})
     for frame in SUBSTITUTE_FRAMES:
         values = metrics.get(frame)
         row.update({f"{frame}_{name}": (float("nan") if values is None else values[name]) for name in METRIC_NAMES})
@@ -3038,6 +3323,7 @@ SUBSTITUTE_COLUMNS: list[str] = [
     "T_0",
     "rho_T_0",
     "rho_T_r",
+    "maturity",
     "objective",
     "skipped",
     "rule_peak",
@@ -3051,6 +3337,7 @@ SUBSTITUTE_COLUMNS: list[str] = [
     "objective_initial",
     "objective_achieved",
     "growth_n_steps",
+    "steps_per_day",
     "dt",
     "wall_time_s",
     *(f"{frame}_{name}" for frame in SUBSTITUTE_FRAMES for name in METRIC_NAMES),
@@ -3123,8 +3410,8 @@ def substitute_patient(
         "cell": patient.cell,
         "resection_time": patient.resection_time,
         "rho": patient.rho,
-        "n_growth": truth.n_growth,
-        "dt": truth.dt,
+        "maturity": patient.maturity,
+        **truth.stepping(),
         "cavity_volume_mm3": truth.maps.record["cavity_volume_mm3"],
         "dose_volume_mm3": truth.maps.record["dose_volume_mm3"],
         "observation": region.record(),
@@ -3221,6 +3508,7 @@ class TimeFit:
     value: float
     growth_n_steps: int
     dt: float
+    steps_per_day: int | None
     history: list[dict[str, float]]
     wall_time_s: float
 
@@ -3243,6 +3531,7 @@ class TimeFit:
             "seed_peak": self.seed_peak,
             "seed_sigma_mm": self.seed_sigma,
             "growth_n_steps": self.growth_n_steps,
+            "steps_per_day": self.steps_per_day,
             "dt": self.dt,
             "wall_time_s": self.wall_time_s,
             "history": self.history,
@@ -3270,9 +3559,8 @@ def fit_growth_time(
 ) -> TimeFit:
     """
     Fit log T_r of a growth-only run from the fixed seed (peak, sigma in
-    mm; the patient's v, lambda, the cohort's seed voxel, the base
-    config's time step: the solve path of ``fit_seed``, one step count
-    per T_r) to the truth's density at resection (reference) on the
+    mm; the patient's v, lambda, the cohort's seed voxel and the patient's
+    time step: the solve path of ``fit_seed``, one step count per T_r) to the truth's density at resection (reference) on the
     region's voxels, by the bounded Brent search of
     scipy.optimize.minimize_scalar on [log lo, log hi] of the bounds in
     days (at most maxfev evaluations, xatol SCALAR_XATOL in log T_r). The
@@ -3320,6 +3608,7 @@ def fit_growth_time(
         value=best["value"],
         growth_n_steps=int(best["n_steps"]),
         dt=best["dt"],
+        steps_per_day=patient.steps_per_day,
         history=history,
         wall_time_s=time.perf_counter() - start,
     )
@@ -3409,6 +3698,7 @@ def fit_growth_time_free(
         value=best["value"],
         growth_n_steps=int(best["n_steps"]),
         dt=best["dt"],
+        steps_per_day=patient.steps_per_day,
         history=history,
         wall_time_s=time.perf_counter() - started,
     )
@@ -3418,7 +3708,7 @@ def seedfix_row(cohort: Cohort, patient: Patient, lambda_mode: str, fit: TimeFit
     """A seedfix.csv record: the patient, the lambda mode ("truth" for
     the truth row), the fitted T_r and lambda (the truth's for the truth
     row), rho T_r fitted (with the fitted rho) and true, the design's
-    R_over_lambda, the seed, the fit (with bound_hit; False for the
+    R_over_lambda and maturity, the seed, the fit (with bound_hit; False for the
     truth row) and the metrics per frame as <frame>_<metric>."""
     t_r = fit.t_r if fit is not None else patient.resection_time
     width = fit.front_width if fit is not None else patient.front_width
@@ -3434,12 +3724,13 @@ def seedfix_row(cohort: Cohort, patient: Patient, lambda_mode: str, fit: TimeFit
         "rho_T_r_fitted": float(rho) * float(t_r),
         "rho_T_r": patient.rho * patient.resection_time,
         "R_over_lambda": patient.r_over_lambda,
+        "maturity": patient.maturity,
     }
     if fit is not None:
         skipped = ("history", "objective", "lambda_mode", "fitted_T_r", "fitted_lambda_mm", "lambda_truth_mm", "rho_T_r_fitted", "rho_T_r_truth", "T_r_bounds", "lambda_bounds", "start")
         row.update({key: value for key, value in fit.record().items() if key not in skipped})
     else:
-        row.update({"seed_peak": patient.seed_peak, "seed_sigma_mm": patient.seed_sigma, "bound_hit": False})
+        row.update({"seed_peak": patient.seed_peak, "seed_sigma_mm": patient.seed_sigma, "bound_hit": False, "steps_per_day": patient.steps_per_day})
     for frame, values in metrics.items():
         row.update({f"{frame}_{name}": value for name, value in values.items()})
     return row
@@ -3456,6 +3747,7 @@ SEEDFIX_COLUMNS: list[str] = [
     "rho_T_r_fitted",
     "rho_T_r",
     "R_over_lambda",
+    "maturity",
     "seed_peak",
     "seed_sigma_mm",
     "n_evaluations",
@@ -3463,10 +3755,24 @@ SEEDFIX_COLUMNS: list[str] = [
     "objective_achieved",
     "bound_hit",
     "growth_n_steps",
+    "steps_per_day",
     "dt",
     "wall_time_s",
     *(f"{frame}_{name}" for frame in SUBSTITUTE_FRAMES for name in METRIC_NAMES),
 ]
+
+
+def check_reused_seed(path: Path, record: Mapping[str, Any], seed_peak: float, seed_sigma: float) -> None:
+    """Raise when a reused record (a seedfix or profile row.json or
+    fit.json) was written for another fixed seed than the current
+    arguments (seed_peak, seed_sigma_mm), naming both."""
+    stored = {"seed_peak": sa.as_float(record.get("seed_peak")), "seed_sigma_mm": sa.as_float(record.get("seed_sigma_mm"))}
+    current = {"seed_peak": float(seed_peak), "seed_sigma_mm": float(seed_sigma)}
+    if any(not np.isclose(stored[key], current[key], rtol=1e-9, atol=0.0) for key in current):
+        raise ValueError(
+            f"{path} was written for the seed peak {stored['seed_peak']!r}, sigma {stored['seed_sigma_mm']!r} mm; the current arguments are "
+            f"peak {current['seed_peak']!r}, sigma {current['seed_sigma_mm']!r} mm. Run into another design, or remove the record."
+        )
 
 
 def load_or_solve_truth(cohort: Cohort, patient: Patient, patient_dir: Path, sources: Sequence[Path]) -> tuple[TruthRun, bool]:
@@ -3486,9 +3792,9 @@ def load_or_solve_truth(cohort: Cohort, patient: Patient, patient_dir: Path, sou
 
 
 def parse_lambda_modes(text: str | None) -> tuple[str, ...]:
-    """--lambda-mode as the modes run, in LAMBDA_MODES' order: fixed |
-    free | both (the default)."""
-    mode = "both" if text is None or str(text).strip() == "" else str(text).strip()
+    """--lambda-mode as the modes run, in LAMBDA_MODES' order: fixed (the
+    default, DEFAULT_LAMBDA_MODE) | free | both."""
+    mode = DEFAULT_LAMBDA_MODE if text is None or str(text).strip() == "" else str(text).strip()
     if mode == "both":
         return tuple(LAMBDA_MODES)
     if mode not in LAMBDA_MODES:
@@ -3515,12 +3821,14 @@ def seedfix_patient(
     seed_sigma; ``fit_growth_time`` with v and lambda at the truth, or
     ``fit_growth_time_free`` with lambda fitted too, started from the
     fixed mode's optimum (log T_r*, log lambda_truth) when its fit.json
-    exists in this patient's directory, else the brackets' midpoints), the
+    exists in this patient's directory and did not hit a bound, else the
+    brackets' midpoints), the
     treated run from that seed with the fitted lambda's D and rho,
     resection_time the fitted T_r, the truth's maps, alpha and k_ct and
     the schedule shifted for it (<LAMBDA_MODE_DIRS[mode]>/run/) and the
     metrics against the truth per frame; a mode whose row.json exists is
-    reused. Writes seedfix.json (the record returned).
+    reused (its seed must be the current one, ``check_reused_seed``).
+    Writes seedfix.json (the record returned).
     """
     patient_dir = out_dir / patient.id
     start = time.perf_counter()
@@ -3538,13 +3846,20 @@ def seedfix_patient(
         fit_dir = patient_dir / LAMBDA_MODE_DIRS[mode]
         row_path = fit_dir / "row.json"
         if row_path.is_file():
-            rows.append(read_record(row_path))
+            stored = read_record(row_path)
+            check_reused_seed(row_path, stored, seed_peak, seed_sigma)
+            rows.append(stored)
             print(f"  {patient.id} {mode}: row exists, kept", flush=True)
             continue
         if mode == "fixed":
             fit = fit_growth_time(cohort, patient, seed_peak, seed_sigma, truth.density, region, objective, maxfev, tr_bounds)
         else:
-            free_start = (float(read_record(fixed_fit_path)["fitted_T_r"]), patient.front_width) if fixed_fit_path.is_file() else None
+            free_start = None
+            if fixed_fit_path.is_file():
+                fixed_fit = read_record(fixed_fit_path)
+                check_reused_seed(fixed_fit_path, fixed_fit, seed_peak, seed_sigma)
+                if str(fixed_fit.get("bound_hit")) != "True":
+                    free_start = (float(fixed_fit["fitted_T_r"]), patient.front_width)
             fit = fit_growth_time_free(cohort, patient, seed_peak, seed_sigma, truth.density, region, objective, maxfev, tr_bounds, lambda_bounds, free_start)
         fit_dir.mkdir(parents=True, exist_ok=True)
         write_record(fit_dir / "fit.json", fit.record())
@@ -3569,8 +3884,8 @@ def seedfix_patient(
         "rho": patient.rho,
         "front_width": patient.front_width,
         "R_over_lambda": patient.r_over_lambda,
-        "n_growth": truth.n_growth,
-        "dt": truth.dt,
+        "maturity": patient.maturity,
+        **truth.stepping(),
         "cavity_volume_mm3": truth.maps.record["cavity_volume_mm3"],
         "dose_volume_mm3": truth.maps.record["dose_volume_mm3"],
         "truth_dir": str(truth.run.run_dir),
@@ -3599,11 +3914,13 @@ PROFILE_COLUMNS: list[str] = [
     "rho_T_r_fitted",
     "rho_T_r",
     "R_over_lambda",
+    "maturity",
     "bound_hit",
     "objective_initial",
     "objective_achieved",
     "n_evaluations",
     "growth_n_steps",
+    "steps_per_day",
     "dt",
     "wall_time_s",
     *(f"{frame}_{name}" for frame in SUBSTITUTE_FRAMES for name in METRIC_NAMES),
@@ -3612,7 +3929,7 @@ PROFILE_COLUMNS: list[str] = [
 
 def profile_row(patient: Patient, sigma: float, fit: TimeFit, metrics: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
     """A profile.csv record: the patient, the seed width sigma_0 and peak,
-    the fit (fitted_T_r, rho_T_r_fitted, bound_hit, the objective values,
+    the design's R_over_lambda and maturity, the fit (fitted_T_r, rho_T_r_fitted, bound_hit, the objective values,
     the evaluations, the stepping) and the metrics per frame as
     <frame>_<metric>."""
     row: dict[str, Any] = {
@@ -3624,11 +3941,13 @@ def profile_row(patient: Patient, sigma: float, fit: TimeFit, metrics: Mapping[s
         "rho_T_r_fitted": fit.rho * fit.t_r,
         "rho_T_r": patient.rho * patient.resection_time,
         "R_over_lambda": patient.r_over_lambda,
+        "maturity": patient.maturity,
         "bound_hit": fit.bound_hit,
         "objective_initial": fit.value_initial,
         "objective_achieved": fit.value,
         "n_evaluations": fit.n_evaluations,
         "growth_n_steps": fit.growth_n_steps,
+        "steps_per_day": fit.steps_per_day,
         "dt": fit.dt,
         "wall_time_s": fit.wall_time_s,
     }
@@ -3655,8 +3974,9 @@ def profile_patient(
     the treated run from it at the fitted T_r with the truth's maps,
     alpha and k_ct (sigma_<sigma_0>/run/) and the metrics against the
     truth per frame, the path of ``seedfix_patient``'s fixed mode; a
-    sigma_0 whose row.json exists is reused. Writes profile.json (the
-    record returned).
+    sigma_0 whose row.json exists is reused (its seed must be the current
+    peak and that sigma_0, ``check_reused_seed``). Writes profile.json
+    (the record returned).
     """
     patient_dir = out_dir / patient.id
     start = time.perf_counter()
@@ -3672,7 +3992,9 @@ def profile_patient(
         fit_dir = patient_dir / f"sigma_{float(sigma):g}"
         row_path = fit_dir / "row.json"
         if row_path.is_file():
-            rows.append(read_record(row_path))
+            stored = read_record(row_path)
+            check_reused_seed(row_path, stored, seed_peak, float(sigma))
+            rows.append(stored)
             print(f"  {patient.id} sigma_0={sigma:g}: row exists, kept", flush=True)
             continue
         fit = fit_growth_time(cohort, patient, seed_peak, float(sigma), truth.density, region, objective, maxfev, tr_bounds)
@@ -3698,8 +4020,8 @@ def profile_patient(
         "resection_time": patient.resection_time,
         "rho": patient.rho,
         "R_over_lambda": patient.r_over_lambda,
-        "n_growth": truth.n_growth,
-        "dt": truth.dt,
+        "maturity": patient.maturity,
+        **truth.stepping(),
         "truth_dir": str(truth.run.run_dir),
         "truth_reused": reused,
         "seed_peak": float(seed_peak),
@@ -3712,6 +4034,83 @@ def profile_patient(
     }
     write_record(patient_dir / PATIENT_FILE.format(experiment="profile"), record)
     return record
+
+
+# --- dt-check ---
+
+
+DT_CHECK_METRICS: tuple[str, ...] = ("dice_core", "dice_edema", "mass_rel", "mass_beyond_edema_rel")
+DT_CHECK_FRAMES: tuple[str, ...] = ("pre", "d180")
+DT_CHECK_COLUMNS: list[str] = [
+    "patient",
+    "cell",
+    "maturity",
+    "resection_time",
+    "white_matter_diffusivity",
+    "grid_spacing_mm",
+    *(f"{key}_{mode}" for mode in DT_MODES for key in ("steps_per_day", "dt", "dt_refined", "n_growth", "n_steps", "wall_time_s")),
+    *(f"{frame}_{name}" for frame in DT_CHECK_FRAMES for name in DT_CHECK_METRICS),
+]
+
+
+def dt_check_patient(cohort: Cohort, patient: Patient, out_dir: Path) -> dict[str, Any]:
+    """
+    The time-step check of one patient: the truth (``truth_run``: the
+    growth stage, its own cavity and dose map and the treated stage over
+    SUBSTITUTE_HORIZON with the frames SUBSTITUTE_FRAMES) once at the
+    fixed step and once at the stability step (``steps_per_day_for`` per
+    mode, on the design's grid spacing) into out_dir/<patient>/<mode>/,
+    and the metrics (``compare_to``) of the stability run's pre and d180
+    frames against the fixed run's, the fixed run's dose map defining the
+    field. Writes dt_check.json (the record returned, the resume marker):
+    per mode steps_per_day, dt, dt_refined, n_growth, n_steps and
+    wall_time_s, and the row of dt_check.csv.
+    """
+    patient_dir = out_dir / patient.id
+    start = time.perf_counter()
+    dx = grid_spacing_mm(cohort.base, cohort.zooms)
+    truths: dict[str, TruthRun] = {}
+    for mode in DT_MODES:
+        steps = steps_per_day_for(mode, patient.diffusivity, patient.rho, patient.resection_time, dx)
+        stepped = replace(patient, steps_per_day=steps)
+        truths[mode] = truth_run(cohort, stepped, SUBSTITUTE_HORIZON, SUBSTITUTE_FRAMES, patient_dir / mode)
+        print(f"  {patient.id} {mode}: {steps} steps/day, dt {truths[mode].dt:g}, {truths[mode].n_growth} growth steps, {truths[mode].run.n_steps} steps in total ({truths[mode].run.wall_time_s:.0f} s)", flush=True)
+    fine, coarse = truths["fixed"], truths["stability"]
+    metrics = {frame: compare_to(cohort, coarse.run.frames[frame], fine.run.frames[frame], fine.maps.dose) for frame in SUBSTITUTE_FRAMES}
+    row: dict[str, Any] = {
+        "patient": patient.id,
+        "cell": patient.cell,
+        "maturity": patient.maturity,
+        "resection_time": patient.resection_time,
+        "white_matter_diffusivity": patient.diffusivity,
+        "grid_spacing_mm": dx,
+    }
+    for mode, truth in truths.items():
+        stepping = truth.stepping()
+        row.update({f"{key}_{mode}": stepping[key] for key in ("steps_per_day", "dt", "dt_refined", "n_growth")})
+        row[f"n_steps_{mode}"] = truth.run.n_steps
+        row[f"wall_time_s_{mode}"] = truth.run.wall_time_s
+    for frame in DT_CHECK_FRAMES:
+        row.update({f"{frame}_{name}": metrics[frame][name] for name in DT_CHECK_METRICS})
+    record = {
+        "patient": patient.id,
+        "cell": patient.cell,
+        "resection_time": patient.resection_time,
+        "grid_spacing_mm": dx,
+        "modes": {mode: {**truth.stepping(), "n_steps": truth.run.n_steps, "wall_time_s": truth.run.wall_time_s, "run_dir": str(truth.run.run_dir)} for mode, truth in truths.items()},
+        "metrics": metrics,
+        "row": row,
+        "wall_time_s": time.perf_counter() - start,
+    }
+    write_record(patient_dir / PATIENT_FILE.format(experiment="dt_check"), record)
+    return record
+
+
+def assemble_dt_check(root: Path) -> list[dict[str, Any]]:
+    """dt_check.csv from the records present (runs/dt_check/<patient>/dt_check.json)."""
+    rows = [record["row"] for record in patient_records(root, "dt_check")]
+    sa.write_csv(root / "dt_check.csv", rows, DT_CHECK_COLUMNS)
+    return rows
 
 
 # --- invariance (experiment 0) ---
@@ -4017,14 +4416,13 @@ def invariance_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path) -> N
 
 def row_groups(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
     """The summaries' groups of rows: each cell, "all", and the strata
-    R_over_lambda >= / < R_OVER_LAMBDA_SPLIT (R_over_lambda_ge_10,
-    R_over_lambda_lt_10; a row without a finite value is in neither);
-    empty groups are left out."""
+    maturity >= / < MATURITY_SPLIT (maturity_ge_15, maturity_lt_15; a row
+    without a finite value is in neither); empty groups are left out."""
     groups: dict[str, list[Mapping[str, Any]]] = {cell: [row for row in rows if row["cell"] == cell] for cell in CELLS}
     groups["all"] = list(rows)
-    ratios = {id(row): sa.as_float(row.get("R_over_lambda")) for row in rows}
-    groups[f"R_over_lambda_ge_{R_OVER_LAMBDA_SPLIT:g}"] = [row for row in rows if ratios[id(row)] >= R_OVER_LAMBDA_SPLIT]
-    groups[f"R_over_lambda_lt_{R_OVER_LAMBDA_SPLIT:g}"] = [row for row in rows if ratios[id(row)] < R_OVER_LAMBDA_SPLIT]
+    values = {id(row): sa.as_float(row.get("maturity")) for row in rows}
+    groups[f"maturity_ge_{MATURITY_SPLIT:g}"] = [row for row in rows if values[id(row)] >= MATURITY_SPLIT]
+    groups[f"maturity_lt_{MATURITY_SPLIT:g}"] = [row for row in rows if values[id(row)] < MATURITY_SPLIT]
     return {name: group for name, group in groups.items() if group}
 
 
@@ -4043,7 +4441,7 @@ def frame_metric_keys(frames: Sequence[str] = ("d120", "d180")) -> list[str]:
 
 def substitute_medians(rows: Sequence[Mapping[str, Any]], frames: Sequence[str] = ("d120", "d180")) -> dict[str, Any]:
     """Per objective and delta_a, per group (``row_groups``: the cells,
-    "all", the two R_over_lambda strata): the row count, the skipped rows
+    "all", the two maturity strata): the row count, the skipped rows
     (n_skipped, a T_0 outside its range; excluded) and the median of
     every <frame>_<metric> of the frames (NaN entries left out; None
     when no value is finite)."""
@@ -4138,7 +4536,7 @@ def substitute_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path, fram
 
 def seedfix_medians(rows: Sequence[Mapping[str, Any]], frames: Sequence[str] = ("d120", "d180")) -> dict[str, dict[str, dict[str, Any]]]:
     """Per lambda mode and group (``row_groups``: the cells, "all", the
-    two R_over_lambda strata): the patient count, the number of fits that
+    two maturity strata): the patient count, the number of fits that
     hit a bound (n_bound_hit) and, over the patients whose fit did not,
     the median of |rho_fitted T_r_fitted - rho T_r| (abs_rho_T_r_error),
     of |log(lambda_fitted / lambda)| (abs_log_lambda_error) and of every
@@ -4191,7 +4589,7 @@ def _log_axis(axis: Any, values: NDArray, label: str, fallback: tuple[float, flo
         low, high = low / 1.5, high * 1.5
     axis.set_xlim(low, high)
     axis.set_xscale("log")
-    ticks = [t for t in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200) if low <= t <= high]
+    ticks = [t for t in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000) if low <= t <= high]
     axis.set_xticks(ticks, [f"{t:g}" for t in ticks])
     axis.set_xticks([], minor=True)
     axis.set_xlabel(label, fontsize=8)
@@ -4199,16 +4597,15 @@ def _log_axis(axis: Any, values: NDArray, label: str, fallback: tuple[float, flo
 
 def seedfix_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path, frames: Sequence[str] = ("d120", "d180")) -> None:
     """Per frame and lambda mode: every comparison metric against the
-    truth's R_over_lambda (log axis; a vertical line at
-    R_OVER_LAMBDA_SPLIT), one marker per patient coloured by cell (a bound
-    hit hollow)."""
+    truth's maturity (log axis), one marker per patient coloured by cell
+    (a bound hit hollow)."""
     figure_dir.mkdir(exist_ok=True)
     for frame in frames:
         for mode in LAMBDA_MODES:
             selected = [row for row in rows if row.get("lambda_mode") == mode]
             if not selected:
                 continue
-            ratios = np.array([sa.as_float(row.get("R_over_lambda")) for row in selected])
+            maturities = np.array([sa.as_float(row.get("maturity")) for row in selected])
             figure, axes = _metric_axes(PLOTTED_METRICS)
             for axis, name in zip(axes.flat, PLOTTED_METRICS):
                 key = f"{frame}_{name}"
@@ -4216,15 +4613,14 @@ def seedfix_figures(rows: Sequence[Mapping[str, Any]], figure_dir: Path, frames:
                     cell_rows = [row for row in selected if row["cell"] == cell]
                     if not cell_rows:
                         continue
-                    x = np.array([sa.as_float(row.get("R_over_lambda")) for row in cell_rows])
+                    x = np.array([sa.as_float(row.get("maturity")) for row in cell_rows])
                     y = np.array([sa.as_float(row.get(key)) for row in cell_rows])
                     hit = np.array([str(row.get("bound_hit")) == "True" for row in cell_rows])
                     finite = np.isfinite(x) & np.isfinite(y)
                     axis.scatter(x[finite & ~hit], y[finite & ~hit], s=16, color=color, alpha=0.7, linewidths=0, label=cell)
                     axis.scatter(x[finite & hit], y[finite & hit], s=16, facecolors="none", edgecolors=color, linewidths=0.8)
-                axis.axvline(R_OVER_LAMBDA_SPLIT, color="#52514e", linewidth=0.6, linestyle=":")
                 # Limits by hand: a panel whose values are all NaN has no data to scale.
-                _log_axis(axis, ratios, "R / lambda (truth)")
+                _log_axis(axis, maturities, "maturity (truth)")
                 axis.set_title(f"{frame} {name}", fontsize=8)
                 axis.tick_params(labelsize=7)
                 axis.spines[["top", "right"]].set_visible(False)
@@ -4352,6 +4748,8 @@ def design_command(args: argparse.Namespace, device: str = "") -> Path:
         args.rt_dose_per_fraction,
         tr_max=float(args.tr_max),
         bands=parse_bands(args),
+        patients_per_cell=SMOKE.patients_per_cell if args.smoke else int(args.patients_per_cell),
+        dt_mode=str(args.dt_mode),
         device=device,
     )
     spec = sa.read_json(root / "spec.json")
@@ -4360,12 +4758,13 @@ def design_command(args: argparse.Namespace, device: str = "") -> Path:
     print(
         f"seed voxel {spec['seed_voxel']} (target {spec['seed_target_voxel']}, snapped {spec['seed_snap_distance_voxels']:g} voxels); "
         f"floor {spec['gaussian_seed_floor']:g}, precision {spec['precision']}, resolution_factor {spec['resolution_factor']:g}"
-        f"{' (smoke)' if spec['smoke'] else ''}"
+        f"{' (smoke)' if spec['smoke'] else ''}; dt mode {spec['dt_mode']} (dx {spec['dt_modes']['grid_spacing_mm']:g} mm)"
     )
     screening = spec["screening"]
     counts = screening["counts"]
     print(
-        f"screening: {counts['n_candidates']} candidates, {counts['n_rejected_T_r_below_min']} with T_r < {screening['tr_min']:g} d and "
+        f"screening: {counts['n_candidates']} candidates, {counts['n_rejected_seed_wide']} with a seed wider than {spec['seed_width_cap']['cap']:g} "
+        f"front widths, {counts['n_rejected_T_r_below_min']} with T_r < {screening['tr_min']:g} d and "
         f"{counts['n_rejected_T_r_above_max']} with T_r > {screening['tr_max']:g} d rejected; {counts['n_screened']} solved, "
         f"{counts['n_accepted']} accepted, {counts['n_solve_failed']} failed; bands {screening['bands']}; {screening['wall_time_s'] / 60:.1f} min"
     )
@@ -4381,14 +4780,23 @@ def design_command(args: argparse.Namespace, device: str = "") -> Path:
         if members:
             spans = {
                 key: (min(float(r[key]) for r in members), max(float(r[key]) for r in members))
-                for key in ("resection_time", "rho_T_r", "r_core_mm", "r_whole_mm", "whole_core_ratio", "R_over_lambda", "visibility_margin")
+                for key in ("resection_time", "rho_T_r", "maturity", "r_core_mm", "r_whole_mm", "whole_core_ratio", "R_over_lambda", "visibility_margin")
             }
             print(
                 f"    {len(members)} patients: T_r {spans['resection_time'][0]:.0f}-{spans['resection_time'][1]:.0f} d, rho T_r "
-                f"{spans['rho_T_r'][0]:.1f}-{spans['rho_T_r'][1]:.1f}, r_core {spans['r_core_mm'][0]:.1f}-{spans['r_core_mm'][1]:.1f} mm, r_whole "
+                f"{spans['rho_T_r'][0]:.1f}-{spans['rho_T_r'][1]:.1f}, maturity {spans['maturity'][0]:.1f}-{spans['maturity'][1]:.1f}, "
+                f"r_core {spans['r_core_mm'][0]:.1f}-{spans['r_core_mm'][1]:.1f} mm, r_whole "
                 f"{spans['r_whole_mm'][0]:.1f}-{spans['r_whole_mm'][1]:.1f} mm, ratio {spans['whole_core_ratio'][0]:.2f}-{spans['whole_core_ratio'][1]:.2f}, "
                 f"R/lambda {spans['R_over_lambda'][0]:.1f}-{spans['R_over_lambda'][1]:.1f}, margin {spans['visibility_margin'][0]:.2f}-{spans['visibility_margin'][1]:.2f}"
             )
+            for r in members:
+                print(
+                    f"      {r['patient']}: T_r {float(r['resection_time']):.0f} d, lambda {float(r['front_width_mm']):.2f} mm, sigma "
+                    f"{float(r['seed_sigma_mm']):.2f} mm, maturity {float(r['maturity']):.1f}, {r['steps_per_day']} steps/day"
+                )
+    refined = [r["patient"] for r in records if str(read_record(root / SCREEN_DIR / f"c{int(r['candidate']):04d}" / SCREEN_FILE).get("dt_refined")) == "True"]
+    if refined:
+        print(f"the solver refined the requested step of {refined} in the screening (its estimate needs more than {BASE_STEPS_PER_DAY} steps/day)")
     print(f"{spec['n_patients']} patients from {spec['n_candidates']} Sobol' points (seed {spec['design_seed']})")
     return root
 
@@ -4426,7 +4834,7 @@ def worker_command(root: Path, experiment: str, device: str, patients: Sequence[
     """The command line of one dispatched worker: this script's
     experiment subcommand on one device and one block of patients, the
     other options passed through (those given: --draws for fisher;
-    --maxfev for the fits; --delta-a for substitute; --tr-bounds and
+    --maxfev and --dt-mode for the fits; --delta-a for substitute; --tr-bounds and
     --seed-peak for seedfix and profile; --seed-sigma-mm and
     --lambda-mode for seedfix; --sigmas for profile), the assembly
     skipped."""
@@ -4449,6 +4857,7 @@ def worker_command(root: Path, experiment: str, device: str, patients: Sequence[
     forwarded: list[tuple[tuple[str, ...], str, str]] = [  # (experiments, attribute, flag)
         (("fisher",), "draws", "--draws"),
         (("substitute", "seedfix", "profile"), "maxfev", "--maxfev"),
+        (("substitute", "seedfix", "profile"), "dt_mode", "--dt-mode"),
         (("substitute",), "delta_a", "--delta-a"),
         (("seedfix", "profile"), "tr_bounds", "--tr-bounds"),
         (("seedfix", "profile"), "seed_peak", "--seed-peak"),
@@ -4531,7 +4940,10 @@ def check_dispatch(record: Mapping[str, Any]) -> None:
 
 def fisher_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
     cohort = load_cohort(root)
-    patients = select_patients(cohort, args.patients, smoke)
+    # The fixed step whatever the design's mode: the scaled-dt T_r column
+    # steps at dt e^{+-h}, which a half-day step would push past the frame
+    # rounding's limit of half a day.
+    patients = [replace(patient, steps_per_day=BASE_STEPS_PER_DAY) for patient in select_patients(cohort, args.patients, smoke)]
     if min(len(devices), len(patients)) > 1:
         record = dispatch(root, "fisher", devices, patients, args)
         assemble_fisher(root, record)
@@ -4547,7 +4959,8 @@ def fisher_command(root: Path, args: argparse.Namespace, smoke: bool, devices: S
             print(f"fisher {patient.id}: {marker} exists, skipped", flush=True)
             continue
         print(f"fisher {patient.id} ({patient.cell}): T_r {patient.resection_time:.1f}, K = {draws}", flush=True)
-        record = fisher_patient(cohort, patient, out_dir, draws, fd_flags.get(patient.id, False), int(cohort.spec["design_seed"]) * 1000 + cohort.patients.index(patient))
+        seed = int(cohort.spec["design_seed"]) * 1000 + [p.id for p in cohort.patients].index(patient.id)
+        record = fisher_patient(cohort, patient, out_dir, draws, fd_flags.get(patient.id, False), seed)
         summary = record["analysis"]["scaled_dt"]
         print(
             f"fisher {patient.id}: {record['observation']['n_observations']} observations on {record['observation']['n_voxels']} voxels; "
@@ -4558,6 +4971,44 @@ def fisher_command(root: Path, args: argparse.Namespace, smoke: bool, devices: S
     print(f"fisher: {(time.perf_counter() - start) / 60:.1f} min", flush=True)
     if not getattr(args, "no_assemble", False):
         assemble_fisher(root)
+
+
+def check_dt_mode(cohort: Cohort, args: argparse.Namespace) -> str:
+    """The run's --dt-mode (DEFAULT_DT_MODE when not given), which must be
+    the design's recorded dt_mode (spec.json; "fixed" for a design made
+    before the modes existed, which stepped at the base config's rate):
+    every solve of a patient uses the design's step, so another mode
+    raises with both values. Returns the mode."""
+    mode = str(getattr(args, "dt_mode", None) or DEFAULT_DT_MODE)
+    recorded = str(cohort.spec.get("dt_mode", "fixed"))
+    if mode != recorded:
+        raise ValueError(
+            f"--dt-mode {mode} but the design {cohort.root} was made with dt_mode {recorded}: every run of a patient uses the design's "
+            f"time step (design.csv's steps_per_day); pass --dt-mode {recorded}, or make a design with --dt-mode {mode}."
+        )
+    return mode
+
+
+def dt_check_command(root: Path, args: argparse.Namespace, smoke: bool) -> None:
+    cohort = load_cohort(root)
+    patients = select_patients(cohort, args.patients, smoke) if args.patients else [patient for patient in cohort.patients if patient.fd_check]
+    out_dir = root / "runs" / "dt_check"
+    start = time.perf_counter()
+    for index, patient in enumerate(patients):
+        marker = out_dir / patient.id / PATIENT_FILE.format(experiment="dt_check")
+        if marker.is_file():
+            print(f"dt-check {patient.id}: {marker} exists, skipped", flush=True)
+            continue
+        print(f"dt-check {patient.id} ({patient.cell}): T_r {patient.resection_time:.1f}, D {patient.diffusivity:.3g} mm^2/day, maturity {patient.maturity:.1f}", flush=True)
+        record = dt_check_patient(cohort, patient, out_dir)
+        row = record["row"]
+        print(
+            f"dt-check {patient.id}: dt {row['dt_fixed']:g} -> {row['dt_stability']:g}; pre Dice edema {row['pre_dice_edema']:.4f}, mass rel {row['pre_mass_rel']:.2e}; "
+            f"d180 Dice edema {row['d180_dice_edema']:.4f}, mass beyond edema rel {row['d180_mass_beyond_edema_rel']:.3f}; {record['wall_time_s'] / 60:.1f} min ({index + 1} done)",
+            flush=True,
+        )
+    print(f"dt-check: {(time.perf_counter() - start) / 60:.1f} min", flush=True)
+    assemble_dt_check(root)
 
 
 def spec_tr_max(cohort: Cohort) -> float:
@@ -4578,13 +5029,14 @@ def parse_floats(text: str | None, default: Sequence[float], flag: str) -> list[
 
 def substitute_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
     cohort = load_cohort(root)
+    check_dt_mode(cohort, args)
     patients = select_patients(cohort, args.patients, smoke)
     if min(len(devices), len(patients)) > 1:
         record = dispatch(root, "substitute", devices, patients, args)
         assemble_substitute(root, record)
         check_dispatch(record)
         return
-    maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else MAXFEV)
+    maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else SUBSTITUTE_MAXFEV)
     deltas = parse_floats(getattr(args, "delta_a", None), SUBSTITUTE_DELTA_A, "--delta-a")
     tr_max = spec_tr_max(cohort)
     out_dir = root / "runs" / "substitute"
@@ -4635,6 +5087,7 @@ def fixed_seed_args(args: argparse.Namespace) -> tuple[float, float]:
 
 def seedfix_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
     cohort = load_cohort(root)
+    check_dt_mode(cohort, args)
     patients = select_patients(cohort, args.patients, smoke)
     if min(len(devices), len(patients)) > 1:
         record = dispatch(root, "seedfix", devices, patients, args)
@@ -4665,12 +5118,30 @@ def seedfix_command(root: Path, args: argparse.Namespace, smoke: bool, devices: 
         assemble_seedfix(root)
 
 
+def profile_default_patients(cohort: Cohort, smoke: bool) -> list[Patient]:
+    """The profile's default patients: per cell (CELLS' order) the
+    fd_check patient and the next accepted patient in design order (8 for
+    a full design); with smoke the first patient of each cell alone (4)."""
+    if smoke:
+        return select_patients(cohort, None, True)
+    chosen: list[Patient] = []
+    for cell in CELLS:
+        members = [p for p in cohort.patients if p.cell == cell]
+        flagged = [p for p in members if p.fd_check]
+        first = flagged[0] if flagged else (members[0] if members else None)
+        if first is None:
+            continue
+        chosen.extend(members[members.index(first) : members.index(first) + 2])
+    return chosen
+
+
 def profile_command(root: Path, args: argparse.Namespace, smoke: bool, devices: Sequence[str]) -> None:
     cohort = load_cohort(root)
+    check_dt_mode(cohort, args)
     if args.patients:
         patients = select_patients(cohort, args.patients, smoke)
     else:
-        patients = [patient for patient in cohort.patients if patient.fd_check]
+        patients = profile_default_patients(cohort, smoke)
     if min(len(devices), len(patients)) > 1:
         record = dispatch(root, "profile", devices, patients, args)
         assemble_profile(root, record)
@@ -4679,7 +5150,7 @@ def profile_command(root: Path, args: argparse.Namespace, smoke: bool, devices: 
     maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else MAXFEV)
     tr_bounds = parse_tr_bounds(getattr(args, "tr_bounds", None))
     peak, _ = fixed_seed_args(args)
-    sigmas = parse_floats(getattr(args, "sigmas", None), PROFILE_SIGMAS, "--sigmas")
+    sigmas = parse_floats(getattr(args, "sigmas", None), SMOKE.sigmas if smoke else PROFILE_SIGMAS, "--sigmas")
     if any(s <= 0 for s in sigmas):
         raise ValueError(f"--sigmas must be positive widths in mm, got {args.sigmas!r}.")
     out_dir = root / "runs" / "profile"
@@ -4738,6 +5209,7 @@ def _add_design_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rt-margin-mm", type=float, default=sa.RT_MARGIN_MM, help="margin around the cavity of the dose region, mm")
     parser.add_argument("--rt-dose-per-fraction", type=float, default=sa.RT_DOSE_PER_FRACTION_GY, help="dose per fraction in Gy")
     parser.add_argument("--tr-max", type=float, default=DEFAULT_TR_MAX, help=f"candidates with resection_time above it (days) are rejected; also caps the substitute arm's T_0 (default {DEFAULT_TR_MAX:g}; below {TR_MIN:g} d is rejected too)")
+    parser.add_argument("--patients-per-cell", type=int, default=PATIENTS_PER_CELL, help=f"patients accepted per cell (default {PATIENTS_PER_CELL}; {SMOKE.patients_per_cell} with --smoke)")
     for name, attribute in BAND_ARGS.items():
         lo, hi = getattr(DEFAULT_BANDS, name)
         parser.add_argument(
@@ -4755,7 +5227,7 @@ def _add_invariance_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_patient_args(parser: argparse.ArgumentParser, profile: bool = False) -> None:
-    default = "the fd_check patient of each cell" if profile else "all, or the first of each cell with --smoke"
+    default = "per cell the fd_check patient and the next one (the fd_check patients alone with --smoke)" if profile else "all, or the first of each cell with --smoke"
     parser.add_argument("--patients", default=None, help=f"comma-separated patient ids or ranges (p03, p00-p07); default {default}")
 
 
@@ -4763,8 +5235,20 @@ def _add_fisher_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--draws", type=int, default=None, help=f"noise draws K (default {NOISE_DRAWS}, {SMOKE.draws} with --smoke)")
 
 
+def _add_dt_mode_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dt-mode",
+        default=DEFAULT_DT_MODE,
+        choices=DT_MODES,
+        help=f"the time step of every patient's solves: fixed ({BASE_STEPS_PER_DAY} steps/day) or stability (per patient, see the docstring); default {DEFAULT_DT_MODE}; "
+        "the design records it and the other subcommands must name the same mode",
+    )
+
+
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--maxfev", type=int, default=None, help=f"evaluations per fit (default {MAXFEV}, {SMOKE.maxfev} with --smoke)")
+    parser.add_argument(
+        "--maxfev", type=int, default=None, help=f"evaluations per fit (default {SUBSTITUTE_MAXFEV} for substitute, {MAXFEV} for seedfix and profile, {SMOKE.maxfev} with --smoke)"
+    )
 
 
 def _add_substitute_args(parser: argparse.ArgumentParser) -> None:
@@ -4783,14 +5267,14 @@ def _add_seedfix_args(parser: argparse.ArgumentParser) -> None:
     _add_tr_bounds_arg(parser)
     _add_seed_peak_arg(parser)
     parser.add_argument("--seed-sigma-mm", type=float, default=None, help=f"the fixed seed's width sigma in mm (default {DEFAULT_SEED_SIGMA_MM:g})")
-    parser.add_argument("--lambda-mode", default=None, choices=(*LAMBDA_MODES, "both"), help="fit T_r with lambda at the truth (fixed), with lambda fitted too (free), or both (default)")
+    parser.add_argument("--lambda-mode", default=None, choices=(*LAMBDA_MODES, "both"), help=f"fit T_r with lambda at the truth (fixed), with lambda fitted too (free), or both (default {DEFAULT_LAMBDA_MODE})")
 
 
 def _add_profile_args(parser: argparse.ArgumentParser, shared: bool = False) -> None:
     if not shared:
         _add_tr_bounds_arg(parser)
         _add_seed_peak_arg(parser)
-    parser.add_argument("--sigmas", default=None, help=f"comma-separated fixed seed widths sigma_0 in mm; default {','.join(f'{v:g}' for v in PROFILE_SIGMAS)}")
+    parser.add_argument("--sigmas", default=None, help=f"comma-separated fixed seed widths sigma_0 in mm; default {','.join(f'{v:g}' for v in PROFILE_SIGMAS)} ({','.join(f'{v:g}' for v in SMOKE.sigmas)} with --smoke)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4800,6 +5284,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(design)
     _add_device_arg(design, single=True)
     _add_design_args(design)
+    _add_dt_mode_arg(design)
     invariance = commands.add_parser("invariance", help="experiment 0")
     _add_common_args(invariance)
     _add_device_arg(invariance, single=True)
@@ -4814,6 +5299,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(substitute)
     _add_device_arg(substitute)
     _add_patient_args(substitute)
+    _add_dt_mode_arg(substitute)
     _add_fit_args(substitute)
     _add_substitute_args(substitute)
     _add_worker_arg(substitute)
@@ -4821,6 +5307,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(seedfix)
     _add_device_arg(seedfix)
     _add_patient_args(seedfix)
+    _add_dt_mode_arg(seedfix)
     _add_fit_args(seedfix)
     _add_seedfix_args(seedfix)
     _add_worker_arg(seedfix)
@@ -4828,13 +5315,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(profile)
     _add_device_arg(profile)
     _add_patient_args(profile, profile=True)
+    _add_dt_mode_arg(profile)
     _add_fit_args(profile)
     _add_profile_args(profile)
     _add_worker_arg(profile)
+    dt_check = commands.add_parser("dt-check", help="the truth of each patient at the fixed and at the stability step, compared")
+    _add_common_args(dt_check)
+    _add_device_arg(dt_check, single=True)
+    dt_check.add_argument("--patients", default=None, help="comma-separated patient ids or ranges (p03, p00-p07); default the fd_check patients")
     everything = commands.add_parser("all", help="design (one device), then substitute, seedfix and profile")
     _add_common_args(everything)
     _add_device_arg(everything)
     _add_design_args(everything)
+    _add_dt_mode_arg(everything)
     _add_patient_args(everything)
     _add_fit_args(everything)
     _add_substitute_args(everything)
@@ -4857,8 +5350,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     smoke = bool(args.smoke) or ((root / "spec.json").is_file() and bool(sa.read_json(root / "spec.json").get("smoke", False)))
     if smoke:
         devices = ["" for _ in devices]  # the CPU, as many workers as devices given
-    if args.command == "invariance" and len(devices) > 1:
-        raise ValueError(f"invariance runs on one device; give --gpus one entry, not {args.gpus!r}.")
+    if args.command in ("invariance", "dt-check") and len(devices) > 1:
+        raise ValueError(f"{args.command} runs on one device; give --gpus one entry, not {args.gpus!r}.")
     configure_device(devices[0])
     if args.command == "all" and not (root / "spec.json").is_file():
         design_command(args, devices[0])
@@ -4868,6 +5361,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise FileNotFoundError(f"{root / 'spec.json'} not found; run the design first.")
     if args.command == "invariance":
         invariance_command(root, args)
+    if args.command == "dt-check":
+        dt_check_command(root, args, smoke)
     if args.command == "fisher":
         fisher_command(root, args, smoke, devices)
     if args.command in ("substitute", "all"):

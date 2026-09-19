@@ -13,17 +13,22 @@ reproduces a growth-only run of a light seed at a small rho to 1 % in
 relative L2, (5) the metrics on synthetic spheres and half-spaces give the
 set-formula Dice, the analytic surface distance, the masses beyond the
 reference's edema and the log volume ratios, (6) the design strips the
-script factor, assigns the cells by the front width and the visibility
-sign, screens the candidates by size (accepting on a synthetic field
-exactly within the bands) and fills the cells, resuming from its screen
-records, (7) the substitute arm's deficits give T_0 = T_r - delta_a / rho
-and skip a T_0 outside its range with a NaN row, (8) the free-lambda
-transform round-trips and the free fit recovers the front width of a
-phantom truth within 10 %, and (9) the smaller pieces: the frame days,
-the total log kill, the patient selection, the seed reparametrisations,
-the Cramer-Rao errors of a singular Fisher matrix, the device split and
-the worker command lines. The whole smoke pipeline on the phantom is
-``slow``.
+script factor, assigns the cells by the front width and the maturity,
+rejects seeds wider than 1.5 front widths and counts them, records the
+maturity column by its formula and the patients' time step, screens the
+candidates by size (accepting on a synthetic field exactly within the
+bands) and fills the cells, resuming from its screen records, (7) the
+substitute arm's deficits (default -1, -0.5, 0.5, 1) give
+T_0 = T_r - delta_a / rho and skip a T_0 outside its range with a NaN
+row, (8) the free-lambda transform round-trips and the free fit recovers
+the front width of a phantom truth within 10 %, (9) the smaller pieces:
+the frame days, the total log kill, the patient selection and the
+profile's default patients, the stability time step (an integer number
+of steps per day between 2 and 12, "fixed" giving 12), the seed
+reparametrisations, the Cramer-Rao errors of a singular Fisher matrix,
+the device split and the worker command lines, and (10) a reused seedfix
+or profile record of another fixed seed raises. The whole smoke pipeline
+on the phantom is ``slow``.
 """
 
 from __future__ import annotations
@@ -58,8 +63,10 @@ sa = ide.sa
 
 PHANTOM_N = 24
 # The phantom's tissue is a ball of radius 9 voxels, so its patients are
-# small: bands within the phantom in place of the provisional defaults.
-PHANTOM_BANDS = ide.SizeBands(r_core_mm=(0.5, 9.0), r_whole_mm=(1.0, 9.5), whole_core_ratio=(1.0, 30.0))
+# small: bands within the phantom in place of the provisional defaults. A
+# mature compact tumour (a front travel of at least 7.5 mm) fills the
+# ball (r_core = r_whole = 9.1 mm, ratio 1), which the bands accept.
+PHANTOM_BANDS = ide.SizeBands(r_core_mm=(0.5, 9.5), r_whole_mm=(1.0, 9.5), whole_core_ratio=(1.0, 30.0))
 PATIENTS_PER_CELL = 2  # the phantom design's, 8 patients p00-p07
 
 
@@ -431,14 +438,39 @@ def test_script_factor_stripping(tmp_path):
     assert set(script) == {"growth_efolds", "other_thing"} and "other_thing" not in space.factors
 
 
-def test_cell_assignment_and_visibility_sign():
+def test_cell_assignment_on_maturity_and_seed_cap(phantom_root):
     """The cells split at front_width_mm = 2 (at or below: compact) and at
-    visibility_margin = 120 rho - Lambda = 0 (at or above: visible); the
-    margin's sign says whether the untreated regrowth over 120 days
-    exceeds the log kill."""
-    assert ide.cell_of(2.0, 0.0) == "compact_visible" and ide.cell_of(2.0, -1e-9) == "compact_invisible"
-    assert ide.cell_of(2.0 + 1e-9, 0.0) == "broad_visible" and ide.cell_of(8.0, -3.0) == "broad_invisible"
-    assert ide.cell_of(1.0, 5.0) == "compact_visible" and list(ide.CELLS) == ["compact_visible", "compact_invisible", "broad_visible", "broad_invisible"]
+    maturity = 2 growth_efolds front_width_mm^2 / seed_sigma_mm^2 = 15 (at
+    or above: mature); the Sobol' candidates of the script's search space
+    reject a seed wider than 1.5 front widths as seed_wide before the T_r
+    rejection, and the count matches; visibility_margin stays a column
+    whose sign says whether the untreated regrowth over 120 days exceeds
+    the log kill."""
+    assert ide.MATURITY_SPLIT == 15.0 and ide.LAMBDA_SPLIT == 2.0 and ide.SEED_WIDTH_CAP == 1.5 and ide.PATIENTS_PER_CELL == 4
+    assert ide.cell_of(2.0, 15.0) == "compact_mature" and ide.cell_of(2.0, 15.0 - 1e-9) == "compact_immature"
+    assert ide.cell_of(2.0 + 1e-9, 15.0) == "broad_mature" and ide.cell_of(8.0, 3.0) == "broad_immature"
+    assert ide.cell_of(1.0, 50.0) == "compact_mature" and list(ide.CELLS) == ["compact_immature", "compact_mature", "broad_immature", "broad_mature"]
+    assert ide.CELLS["broad_mature"] == (True, True) and ide.CELLS["compact_immature"] == (False, False)
+    assert float(ide.maturity(2.0, 3.0, 1.5)) == pytest.approx(2 * 2 * 9 / 2.25) == pytest.approx(16.0)
+    np.testing.assert_allclose(ide.maturity(np.array([1.0, 12.0]), np.array([1.0, 8.0]), np.array([1.0, 4.0])), [2.0, 2 * 12 * 64 / 16])
+    # ell lambda / sigma^2 with ell = v T_r = 2 a lambda.
+    a, width, sigma = 3.0, 2.5, 2.0
+    v = 0.1
+    t_r = a / sa.growth_parameters(v, width)["rho"]
+    assert float(ide.maturity(a, width, sigma)) == pytest.approx(v * t_r * width / sigma**2)
+    base = read_config(phantom_root / "base_config.json", solver=StuppFKPPSolver)
+    space, script = ide.load_script_search_space(ide.DEFAULT_SEARCH_SPACE, StuppFKPPSolver.config_keys())
+    candidates = ide.sample_candidates(space, script, base, sa.treatment_settings(), 4900.0, 30, 8, 1, tr_max=1000.0)
+    wide = [c for c in candidates if c["seed_sigma_mm"] > 1.5 * c["front_width_mm"]]
+    assert wide and all(c["rejected"] == "seed_wide" for c in wide)
+    assert sum(1 for c in candidates if c["rejected"] == "seed_wide") == len(wide)
+    assert all(c["rejected"] != "seed_wide" for c in candidates if c["seed_sigma_mm"] <= 1.5 * c["front_width_mm"])
+    # The seed cap precedes the T_r rejection: a wide seed is never counted under T_r.
+    assert all(c["rejected"] == "T_r_above_max" for c in candidates if c not in wide and c["resection_time"] > 1000.0)
+    assert any(c["resection_time"] > 1000.0 for c in wide)
+    for c in candidates:
+        assert c["maturity"] == pytest.approx(2 * c["growth_efolds"] * c["front_width_mm"] ** 2 / c["seed_sigma_mm"] ** 2)
+        assert c["cell"] == ide.cell_of(c["front_width_mm"], c["maturity"])
     assert float(ide.visibility_margin(0.05, 4.0)) == pytest.approx(120 * 0.05 - 4.0) and float(ide.visibility_margin(0.05, 4.0)) > 0
     assert float(ide.visibility_margin(0.01, 4.0)) == pytest.approx(1.2 - 4.0) and float(ide.visibility_margin(0.01, 4.0)) < 0
     np.testing.assert_allclose(ide.visibility_margin(np.array([0.01, 0.05]), np.array([1.2, 6.0])), [0.0, 0.0])
@@ -486,15 +518,18 @@ def test_size_screening_acceptance_on_synthetic_field():
 def test_design_fills_the_cells_by_size_screening(cohort, phantom_root):
     """8 patients (2 per cell), ids p00-p07 in cell order, the first of
     each cell flagged for the finite-difference check; the cells follow
-    the front width and the visibility sign; resection_time =
-    growth_efolds / rho within [5, 1000] days; the derived columns follow
-    the script's derivations (the seed from seed_sigma_mm in mm); the
-    sizes lie within the bands and match the screen records; the counts
-    add up; the floor is 0, the precision f64, the search space's
-    overrides are in the base config; every config loads and constructs
-    a solver once maps are given; the design is not overwritten, and a
-    copy without spec.json is resumed from its screen records without a
-    new solve to the same design.csv."""
+    the front width and the maturity; no accepted seed is wider than 1.5
+    front widths and the seed-wide rejections are counted;
+    resection_time = growth_efolds / rho within [5, 1000] days; the
+    derived columns follow the script's derivations (the seed from
+    seed_sigma_mm in mm, the maturity from its formula); the time step is
+    the stability mode's per patient and is in every config; the sizes
+    lie within the bands and match the screen records; the counts add
+    up; the floor is 0, the precision f64, the search space's overrides
+    are in the base config; every config loads and constructs a solver
+    once maps are given; the design is not overwritten, and a copy
+    without spec.json is resumed from its screen records without a new
+    solve to the same design.csv."""
     records = _read_csv(phantom_root / "design.csv")
     spec = json.loads((phantom_root / "spec.json").read_text())
     base = json.loads((phantom_root / "base_config.json").read_text())
@@ -511,21 +546,30 @@ def test_design_fills_the_cells_by_size_screening(cohort, phantom_root):
     assert spec["seed_target_source"] == "base_config_fractions" and spec["default_seed_voxel"] == [132, 103, 90]
     assert spec["log_kill"]["chemo_total_dose"] == 4900.0 and spec["schedules"]["substitute"]["chemo_total_dose"] == 6900.0
     assert spec["crt_snapshots"] == {"mid_crt": 34.0, "end_crt": 55.0}
+    assert spec["maturity_split"] == 15.0 and spec["lambda_split_mm"] == 2.0 and spec["seed_width_cap"]["cap"] == 1.5
+    assert spec["dt_mode"] == "stability" and spec["dt_modes"]["grid_spacing_mm"] == 1.0 and spec["dt_modes"]["dt_max_days"] == 0.5
+    assert spec["profile"]["sigmas"] == [1.0, 1.5, 2.0, 3.0, 4.0, 6.0] and spec["substitute"]["delta_a"] == [-1.0, -0.5, 0.5, 1.0] and spec["substitute"]["maxfev"] == 60
+    assert spec["seedfix"]["lambda_bounds"] == [0.5, 8.0] and spec["seedfix"]["default_lambda_mode"] == "fixed" and spec["seedfix"]["maxfev"] == 150
     screening = spec["screening"]
     assert screening["tr_min"] == 5.0 and screening["tr_max"] == 1000.0 and screening["bands"] == PHANTOM_BANDS.record() and screening["resumed"] is False
     counts = screening["counts"]
     assert counts["n_candidates"] == 256 and counts["n_accepted"] == n_patients and counts["n_solve_failed"] == 0
     assert counts["n_screened"] == sum(c["n_screened"] for c in counts["cells"].values()) >= n_patients
-    assert counts["n_rejected_T_r_below_min"] + counts["n_rejected_T_r_above_max"] + sum(c["n_admissible"] for c in counts["cells"].values()) == 256
-    for cell, (broad, visible) in ide.CELLS.items():
+    assert counts["n_rejected_seed_wide"] > 0
+    assert counts["n_rejected_seed_wide"] + counts["n_rejected_T_r_below_min"] + counts["n_rejected_T_r_above_max"] + sum(c["n_admissible"] for c in counts["cells"].values()) == 256
+    for cell, (broad, mature) in ide.CELLS.items():
         members = [r for r in records if r["cell"] == cell]
         assert len(members) == PATIENTS_PER_CELL and [r["fd_check"] for r in members] == ["True"] + ["False"] * (PATIENTS_PER_CELL - 1)
         cell_counts = counts["cells"][cell]
-        assert cell_counts["n_accepted"] == PATIENTS_PER_CELL and spec["cells"][cell] == {"broad": broad, "visible": visible}
+        assert cell_counts["n_accepted"] == PATIENTS_PER_CELL and spec["cells"][cell] == {"broad": broad, "mature": mature}
         assert cell_counts["n_screened"] == cell_counts["n_accepted"] + cell_counts["n_solve_failed"] + sum(cell_counts["n_rejected"].values())
         for r in members:
-            assert (float(r["front_width_mm"]) > 2.0) == broad and (float(r["visibility_margin"]) >= 0.0) == visible
+            assert (float(r["front_width_mm"]) > 2.0) == broad and (float(r["maturity"]) >= 15.0) == mature
     for r in records:
+        assert float(r["seed_sigma_mm"]) <= 1.5 * float(r["front_width_mm"])
+        assert float(r["maturity"]) == pytest.approx(2 * float(r["growth_efolds"]) * float(r["front_width_mm"]) ** 2 / float(r["seed_sigma_mm"]) ** 2)
+        steps = ide.steps_per_day_for("stability", float(r["white_matter_diffusivity"]), float(r["rho"]), float(r["resection_time"]), 1.0)
+        assert int(r["steps_per_day"]) == steps and float(r["dt"]) == pytest.approx(1.0 / steps) and 2 <= steps <= 12
         growth = sa.growth_parameters(float(r["front_speed_mm_per_day"]), float(r["front_width_mm"]))
         assert float(r["white_matter_diffusivity"]) == pytest.approx(growth["white_matter_diffusivity"])
         assert float(r["rho"]) == pytest.approx(growth["rho"]) and float(r["rho_T_r"]) == pytest.approx(float(r["growth_efolds"]))
@@ -546,12 +590,19 @@ def test_design_fills_the_cells_by_size_screening(cohort, phantom_root):
         screen = ide.read_record(phantom_root / "screen" / f"c{int(r['candidate']):04d}" / "screen.json")
         assert screen["failed"] is False and screen["r_core_mm"] == pytest.approx(float(r["r_core_mm"])) and screen["n_core"] > 0
         assert screen["resection_time"] == pytest.approx(float(r["resection_time"])) and screen["wall_time_s"] > 0
+        assert screen["steps_per_day"] == int(r["steps_per_day"]) and screen["dt_refined"] is False
+        assert screen["n_steps"] == ide.requested_steps(float(r["resection_time"]), int(r["steps_per_day"])) == int(np.ceil(float(r["resection_time"]) * int(r["steps_per_day"]) - 1e-9))
+        assert screen["dt"] == pytest.approx(float(r["resection_time"]) / screen["n_steps"]) and screen["dt"] <= float(r["dt"]) * (1 + 1e-9)
         assert 0.6 <= float(r["seed_peak_density"]) <= 1.0 and 1.0 <= float(r["front_width_mm"]) <= 8.0
     assert len(list((phantom_root / "screen").glob("c*/screen.json"))) == counts["n_screened"]
     patient = cohort.patient("p05")
-    assert patient.cell == "broad_visible" and patient.solver_values()["rho"] == pytest.approx(float(records[5]["rho"]))
+    assert patient.cell == "broad_immature" and patient.solver_values()["rho"] == pytest.approx(float(records[5]["rho"]))
     assert patient.r_over_lambda == pytest.approx(float(records[5]["R_over_lambda"])) and patient.fd_check is False and cohort.patient("p04").fd_check is True
+    assert patient.maturity == pytest.approx(float(records[5]["maturity"])) and patient.steps_per_day == int(records[5]["steps_per_day"])
+    assert patient.dt == pytest.approx(1.0 / patient.steps_per_day) and patient.solver_values()["steps_per_day"] == patient.steps_per_day
+    assert patient.solver_values()["dt"] is None and patient.solver_values()["n_steps"] is None
     config = read_config(phantom_root / "configs" / "p05.json", solver=StuppFKPPSolver)
+    assert config["steps_per_day"] == patient.steps_per_day and config["dt"] is None and config["n_steps"] is None
     assert config["resection_cavity"] is None and config["rt_dose"] is None and config["time_after_resection"] == 120.0
     assert config["resection_time"] == patient.resection_time and config["chemo_times"][0] == pytest.approx(patient.resection_time + 14.0)
     assert len(config["chemo_times"]) == 52 and len(config["rt_times"]) == 30 and config["gaussian_seed_x_fraction"] == pytest.approx(12.5 / 24)
@@ -573,6 +624,9 @@ def test_design_fills_the_cells_by_size_screening(cohort, phantom_root):
     (copy / "spec.json").unlink()
     with pytest.raises(ValueError, match="another candidate"):
         ide.make_design(spec["base_config"], ide.DEFAULT_SEARCH_SPACE, copy.parent, copy.name, tissue_maps=None, log2_candidates=8, seed=2, bands=PHANTOM_BANDS, patients_per_cell=PATIENTS_PER_CELL)
+    # So is the other time-step mode (the screen records carry the step).
+    with pytest.raises(ValueError, match="another candidate"):
+        ide.make_design(spec["base_config"], ide.DEFAULT_SEARCH_SPACE, copy.parent, copy.name, tissue_maps=None, log2_candidates=8, bands=PHANTOM_BANDS, patients_per_cell=PATIENTS_PER_CELL, dt_mode="fixed")
 
 
 def test_design_fails_with_counts_when_a_cell_cannot_be_filled(tmp_path):
@@ -583,7 +637,7 @@ def test_design_fails_with_counts_when_a_cell_cannot_be_filled(tmp_path):
     bands = ide.SizeBands(r_core_mm=(20.0, 30.0), r_whole_mm=(1.0, 40.0), whole_core_ratio=(1.0, 30.0))
     with pytest.raises(ValueError, match="could not be filled") as error:
         ide.make_design(base, ide.DEFAULT_SEARCH_SPACE, tmp_path, "short", tissue_maps=None, log2_candidates=3, bands=bands, patients_per_cell=1)
-    assert "compact_visible" in str(error.value) and "n_screened" in str(error.value)
+    assert "compact_immature" in str(error.value) and "n_screened" in str(error.value) and "maturity" in str(error.value)
     assert not (tmp_path / "short" / "spec.json").is_file() and list((tmp_path / "short" / "screen").glob("c*/screen.json"))
 
 
@@ -628,6 +682,10 @@ def test_deficit_t0_and_sub_5_day_skip(tmp_path):
     one fitted row (T0_8.7/B/) and one skipped row with NaN metrics, and
     records the skip."""
     patient = _fast_patient()
+    assert ide.SUBSTITUTE_DELTA_A == (-1.0, -0.5, 0.5, 1.0) and ide.SUBSTITUTE_MAXFEV == 60 and ide.MAXFEV == 150
+    assert ide.parse_floats(None, ide.SUBSTITUTE_DELTA_A, "--delta-a") == [-1.0, -0.5, 0.5, 1.0]
+    assert [entry["delta_a"] for entry in ide.deficit_schedule(patient)] == [-1.0, -0.5, 0.5, 1.0]
+    assert ide.build_parser().parse_args(["substitute", "--name", "x"]).maxfev is None  # resolved to SUBSTITUTE_MAXFEV by the command
     assert ide.substitute_t0(patient, 0.5) == pytest.approx(12.0 - 0.5 / 0.15) and ide.substitute_t0(patient, -0.5) == pytest.approx(12.0 + 0.5 / 0.15)
     assert ide.substitute_t0(patient, 0.0) == 12.0
     schedule = ide.deficit_schedule(patient, (0.5, 100.0, -200.0, -2.0), tr_max=1000.0)
@@ -639,7 +697,8 @@ def test_deficit_t0_and_sub_5_day_skip(tmp_path):
     record = ide.substitute_patient(cohort, patient, tmp_path / "substitute", maxfev=2, deltas=(0.5, 100.0), tr_max=1000.0)
     rows = record["rows"]
     assert [row["objective"] for row in rows] == ["truth", "B", "B"] and [row["delta_a"] for row in rows] == [0.0, 0.5, 100.0]
-    assert rows[0]["T_0"] == 12.0 and rows[0]["skipped"] == "" and rows[0]["d180_mass_rel"] == 0.0
+    assert rows[0]["T_0"] == 12.0 and rows[0]["skipped"] == "" and rows[0]["d180_mass_rel"] == 0.0 and np.isnan(rows[0]["maturity"])
+    assert record["steps_per_day"] is None and record["dt"] == pytest.approx(1.0 / 12.0) and record["dt_refined"] is False
     fitted, skipped = rows[1], rows[2]
     assert fitted["skipped"] == "" and fitted["T_0"] == pytest.approx(8.6667, abs=1e-3) and fitted["rho_T_0"] == pytest.approx(0.15 * fitted["T_0"])
     assert fitted["n_evaluations"] <= 3 and np.isfinite(fitted["d180_dice_edema"]) and np.isfinite(fitted["d180_mass_rel"])
@@ -673,7 +732,8 @@ def test_free_lambda_transform_and_fit_recovers_lambda(tmp_path):
     0.5-4 mm) recovers the truth's front width 1.155 mm within 10 % and
     its growth time within 20 %, with the objective below the start's and
     no bound hit; the fixed-lambda fit on the same truth recovers T_r."""
-    for lo, hi in ((np.log(5.0), np.log(3000.0)), (np.log(1.0), np.log(8.0)), (0.05, 1.0)):
+    assert ide.LAMBDA_BOUNDS == (0.5, 8.0) and ide.TR_BOUNDS == (5.0, 3000.0) and ide.DEFAULT_LAMBDA_MODE == "fixed"
+    for lo, hi in ((np.log(5.0), np.log(3000.0)), (np.log(0.5), np.log(8.0)), (0.05, 1.0)):
         for value in np.linspace(lo, hi, 7)[1:-1]:
             assert ide.bounded_from_unbounded(ide.unbounded_from_bounded(value, lo, hi), lo, hi) == pytest.approx(value, abs=1e-9)
         for outside in (lo - 1.0, lo, hi, hi + 1.0):
@@ -709,8 +769,12 @@ def test_frame_days_and_log_kill_and_selection(cohort):
     """The frame days follow the script's rounding (pre = (n_growth - 1)
     dt, the Sundays the script's own days, the horizon frame before the
     horizon); the total log kill formula; the patient selection syntax
-    (the smoke selection takes the first patient of each cell); the
-    lambda modes; the Cramer-Rao errors of a singular matrix."""
+    (the smoke selection takes the first patient of each cell; the
+    profile's default is the fd_check patient and the next of each cell,
+    the fd_check patients alone with smoke); the lambda modes (fixed by
+    default); the stability time step (an integer number of steps per
+    day between 2 and 12, "fixed" giving 12, the solver's estimate
+    honoured at T_r); the Cramer-Rao errors of a singular matrix."""
     dt = 1.0 / 12.0
     days = ide.frame_days(100.0, dt, {name: ide.FRAME_MOMENTS[name] for name in ide.SUBSTITUTE_FRAMES})
     assert days["pre"] == pytest.approx(1199 * dt) and days["pre"] < 100.0
@@ -726,11 +790,47 @@ def test_frame_days_and_log_kill_and_selection(cohort):
     assert len(ide.select_patients(cohort, "all", True)) == 8 and len(ide.select_patients(cohort, None, False)) == 8
     with pytest.raises(ValueError, match="unknown id"):
         ide.select_patients(cohort, "p99", False)
-    assert ide.parse_lambda_modes(None) == ("fixed", "free") and ide.parse_lambda_modes("both") == ("fixed", "free")
+    assert [p.id for p in ide.profile_default_patients(cohort, False)] == [f"p{i:02d}" for i in range(8)]
+    assert [p.id for p in ide.profile_default_patients(cohort, True)] == ["p00", "p02", "p04", "p06"]
+    assert [p.fd_check for p in ide.profile_default_patients(cohort, False)] == [True, False] * 4
+    assert ide.PROFILE_SIGMAS == (1.0, 1.5, 2.0, 3.0, 4.0, 6.0) and ide.SMOKE.sigmas == (2.0, 4.0) and ide.SMOKE.patients_per_cell == 1
+    assert ide.parse_lambda_modes(None) == ("fixed",) and ide.parse_lambda_modes("both") == ("fixed", "free")
     assert ide.parse_lambda_modes("free") == ("free",) and ide.parse_lambda_modes("fixed") == ("fixed",)
     with pytest.raises(ValueError, match="lambda-mode"):
         ide.parse_lambda_modes("neither")
     assert ide.parse_tr_bounds(None) == (5.0, 3000.0) and ide.parse_tr_bounds("10, 20") == (10.0, 20.0)
+    # The time step: fixed is 12 steps/day; stability is dt = min(0.5, 0.5 dx^2 / (6 D))
+    # rounded to whole steps per day, raised to the solver's estimate at T_r, capped at 12.
+    assert ide.DT_MODES == ("fixed", "stability") and ide.DEFAULT_DT_MODE == "stability" and ide.BASE_STEPS_PER_DAY == 12
+    assert ide.DT_MAX == 0.5 and ide.DT_SAFETY == 0.5
+    assert ide.steps_per_day_for("fixed", 0.05, 0.01, 300.0, 1.0) == 12 and ide.steps_per_day_for("fixed", 1.0, 0.1, 5.0, 4.0) == 12
+    assert ide.steps_per_day_for("stability", 0.5, 0.01, 1000.0, 1.0) == 6  # dt = 1 / (12 D) = 1/6 d
+    assert ide.steps_per_day_for("stability", 0.2, 0.01, 1000.0, 1.0) == 3  # 1 / (12 D) = 0.417 d -> 3 steps/day
+    assert ide.steps_per_day_for("stability", 0.05, 0.01, 1000.0, 1.0) == 2  # 1.67 d capped at DT_MAX 0.5 d
+    assert ide.steps_per_day_for("stability", 1.0, 0.1, 1000.0, 1.0) == 12  # the floor: never finer than 12
+    assert ide.steps_per_day_for("stability", 0.2, 0.01, 1000.0, 4.0) == 2  # the smoke's 4 mm voxels: DT_MAX everywhere
+    assert ide.solver_step_estimate(0.2, 0.01, 40.0, 1.0) == int(np.ceil(8 * 0.2 * 40 + 100))
+    assert ide.steps_per_day_for("stability", 0.2, 0.01, 40.0, 1.0) == int(np.ceil(164 / 40))  # the solver's estimate at T_r binds
+    assert ide.steps_per_day_for("stability", 1.0, 0.1, 5.0, 1.0) == 12  # the estimate would need 28/day: capped
+    for diffusivity in (0.015, 0.05, 0.2, 0.5, 1.0):
+        for t_r in (5.0, 40.0, 300.0, 1000.0):
+            for dx in (1.0, 4.0):
+                steps = ide.steps_per_day_for("stability", diffusivity, 0.02, t_r, dx)
+                assert isinstance(steps, int) and 2 <= steps <= 12 and steps >= 1
+                assert 1.0 / steps <= min(0.5, 0.5 * dx**2 / (6 * diffusivity)) + 1e-12
+                assert steps * t_r >= min(12 * t_r, ide.solver_step_estimate(diffusivity, 0.02, t_r, dx)) - 1e-9
+    with pytest.raises(ValueError, match="dt-mode"):
+        ide.steps_per_day_for("adaptive", 0.1, 0.01, 100.0, 1.0)
+    assert ide.grid_spacing_mm({"resolution_factor": 0.25}, (1.0, 1.0, 1.0)) == 4.0 and ide.grid_spacing_mm({"resolution_factor": 1.0}, (1.0, 2.0, 1.5)) == 1.0
+    stepped = _fast_patient(steps_per_day=3)
+    assert ide.requested_steps(12.0, 3) == 36 and ide.requested_steps(12.1, 3) == 37 and stepped.dt == pytest.approx(1 / 3)
+    assert not ide.dt_refined(36, 12.0, stepped) and ide.dt_refined(37, 12.0, stepped) and not ide.dt_refined(1000, 12.0, _fast_patient())
+    # Every patient of the design carries its step; the arms refuse another mode.
+    assert all(p.steps_per_day == ide.steps_per_day_for("stability", p.diffusivity, p.rho, p.resection_time, 1.0) for p in cohort.patients)
+    parse = ide.build_parser().parse_args
+    assert ide.check_dt_mode(cohort, parse(["seedfix", "--name", "x"])) == "stability"
+    with pytest.raises(ValueError, match="dt_mode stability"):
+        ide.check_dt_mode(cohort, parse(["seedfix", "--name", "x", "--dt-mode", "fixed"]))
     assert ide.seed_record(0.6, 2.0) == {"source": "argument", "seed_peak": 0.6, "seed_sigma_mm": 2.0, "gaussian_seed_mass": pytest.approx(0.6 * (4 * np.pi * 2.0) ** 1.5), "gaussian_seed_diffusion_time": 2.0}
     e = ide.INVARIANCE_DIRECTION
     columns = np.random.default_rng(0).normal(size=(50, 5))
@@ -765,17 +865,17 @@ def test_patient_blocks_and_devices(cohort):
     command = ide.worker_command(cohort.root, "fisher", "3", patients[:2], parse(["fisher", "--name", "x", "--smoke", "--draws", "5"]))
     assert command[2:] == ["fisher", "--output-dir", str(cohort.root.parent), "--name", cohort.root.name, "--gpus", "3", "--patients", "p00,p01", "--no-assemble", "--smoke", "--draws", "5"]
     command = ide.worker_command(cohort.root, "substitute", "", patients[:1], parse(["substitute", "--name", "x", "--maxfev", "3", "--delta-a", "0.5,2"]))
-    assert command[-7:] == ["--patients", "p00", "--no-assemble", "--maxfev", "3", "--delta-a", "0.5,2"] and command[7:9] == ["--gpus", ""]
-    args = parse(["seedfix", "--name", "x", "--maxfev", "4", "--tr-bounds", "5,100", "--seed-peak", "0.7", "--seed-sigma-mm", "3", "--lambda-mode", "free"])
+    assert command[-9:] == ["--patients", "p00", "--no-assemble", "--maxfev", "3", "--dt-mode", "stability", "--delta-a", "0.5,2"] and command[7:9] == ["--gpus", ""]
+    args = parse(["seedfix", "--name", "x", "--maxfev", "4", "--dt-mode", "fixed", "--tr-bounds", "5,100", "--seed-peak", "0.7", "--seed-sigma-mm", "3", "--lambda-mode", "free"])
     command = ide.worker_command(cohort.root, "seedfix", "2", patients[:1], args)
-    assert command[-10:] == ["--maxfev", "4", "--tr-bounds", "5,100", "--seed-peak", "0.7", "--seed-sigma-mm", "3.0", "--lambda-mode", "free"]
+    assert command[-12:] == ["--maxfev", "4", "--dt-mode", "fixed", "--tr-bounds", "5,100", "--seed-peak", "0.7", "--seed-sigma-mm", "3.0", "--lambda-mode", "free"]
     args = parse(["all", "--name", "x", "--maxfev", "4", "--seed-peak", "0.7", "--seed-sigma-mm", "3", "--sigmas", "2,5", "--delta-a", "0.5", "--lambda-mode", "fixed"])
-    assert ide.worker_command(cohort.root, "profile", "2", patients[:1], args)[-6:] == ["--maxfev", "4", "--seed-peak", "0.7", "--sigmas", "2,5"]
-    assert ide.worker_command(cohort.root, "substitute", "2", patients[:1], args)[-4:] == ["--maxfev", "4", "--delta-a", "0.5"]
-    assert ide.worker_command(cohort.root, "seedfix", "2", patients[:1], args)[-8:] == ["--maxfev", "4", "--seed-peak", "0.7", "--seed-sigma-mm", "3.0", "--lambda-mode", "fixed"]
-    # Defaults are not forwarded; the profile has no seed width.
+    assert ide.worker_command(cohort.root, "profile", "2", patients[:1], args)[-8:] == ["--maxfev", "4", "--dt-mode", "stability", "--seed-peak", "0.7", "--sigmas", "2,5"]
+    assert ide.worker_command(cohort.root, "substitute", "2", patients[:1], args)[-6:] == ["--maxfev", "4", "--dt-mode", "stability", "--delta-a", "0.5"]
+    assert ide.worker_command(cohort.root, "seedfix", "2", patients[:1], args)[-10:] == ["--maxfev", "4", "--dt-mode", "stability", "--seed-peak", "0.7", "--seed-sigma-mm", "3.0", "--lambda-mode", "fixed"]
+    # Unset options are not forwarded (the dt mode always is, it has a default); the profile has no seed width.
     command = ide.worker_command(cohort.root, "profile", "2", patients[:1], parse(["profile", "--name", "x"]))
-    assert command[-1] == "--no-assemble"
+    assert command[-3:] == ["--no-assemble", "--dt-mode", "stability"]
     assert ide.parse_bands(parse(["design", "--name", "x", "--r-core-band", "3,7"])) == ide.SizeBands((3.0, 7.0), (10.0, 35.0), (1.2, 8.0))
     with pytest.raises(ValueError, match="lo < hi"):
         ide.parse_bands(parse(["design", "--name", "x", "--ratio-band", "8,1"]))
@@ -819,7 +919,7 @@ def test_figures_tolerate_empty_iso_surfaces(tmp_path):
     """A metric that is NaN for every row (an empty iso-surface at every
     lambda, at every substitute, at every patient) still gives a figure:
     the panels' axes are scaled by hand; the summaries' groups follow the
-    R_over_lambda strata."""
+    maturity strata (at or above / below 15)."""
     nan = float("nan")
     invariance = [
         {"lambda": value, "run_type": run_type, "snapshot": "pre", **{name: nan for name in ide.METRIC_NAMES}, "mass": 1.0}
@@ -830,7 +930,7 @@ def test_figures_tolerate_empty_iso_surfaces(tmp_path):
     assert (tmp_path / "figures" / "invariance_metrics.png").is_file() and (tmp_path / "figures" / "invariance_qois.pdf").is_file()
     metrics = {f"{frame}_{name}": nan for frame in ide.SUBSTITUTE_FRAMES for name in ide.METRIC_NAMES}
     substitute = [
-        {"patient": f"p{i:02d}", "cell": cell, "delta_a": delta_a, "T_0": 50.0, "rho_T_0": 1.0, "objective": "B", "skipped": "", "R_over_lambda": 5.0 * (i + 1), **metrics}
+        {"patient": f"p{i:02d}", "cell": cell, "delta_a": delta_a, "T_0": 50.0, "rho_T_0": 1.0, "objective": "B", "skipped": "", "maturity": 5.0 * (i + 1), **metrics}
         for i, cell in enumerate(ide.CELLS)
         for delta_a in (-0.5, 0.5)
     ]
@@ -838,10 +938,10 @@ def test_figures_tolerate_empty_iso_surfaces(tmp_path):
     for frame in ("d120", "d180"):
         assert (tmp_path / "figures" / f"substitute_{frame}_objective_B.png").is_file()
     medians = ide.substitute_medians(substitute)["B"]
-    assert set(medians) == {"-0.5", "0.5"} and set(medians["0.5"]) == {*ide.CELLS, "all", "R_over_lambda_ge_10", "R_over_lambda_lt_10"}
-    assert medians["0.5"]["R_over_lambda_lt_10"]["n_rows"] == 1 and medians["0.5"]["R_over_lambda_ge_10"]["n_rows"] == 3
+    assert set(medians) == {"-0.5", "0.5"} and set(medians["0.5"]) == {*ide.CELLS, "all", "maturity_ge_15", "maturity_lt_15"}
+    assert medians["0.5"]["maturity_lt_15"]["n_rows"] == 2 and medians["0.5"]["maturity_ge_15"]["n_rows"] == 2
     seedfix = [
-        {"patient": f"p{i:02d}", "cell": cell, "lambda_mode": mode, "objective": "B", "fitted_T_r": 30.0, "fitted_lambda_mm": 2.0, "lambda_truth_mm": 2.5, "rho_T_r_fitted": 1.0, "rho_T_r": 2.0, "R_over_lambda": nan if i == 0 else 4.0 * i, "bound_hit": i == 1, **metrics}
+        {"patient": f"p{i:02d}", "cell": cell, "lambda_mode": mode, "objective": "B", "fitted_T_r": 30.0, "fitted_lambda_mm": 2.0, "lambda_truth_mm": 2.5, "rho_T_r_fitted": 1.0, "rho_T_r": 2.0, "R_over_lambda": 4.0 * i, "maturity": nan if i == 0 else 8.0 * i, "bound_hit": i == 1, **metrics}
         for i, cell in enumerate(ide.CELLS)
         for mode in ide.LAMBDA_MODES
     ]
@@ -852,15 +952,48 @@ def test_figures_tolerate_empty_iso_surfaces(tmp_path):
     medians = ide.seedfix_medians(seedfix)
     assert set(medians) == set(ide.LAMBDA_MODES) and medians["free"]["all"] == {**medians["free"]["all"], "n_patients": 4, "n_bound_hit": 1}
     assert medians["free"]["all"]["abs_rho_T_r_error"] == 1.0 and medians["free"]["all"]["abs_log_lambda_error"] == pytest.approx(abs(np.log(2.0 / 2.5)))
-    assert medians["fixed"]["R_over_lambda_ge_10"]["n_patients"] == 1 and medians["fixed"]["R_over_lambda_lt_10"]["n_patients"] == 2
+    assert medians["fixed"]["maturity_ge_15"]["n_patients"] == 2 and medians["fixed"]["maturity_lt_15"]["n_patients"] == 1
     profile = [
-        {"patient": f"p{i:02d}", "cell": cell, "sigma_mm": sigma, "seed_peak": 0.6, "fitted_T_r": 30.0, "rho_T_r_fitted": 1.0, "rho_T_r": 2.0, "R_over_lambda": 12.0, "bound_hit": False, "objective_achieved": nan, **metrics}
+        {"patient": f"p{i:02d}", "cell": cell, "sigma_mm": sigma, "seed_peak": 0.6, "fitted_T_r": 30.0, "rho_T_r_fitted": 1.0, "rho_T_r": 2.0, "R_over_lambda": 12.0, "maturity": 20.0, "bound_hit": False, "objective_achieved": nan, **metrics}
         for i, cell in enumerate(ide.CELLS)
         for sigma in (2.0, 5.0)
     ]
     ide.profile_figures(profile, tmp_path / "figures")
     assert (tmp_path / "figures" / "profile_objective.png").is_file() and (tmp_path / "figures" / "profile_d180.pdf").is_file()
     assert set(ide.profile_medians(profile)) == {"2", "5"} and ide.profile_medians(profile)["2"]["all"]["fitted_T_r"] == 30.0
+    assert ide.profile_medians(profile)["2"]["maturity_ge_15"]["n_patients"] == 4 and "maturity_lt_15" not in ide.profile_medians(profile)["2"]
+
+
+# --- (10) reused records of another seed ---
+
+
+def test_reused_seed_mismatch_raises(tmp_path):
+    """``check_reused_seed`` raises, naming both seeds, when a reused
+    record's seed_peak or seed_sigma_mm differs from the arguments;
+    ``seedfix_patient`` on the cube refuses a fixed-mode row.json of
+    another seed and ``profile_patient`` a sigma directory of another
+    peak, both after the truth."""
+    record = {"seed_peak": 0.6, "seed_sigma_mm": 2.0}
+    ide.check_reused_seed(tmp_path / "row.json", record, 0.6, 2.0)
+    with pytest.raises(ValueError, match=r"peak 0\.6, sigma 2\.0 mm.*peak 0\.7, sigma 2\.0 mm"):
+        ide.check_reused_seed(tmp_path / "row.json", record, 0.7, 2.0)
+    with pytest.raises(ValueError, match=r"sigma 2\.0 mm.*sigma 3\.0 mm"):
+        ide.check_reused_seed(tmp_path / "row.json", record, 0.6, 3.0)
+    cohort = _cube_cohort(tmp_path)
+    patient = _fast_patient()
+    seedfix_dir = tmp_path / "seedfix"
+    stale = seedfix_dir / "px" / "B" / "row.json"
+    stale.parent.mkdir(parents=True)
+    ide.write_record(stale, {**record, "seed_peak": 0.8, "lambda_mode": "fixed"})
+    with pytest.raises(ValueError, match=r"peak 0\.8.*peak 0\.6"):
+        ide.seedfix_patient(cohort, patient, seedfix_dir, maxfev=2, tr_bounds=(5.0, 40.0), seed_peak=0.6, seed_sigma=2.0, lambda_modes=("fixed",))
+    assert (seedfix_dir / "px" / "truth" / "frames.json").is_file() and not (seedfix_dir / "px" / "seedfix.json").is_file()
+    profile_dir = tmp_path / "profile"
+    stale = profile_dir / "px" / "sigma_2" / "row.json"
+    stale.parent.mkdir(parents=True)
+    ide.write_record(stale, {"seed_peak": 0.7, "seed_sigma_mm": 2.0})
+    with pytest.raises(ValueError, match=r"peak 0\.7, sigma 2\.0 mm.*peak 0\.6, sigma 2\.0 mm"):
+        ide.profile_patient(cohort, patient, profile_dir, maxfev=2, tr_bounds=(5.0, 40.0), seed_peak=0.6, sigmas=(2.0,))
 
 
 @pytest.mark.slow
@@ -884,6 +1017,8 @@ def test_smoke_pipeline_on_phantom(phantom_root):
     seedfix = [r for r in _read_csv(phantom_root / "seedfix.csv") if r["patient"] == "p00"]
     assert [r["lambda_mode"] for r in seedfix] == ["truth", "fixed"] and list(seedfix[0]) == ide.SEEDFIX_COLUMNS
     assert seedfix[1]["seed_peak"] == "0.6" and seedfix[1]["seed_sigma_mm"] == "2.0" and seedfix[1]["bound_hit"] in ("True", "False")
+    p00 = ide.load_cohort(phantom_root).patient("p00")
+    assert all(int(r["steps_per_day"]) == p00.steps_per_day and float(r["maturity"]) == pytest.approx(p00.maturity) for r in seedfix + substitute)
     profile = [r for r in _read_csv(phantom_root / "profile.csv") if r["patient"] == "p00"]
     assert len(profile) == 1 and profile[0]["sigma_mm"] == "2.0" and list(profile[0]) == ide.PROFILE_COLUMNS
     summary = ide.read_record(phantom_root / "seedfix_summary.json")
