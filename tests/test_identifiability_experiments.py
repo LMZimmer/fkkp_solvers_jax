@@ -548,7 +548,8 @@ def test_design_fills_the_cells_by_size_screening(cohort, phantom_root):
     assert spec["crt_snapshots"] == {"mid_crt": 34.0, "end_crt": 55.0}
     assert spec["maturity_split"] == 15.0 and spec["lambda_split_mm"] == 2.0 and spec["seed_width_cap"]["cap"] == 1.5
     assert spec["dt_mode"] == "stability" and spec["dt_modes"]["grid_spacing_mm"] == 1.0 and spec["dt_modes"]["dt_max_days"] == 0.5
-    assert spec["profile"]["sigmas"] == [1.0, 1.5, 2.0, 3.0, 4.0, 6.0] and spec["substitute"]["delta_a"] == [-1.0, -0.5, 0.5, 1.0] and spec["substitute"]["maxfev"] == 60
+    assert spec["dt_modes"]["rho_dt_max"] == 0.01 and spec["substitute"]["T_0_min"] == 5.0 and spec["substitute"]["T_0_max"] == 3000.0
+    assert spec["profile"]["sigmas"] == [1.0, 1.5, 2.0, 3.0, 4.0, 6.0] and spec["substitute"]["delta_a"] == [-1.0, -0.5, 0.5, 1.0] and spec["substitute"]["maxfev"] == 150
     assert spec["seedfix"]["lambda_bounds"] == [0.5, 8.0] and spec["seedfix"]["default_lambda_mode"] == "fixed" and spec["seedfix"]["maxfev"] == 150
     screening = spec["screening"]
     assert screening["tr_min"] == 5.0 and screening["tr_max"] == 1000.0 and screening["bands"] == PHANTOM_BANDS.record() and screening["resumed"] is False
@@ -570,6 +571,7 @@ def test_design_fills_the_cells_by_size_screening(cohort, phantom_root):
         assert float(r["maturity"]) == pytest.approx(2 * float(r["growth_efolds"]) * float(r["front_width_mm"]) ** 2 / float(r["seed_sigma_mm"]) ** 2)
         steps = ide.steps_per_day_for("stability", float(r["white_matter_diffusivity"]), float(r["rho"]), float(r["resection_time"]), 1.0)
         assert int(r["steps_per_day"]) == steps and float(r["dt"]) == pytest.approx(1.0 / steps) and 2 <= steps <= 12
+        assert float(r["rho_dt"]) == pytest.approx(float(r["rho"]) / steps) and float(r["rho_dt"]) <= 0.01 * (1 + 1e-9)
         growth = sa.growth_parameters(float(r["front_speed_mm_per_day"]), float(r["front_width_mm"]))
         assert float(r["white_matter_diffusivity"]) == pytest.approx(growth["white_matter_diffusivity"])
         assert float(r["rho"]) == pytest.approx(growth["rho"]) and float(r["rho_T_r"]) == pytest.approx(float(r["growth_efolds"]))
@@ -677,24 +679,24 @@ def test_default_seed_voxel_on_atlas(tmp_path):
 def test_deficit_t0_and_sub_5_day_skip(tmp_path):
     """T_0 = T_r - delta_a / rho: for the fast patient (rho = 0.15,
     T_r = 12) delta_a = 0.5 gives T_0 = 8.67 and delta_a = 100 a T_0 far
-    below 5 days, skipped; a negative deficit beyond --tr-max is skipped
-    too. ``substitute_patient`` on the cube cohort writes the truth row,
+    below 5 days, skipped; a negative deficit is never skipped, however
+    late its T_0. ``substitute_patient`` on the cube cohort writes the truth row,
     one fitted row (T0_8.7/B/) and one skipped row with NaN metrics, and
     records the skip."""
     patient = _fast_patient()
-    assert ide.SUBSTITUTE_DELTA_A == (-1.0, -0.5, 0.5, 1.0) and ide.SUBSTITUTE_MAXFEV == 60 and ide.MAXFEV == 150
+    assert ide.SUBSTITUTE_DELTA_A == (-1.0, -0.5, 0.5, 1.0) and ide.MAXFEV == 150 and not hasattr(ide, "SUBSTITUTE_MAXFEV")
     assert ide.parse_floats(None, ide.SUBSTITUTE_DELTA_A, "--delta-a") == [-1.0, -0.5, 0.5, 1.0]
     assert [entry["delta_a"] for entry in ide.deficit_schedule(patient)] == [-1.0, -0.5, 0.5, 1.0]
-    assert ide.build_parser().parse_args(["substitute", "--name", "x"]).maxfev is None  # resolved to SUBSTITUTE_MAXFEV by the command
+    assert ide.build_parser().parse_args(["substitute", "--name", "x"]).maxfev is None  # resolved to MAXFEV by the command
     assert ide.substitute_t0(patient, 0.5) == pytest.approx(12.0 - 0.5 / 0.15) and ide.substitute_t0(patient, -0.5) == pytest.approx(12.0 + 0.5 / 0.15)
     assert ide.substitute_t0(patient, 0.0) == 12.0
-    schedule = ide.deficit_schedule(patient, (0.5, 100.0, -200.0, -2.0), tr_max=1000.0)
-    assert [entry["skipped"] for entry in schedule] == [None, "T_0_below_min", "T_0_above_max", None]
+    schedule = ide.deficit_schedule(patient, (0.5, 100.0, -200.0, -2.0))
+    assert [entry["skipped"] for entry in schedule] == [None, "T_0_below_min", None, None]
     assert schedule[0]["T_0"] == pytest.approx(8.6667, abs=1e-3) and schedule[1]["T_0"] < 5.0 and schedule[2]["T_0"] > 1000.0
     assert [entry["delta_a"] for entry in schedule] == [0.5, 100.0, -200.0, -2.0]
-    assert ide.deficit_schedule(patient, (-2.0,), tr_max=20.0)[0]["skipped"] == "T_0_above_max"
+    assert ide.deficit_schedule(patient, (-2.0,))[0]["skipped"] is None  # no cap above: T_0 = 25.3 > T_r
     cohort = _cube_cohort(tmp_path)
-    record = ide.substitute_patient(cohort, patient, tmp_path / "substitute", maxfev=2, deltas=(0.5, 100.0), tr_max=1000.0)
+    record = ide.substitute_patient(cohort, patient, tmp_path / "substitute", maxfev=2, deltas=(0.5, 100.0))
     rows = record["rows"]
     assert [row["objective"] for row in rows] == ["truth", "B", "B"] and [row["delta_a"] for row in rows] == [0.0, 0.5, 100.0]
     assert rows[0]["T_0"] == 12.0 and rows[0]["skipped"] == "" and rows[0]["d180_mass_rel"] == 0.0 and np.isnan(rows[0]["maturity"])
@@ -707,7 +709,7 @@ def test_deficit_t0_and_sub_5_day_skip(tmp_path):
     assert skipped["skipped"] == "T_0_below_min" and skipped["T_0"] < 5.0 and "fitted_peak" not in skipped
     assert all(np.isnan(skipped[f"{frame}_{name}"]) for frame in ide.SUBSTITUTE_FRAMES for name in ide.METRIC_NAMES)
     assert record["skipped"] == [{"delta_a": 100.0, "T_0": skipped["T_0"], "skipped": "T_0_below_min", "objective": "B"}]
-    assert record["T_0_range"] == [5.0, 1000.0]
+    assert record["T_0_range"] == [5.0, 3000.0]
     patient_dir = tmp_path / "substitute" / "px"
     assert (patient_dir / "T0_8.7" / "B" / "row.json").is_file() and (patient_dir / "T0_8.7" / "B" / "run" / "d180_cell_density.nii.gz").is_file()
     assert ide.read_record(patient_dir / "T0_8.7" / "B" / "fit.json")["delta_a"] == 0.5
@@ -799,10 +801,17 @@ def test_frame_days_and_log_kill_and_selection(cohort):
     with pytest.raises(ValueError, match="lambda-mode"):
         ide.parse_lambda_modes("neither")
     assert ide.parse_tr_bounds(None) == (5.0, 3000.0) and ide.parse_tr_bounds("10, 20") == (10.0, 20.0)
-    # The time step: fixed is 12 steps/day; stability is dt = min(0.5, 0.25 dx^2 / (6 D))
+    # The time step: fixed is 12 steps/day; stability is dt = min(0.5, 0.25 dx^2 / (6 D), 0.01 / rho)
     # rounded to whole steps per day, raised to the solver's estimate at T_r, capped at 12.
     assert ide.DT_MODES == ("fixed", "stability") and ide.DEFAULT_DT_MODE == "stability" and ide.BASE_STEPS_PER_DAY == 12
-    assert ide.DT_MAX == 0.5 and ide.DT_SAFETY == 0.25
+    assert ide.DT_MAX == 0.5 and ide.DT_SAFETY == 0.25 and ide.RHO_DT_MAX == 0.01
+    # The reaction bound: rho = 0.08 gives dt = 0.01 / 0.08 = 0.125 d, 8 steps/day, where the diffusion bound
+    # (D = 0.05: 0.83 d) and DT_MAX would give 2; rho = 0.02 gives 0.5 d, the DT_MAX cap, and does not bind.
+    assert ide.steps_per_day_for("stability", 0.05, 0.08, 1000.0, 1.0) == 8
+    assert ide.steps_per_day_for("stability", 0.05, 0.02, 1000.0, 1.0) == 2
+    assert ide.steps_per_day_for("stability", 0.05, 0.05, 1000.0, 1.0) == 5  # 0.2 d
+    with pytest.raises(ValueError, match="rho > 0"):
+        ide.steps_per_day_for("stability", 0.05, 0.0, 1000.0, 1.0)
     assert ide.steps_per_day_for("fixed", 0.05, 0.01, 300.0, 1.0) == 12 and ide.steps_per_day_for("fixed", 1.0, 0.1, 5.0, 4.0) == 12
     assert ide.steps_per_day_for("stability", 0.5, 0.01, 1000.0, 1.0) == 12  # dt = 1 / (24 D) = 1/12 d
     assert ide.steps_per_day_for("stability", 0.25, 0.01, 1000.0, 1.0) == 6  # 1 / (24 D) = 1/6 d

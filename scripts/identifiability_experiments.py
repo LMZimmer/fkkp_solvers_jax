@@ -300,21 +300,32 @@ patient's step; the fisher and invariance subcommands step at the fixed
 12 steps/day whatever the mode).
   fixed      BASE_STEPS_PER_DAY = 12 steps/day for every patient (the
              base config's dt = 1/12 day).
-  stability  per patient dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D_wm)),
-             DT_MAX = 0.5 d, DT_SAFETY = 0.25, dx the grid spacing (1 mm
-             on the atlas, 4 mm with --smoke) and D_wm the patient's
-             white_matter_diffusivity, rounded down to an integer number
-             of steps per day (steps_per_day = ceil(1 / dt)), raised to
+  stability  per patient dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D_wm),
+             RHO_DT_MAX / rho), DT_MAX = 0.5 d, DT_SAFETY = 0.25,
+             RHO_DT_MAX = 0.01, dx the grid spacing (1 mm on the atlas,
+             4 mm with --smoke), D_wm the patient's
+             white_matter_diffusivity and rho its growth rate, rounded
+             down to an integer number of steps per day (steps_per_day =
+             ceil(1 / dt)), raised to
              the solver's own estimate at the truth's resection_time
              (ceil(max(8 D T_r / dx^2 + 100, 1.1 rho T_r) / T_r),
              ``solver_step_estimate``) so that the truth is stepped as
              requested, and capped at 12 steps/day, the floor of the
-             step (``steps_per_day_for``). On the atlas that is
-             ceil(24 D) steps/day between 2 and 12: 2 for D below
-             1/12 mm^2/day (a quarter of the admissible candidates), 12
-             for D at or above 11/24 mm^2/day (a tenth). DT_MAX is half
-             a day because the frame rounding needs a step of at most
-             half a day.
+             step (``steps_per_day_for``). The diffusion bound fixes the
+             Courant number 6 D dt / dx^2 but not the reaction number
+             rho dt, and forward Euler's tail error of the logistic
+             growth is -a rho dt / 2 after a e-folds, so the reaction
+             bound caps rho dt at RHO_DT_MAX, the fixed
+             mode's own reaction number at rho = 0.125 (12 steps/day).
+             On the atlas the diffusion bound alone gives ceil(24 D)
+             steps/day between 2 and 12: 2 for D below 1/12 mm^2/day (a
+             quarter of the admissible candidates), 12 for D at or above
+             11/24 mm^2/day (a tenth); the reaction bound gives
+             ceil(100 rho) steps/day and binds for rho above 0.02/day
+             where the diffusion bound would allow DT_MAX. DT_MAX is
+             half a day because the frame rounding needs a step of at
+             most half a day. design.csv records the patients' rho_dt =
+             rho / steps_per_day.
 The solver takes a run's step as ceil(horizon steps_per_day) steps, so
 the effective step divides the horizon exactly and is at most
 1 / steps_per_day (``requested_steps``; a warning names the rounding).
@@ -546,12 +557,15 @@ pre, d34, d55, d80, d120, d180 and the observation region of its six
 frames; then for each deficit delta_a in --delta-a (default -1, -0.5,
 0.5, 1 e-folds) the growth time T_0 = T_r - delta_a / rho (delta_a > 0:
 T_0 earlier than the truth; ``deficit_schedule``), skipped when T_0 lies
-below 5 days or above the design's --tr-max (recorded in substitute.json
-and as a row with NaN metrics), and per objective, with v and lambda at
+below 5 days (T_0_min; recorded in substitute.json and as a row with NaN
+metrics; a T_0 later than the truth's T_r is never skipped; spec.json
+records T_0_max = 3000 d, the upper --tr-bounds value), and per objective,
+with v and lambda at
 the truth, the seed position fixed and the floor 0, the seed (logit of
 the peak on (0.05, 1], log sigma; peak = 0.05 + 0.95 sigmoid(z),
 ``bounded_from_unbounded``) is fitted by scipy's Nelder-Mead (--maxfev
-evaluations at most, default 60 (SUBSTITUTE_MAXFEV), 20 with --smoke;
+evaluations at most, default 150 (MAXFEV, as for seedfix and profile),
+20 with --smoke;
 the initial simplex x0, x0 + (0.5, 0), x0 + (0, 0.2); xatol 1e-3,
 fatol 1e-6) so that the growth-only field at T_0 (FKPPSolver at the
 patient's step) matches the truth's
@@ -934,17 +948,22 @@ MATURITY_SPLIT = 15.0
 SEED_WIDTH_CAP = 1.5  # a candidate with seed_sigma_mm > SEED_WIDTH_CAP front_width_mm is rejected (seed_wide)
 # The time step (--dt-mode, ``steps_per_day_for``). fixed: BASE_STEPS_PER_DAY
 # steps per day for every patient (the base config's 12). stability: per
-# patient dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D_wm)) rounded down to an
-# integer number of steps per day, never finer than BASE_STEPS_PER_DAY
-# (the floor of the step) and never coarser than the solver's own
-# estimate at the truth's resection_time (``solver_step_estimate``), so
-# that the truth is stepped as requested; DT_MAX is half a day because
-# the frame rounding (``frame_days``) needs a step of at most half a day.
+# patient dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D_wm), RHO_DT_MAX / rho)
+# rounded down to an integer number of steps per day, never finer than
+# BASE_STEPS_PER_DAY (the floor of the step) and never coarser than the
+# solver's own estimate at the truth's resection_time
+# (``solver_step_estimate``), so that the truth is stepped as requested;
+# DT_MAX is half a day because the frame rounding (``frame_days``) needs
+# a step of at most half a day. The diffusion bound fixes the Courant
+# number but not the reaction number rho dt, whose forward Euler tail
+# error is -a rho dt / 2 after a e-folds; RHO_DT_MAX is the fixed mode's
+# own reaction number at rho = 0.125 and 12 steps/day.
 DT_MODES: tuple[str, ...] = ("fixed", "stability")
 DEFAULT_DT_MODE = "stability"
 BASE_STEPS_PER_DAY = 12
 DT_MAX = 0.5  # days
 DT_SAFETY = 0.25  # of the explicit diffusion limit dx^2 / (6 D): dt = dx^2 / (24 D) before the rounding and the caps
+RHO_DT_MAX = 0.01  # the reaction number rho dt of the stability step: dt <= RHO_DT_MAX / rho before the rounding and the caps
 SOLVER_STEP_FLOOR = 100  # the solver's estimate over a horizon T: max(8 D T / dx^2 + 100, 1.1 rho T) steps
 VISIBILITY_HORIZON = 120.0  # days; visibility_margin = VISIBILITY_HORIZON rho - log_kill_total (a design column, not a cell split)
 TR_MIN = 5.0  # days; a candidate below it is rejected, a substitute T_0 below it skipped
@@ -998,6 +1017,7 @@ DESIGN_COLUMNS: list[str] = [
     "R_over_lambda",
     "steps_per_day",
     "dt",
+    "rho_dt",
     "fd_check",
 ]
 SCREEN_DIR = "screen"  # <design>/screen/c<candidate>/screen.json, the screening's resume records
@@ -1085,8 +1105,7 @@ SINGULAR_TOLERANCE = 1e-14  # an eigenvalue of F below it times the largest coun
 # Experiment 2: the substitute's growth time T_0 = T_r - delta_a / rho per
 # deficit delta_a in e-folds (delta_a > 0: T_0 earlier than the truth).
 SUBSTITUTE_DELTA_A: tuple[float, ...] = (-1.0, -0.5, 0.5, 1.0)
-MAXFEV = 150  # --maxfev of the seedfix and profile fits
-SUBSTITUTE_MAXFEV = 60  # --maxfev of the substitute fits
+MAXFEV = 150  # --maxfev of the substitute, seedfix and profile fits
 PEAK_MIN = 0.05  # the fitted peak lies in (PEAK_MIN, PEAK_MAX]
 PEAK_MAX = 1.0
 LOGIT_CLIP = 1e-4  # the inverse map keeps the unit-interval argument in [LOGIT_CLIP, 1 - LOGIT_CLIP]
@@ -1540,24 +1559,29 @@ def solver_step_estimate(diffusivity: float, rho: float, horizon: float, dx: flo
 def steps_per_day_for(mode: str, diffusivity: float, rho: float, resection_time: float, dx: float) -> int:
     """
     The steps per day of a patient's solves. "fixed": BASE_STEPS_PER_DAY.
-    "stability": dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D)) with D the
-    patient's white-matter diffusivity (mm^2/day) and dx the grid spacing
-    (mm), rounded down to an integer number of steps per day
-    (ceil(1 / dt)), then raised to the solver's estimate at the truth's
+    "stability": dt = min(DT_MAX, DT_SAFETY dx^2 / (6 D), RHO_DT_MAX / rho)
+    with D the patient's white-matter diffusivity (mm^2/day), dx the grid
+    spacing (mm) and rho the growth rate (1/day), rounded down to an
+    integer number of steps per day (ceil(1 / dt)), then raised to the
+    solver's estimate at the truth's
     resection_time (ceil(``solver_step_estimate`` / resection_time)) so
     that the truth's growth stage is stepped as requested, and capped at
     BASE_STEPS_PER_DAY, the finest step (the solver may still refine a
     solve that needs more than that many steps per day, as it does in
-    the fixed mode).
+    the fixed mode). The diffusion bound fixes the Courant number
+    6 D dt / dx^2 but leaves the reaction number rho dt free, and forward
+    Euler's tail error of the logistic growth is -a rho dt / 2 after a
+    e-folds, so the reaction bound caps rho dt at RHO_DT_MAX, the fixed
+    mode's own reaction number at rho = 0.125 and 12 steps/day.
     """
     if mode not in DT_MODES:
         raise ValueError(f"--dt-mode must be one of {DT_MODES}, got {mode!r}.")
     if mode == "fixed":
         return BASE_STEPS_PER_DAY
-    diffusivity, dx, t_r = float(diffusivity), float(dx), float(resection_time)
-    if not (diffusivity > 0 and dx > 0 and t_r > 0):
-        raise ValueError(f"the stability step needs D > 0, dx > 0 and resection_time > 0, got {diffusivity!r}, {dx!r}, {t_r!r}.")
-    dt = min(DT_MAX, DT_SAFETY * dx**2 / (6.0 * diffusivity))
+    diffusivity, rho, dx, t_r = float(diffusivity), float(rho), float(dx), float(resection_time)
+    if not (diffusivity > 0 and rho > 0 and dx > 0 and t_r > 0):
+        raise ValueError(f"the stability step needs D > 0, rho > 0, dx > 0 and resection_time > 0, got {diffusivity!r}, {rho!r}, {dx!r}, {t_r!r}.")
+    dt = min(DT_MAX, DT_SAFETY * dx**2 / (6.0 * diffusivity), RHO_DT_MAX / rho)
     steps = int(np.ceil(1.0 / dt - 1e-9))
     steps = max(steps, int(np.ceil(solver_step_estimate(diffusivity, rho, t_r, dx) / t_r - 1e-9)))
     return int(min(max(steps, 1), BASE_STEPS_PER_DAY))
@@ -1939,7 +1963,7 @@ def make_design(
         rt_margin_mm: See ``treatment_settings``.
         rt_dose_per_fraction: See ``treatment_settings``.
         tr_max: Candidates with resection_time above it (days) are
-            rejected; also the cap of the substitute arm's T_0.
+            rejected.
         bands: The size screening's acceptance bands (``SizeBands``).
         patients_per_cell: Patients accepted per cell.
         dt_mode: The time step of every patient's solves ("fixed" |
@@ -2035,7 +2059,7 @@ def make_design(
     dx = grid_spacing_mm(base, zooms)
     for candidate in candidates:
         steps = steps_per_day_for(dt_mode, candidate["white_matter_diffusivity"], candidate["rho"], candidate["resection_time"], dx)
-        candidate["steps_per_day"], candidate["dt"] = steps, 1.0 / steps
+        candidate["steps_per_day"], candidate["dt"], candidate["rho_dt"] = steps, 1.0 / steps, float(candidate["rho"]) / steps
     root.mkdir(parents=True, exist_ok=True)
     for sub in ("configs", "runs", "figures", SCREEN_DIR):
         (root / sub).mkdir(exist_ok=True)
@@ -2112,11 +2136,12 @@ def make_design(
         "dt_modes": {
             "fixed": f"{BASE_STEPS_PER_DAY} steps per day for every patient (the base config's)",
             "stability": (
-                f"per patient dt = min({DT_MAX:g}, {DT_SAFETY:g} dx^2 / (6 D_wm)) rounded down to an integer number of steps per day, raised to the "
-                f"solver's estimate ceil(max(8 D T_r / dx^2 + {SOLVER_STEP_FLOOR}, 1.1 rho T_r) / T_r) and capped at {BASE_STEPS_PER_DAY} steps per day"
+                f"per patient dt = min({DT_MAX:g}, {DT_SAFETY:g} dx^2 / (6 D_wm), {RHO_DT_MAX:g} / rho) rounded down to an integer number of steps per day, "
+                f"raised to the solver's estimate ceil(max(8 D T_r / dx^2 + {SOLVER_STEP_FLOOR}, 1.1 rho T_r) / T_r) and capped at {BASE_STEPS_PER_DAY} steps per day"
             ),
             "dt_max_days": DT_MAX,
             "dt_safety": DT_SAFETY,
+            "rho_dt_max": RHO_DT_MAX,
             "base_steps_per_day": BASE_STEPS_PER_DAY,
             "grid_spacing_mm": dx,
         },
@@ -2165,10 +2190,10 @@ def make_design(
         },
         "substitute": {
             "delta_a": list(SUBSTITUTE_DELTA_A),
-            "T_0": "T_r - delta_a / rho; skipped below T_0_min or above T_0_max",
+            "T_0": "T_r - delta_a / rho; skipped below T_0_min only (T_0_max, the upper T_r bound, is recorded, not a skip)",
             "T_0_min": TR_MIN,
-            "T_0_max": float(tr_max),
-            "maxfev": SMOKE.maxfev if smoke else SUBSTITUTE_MAXFEV,
+            "T_0_max": TR_BOUNDS[1],
+            "maxfev": SMOKE.maxfev if smoke else MAXFEV,
             "peak_range": [PEAK_MIN, PEAK_MAX],
             "objectives": list(OBJECTIVES),
             "simplex_steps": list(SIMPLEX_STEPS),
@@ -3268,15 +3293,14 @@ def substitute_t0(patient: Patient, delta_a: float) -> float:
     return patient.resection_time - float(delta_a) / patient.rho
 
 
-def deficit_schedule(patient: Patient, deltas: Sequence[float] = SUBSTITUTE_DELTA_A, tr_max: float = DEFAULT_TR_MAX) -> list[dict[str, Any]]:
+def deficit_schedule(patient: Patient, deltas: Sequence[float] = SUBSTITUTE_DELTA_A) -> list[dict[str, Any]]:
     """The substitute arm's (delta_a, T_0) pairs of a patient
     (``substitute_t0``) with "skipped": None, or "T_0_below_min" for a
-    T_0 below TR_MIN, "T_0_above_max" for one above tr_max (the design's
-    --tr-max)."""
+    T_0 below TR_MIN; a T_0 above the truth's T_r is never skipped."""
     out: list[dict[str, Any]] = []
     for delta_a in deltas:
         t0 = substitute_t0(patient, float(delta_a))
-        skipped = "T_0_below_min" if t0 < TR_MIN else ("T_0_above_max" if t0 > float(tr_max) else None)
+        skipped = "T_0_below_min" if t0 < TR_MIN else None
         out.append({"delta_a": float(delta_a), "T_0": t0, "skipped": skipped})
     return out
 
@@ -3351,13 +3375,12 @@ def substitute_patient(
     out_dir: Path,
     maxfev: int,
     deltas: Sequence[float] = SUBSTITUTE_DELTA_A,
-    tr_max: float = DEFAULT_TR_MAX,
 ) -> dict[str, Any]:
     """
     Experiment 2 for one patient: the truth over SUBSTITUTE_HORIZON with
     the frames SUBSTITUTE_FRAMES, then per deficit delta_a
     (``deficit_schedule``: T_0 = T_r - delta_a / rho; a T_0 below TR_MIN
-    or above tr_max is skipped, recorded and given a row of NaN metrics)
+    is skipped, recorded and given a row of NaN metrics)
     and objective the fitted seed (``fit_seed``; T0_<T_0>/<objective>/
     fit.json), the treated run from it with resection_time T_0, the
     truth's maps, alpha and k_ct and the schedule shifted for T_0
@@ -3374,7 +3397,7 @@ def substitute_patient(
     rows: list[dict[str, Any]] = []
     truth_metrics = {name: compare_to(cohort, truth.run.frames[name], truth.run.frames[name], dose) for name in SUBSTITUTE_FRAMES}
     rows.append(substitute_row(cohort, patient, 0.0, patient.resection_time, "truth", None, truth_metrics))
-    schedule = deficit_schedule(patient, deltas, tr_max)
+    schedule = deficit_schedule(patient, deltas)
     skipped: list[dict[str, Any]] = []
     for entry in schedule:
         delta_a, t0 = float(entry["delta_a"]), float(entry["T_0"])
@@ -3418,7 +3441,7 @@ def substitute_patient(
         "observation": region.record(),
         "delta_a": [float(v) for v in deltas],
         "schedule": schedule,
-        "T_0_range": [TR_MIN, float(tr_max)],
+        "T_0_range": [TR_MIN, TR_BOUNDS[1]],
         "skipped": skipped,
         "rows": rows,
         "wall_time_s": time.perf_counter() - start,
@@ -5012,12 +5035,6 @@ def dt_check_command(root: Path, args: argparse.Namespace, smoke: bool) -> None:
     assemble_dt_check(root)
 
 
-def spec_tr_max(cohort: Cohort) -> float:
-    """The design's --tr-max (spec.json, screening.tr_max), the cap of the
-    substitute arm's T_0."""
-    return float(cohort.spec.get("screening", {}).get("tr_max", DEFAULT_TR_MAX))
-
-
 def parse_floats(text: str | None, default: Sequence[float], flag: str) -> list[float]:
     """A comma-separated list of floats; the default when not given."""
     if text is None or str(text).strip() == "":
@@ -5037,9 +5054,8 @@ def substitute_command(root: Path, args: argparse.Namespace, smoke: bool, device
         assemble_substitute(root, record)
         check_dispatch(record)
         return
-    maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else SUBSTITUTE_MAXFEV)
+    maxfev = int(args.maxfev) if args.maxfev is not None else (SMOKE.maxfev if smoke else MAXFEV)
     deltas = parse_floats(getattr(args, "delta_a", None), SUBSTITUTE_DELTA_A, "--delta-a")
-    tr_max = spec_tr_max(cohort)
     out_dir = root / "runs" / "substitute"
     start = time.perf_counter()
     for index, patient in enumerate(patients):
@@ -5049,10 +5065,10 @@ def substitute_command(root: Path, args: argparse.Namespace, smoke: bool, device
             continue
         print(
             f"substitute {patient.id} ({patient.cell}): T_r {patient.resection_time:.1f}, rho T_r {patient.rho * patient.resection_time:.2f}, "
-            f"delta_a {','.join(f'{d:g}' for d in deltas)}, T_0 in [{TR_MIN:g}, {tr_max:g}], maxfev {maxfev}",
+            f"delta_a {','.join(f'{d:g}' for d in deltas)}, T_0 at least {TR_MIN:g} d, maxfev {maxfev}",
             flush=True,
         )
-        record = substitute_patient(cohort, patient, out_dir, maxfev, deltas, tr_max)
+        record = substitute_patient(cohort, patient, out_dir, maxfev, deltas)
         print(f"substitute {patient.id}: {record['wall_time_s'] / 60:.1f} min ({index + 1} done)", flush=True)
     print(f"substitute: {(time.perf_counter() - start) / 60:.1f} min", flush=True)
     if not getattr(args, "no_assemble", False):
@@ -5209,7 +5225,7 @@ def _add_design_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cavity-threshold", type=float, default=sa.CAVITY_THRESHOLD, help="cell density at or above which a voxel at resection_time is resected")
     parser.add_argument("--rt-margin-mm", type=float, default=sa.RT_MARGIN_MM, help="margin around the cavity of the dose region, mm")
     parser.add_argument("--rt-dose-per-fraction", type=float, default=sa.RT_DOSE_PER_FRACTION_GY, help="dose per fraction in Gy")
-    parser.add_argument("--tr-max", type=float, default=DEFAULT_TR_MAX, help=f"candidates with resection_time above it (days) are rejected; also caps the substitute arm's T_0 (default {DEFAULT_TR_MAX:g}; below {TR_MIN:g} d is rejected too)")
+    parser.add_argument("--tr-max", type=float, default=DEFAULT_TR_MAX, help=f"candidates with resection_time above it (days) are rejected (default {DEFAULT_TR_MAX:g}; below {TR_MIN:g} d is rejected too)")
     parser.add_argument("--patients-per-cell", type=int, default=PATIENTS_PER_CELL, help=f"patients accepted per cell (default {PATIENTS_PER_CELL}; {SMOKE.patients_per_cell} with --smoke)")
     for name, attribute in BAND_ARGS.items():
         lo, hi = getattr(DEFAULT_BANDS, name)
@@ -5248,7 +5264,7 @@ def _add_dt_mode_arg(parser: argparse.ArgumentParser) -> None:
 
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--maxfev", type=int, default=None, help=f"evaluations per fit (default {SUBSTITUTE_MAXFEV} for substitute, {MAXFEV} for seedfix and profile, {SMOKE.maxfev} with --smoke)"
+        "--maxfev", type=int, default=None, help=f"evaluations per fit (default {MAXFEV}, {SMOKE.maxfev} with --smoke)"
     )
 
 
