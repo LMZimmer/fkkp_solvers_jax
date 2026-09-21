@@ -10,17 +10,17 @@
   "seed_sigma_mm": 1.240731744247353,
   "resection_time": 133.58995001963405,
   "rho": 0.023815264491218537,
-  "steps_per_day": 2,
+  "steps_per_day": 3,
   "n_core": 62,
   "n_whole": 216,
   "r_core_mm": 2.455280002991856,
   "r_whole_mm": 3.7221029453964,
   "whole_core_ratio": 3.4838709677419355,
-  "max_density": 0.8621298789844032,
-  "n_steps": 268,
-  "dt": 0.4984699627598285,
+  "max_density": 0.8621320581100496,
+  "n_steps": 401,
+  "dt": 0.3331420199990874,
   "dt_refined": false,
   "failed": false,
   "error": null,
-  "wall_time_s": 0.9740503206849098
+  "wall_time_s": 1.1593123003840446
 }

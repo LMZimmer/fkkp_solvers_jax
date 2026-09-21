@@ -9,7 +9,7 @@
   "dt": 0.33312012115380046,
   "steps_per_day": 3,
   "dt_refined": false,
-  "truth_dir": "/mnt/Drive4/lucas/stupp_identifiability/id_2026-09-19/runs/substitute/p00/truth",
+  "truth_dir": "/mnt/Drive4/lucas/stupp_identifiability/id_2026-09-20/runs/substitute/p00/truth",
   "truth_reused": true,
   "seed_peak": 0.6,
   "sigmas": [
@@ -56,7 +56,7 @@
       "growth_n_steps": 1279,
       "steps_per_day": 3,
       "dt": 0.33332499856687664,
-      "wall_time_s": 38.68922816216946,
+      "wall_time_s": 38.56243881583214,
       "pre_dice_core": 0.8886883509240004,
       "pre_assd_core_mm": 1.0746161516646546,
       "pre_log_vol_ratio_core": -0.04409942987022042,
@@ -297,7 +297,7 @@
       "growth_n_steps": 1159,
       "steps_per_day": 3,
       "dt": 0.33327895418627235,
-      "wall_time_s": 26.762151435017586,
+      "wall_time_s": 26.494116812944412,
       "pre_dice_core": 0.9169067650109485,
       "pre_assd_core_mm": 0.8287597026885719,
       "pre_log_vol_ratio_core": -0.024997224049808864,
@@ -538,7 +538,7 @@
       "growth_n_steps": 1055,
       "steps_per_day": 3,
       "dt": 0.3331320832807558,
-      "wall_time_s": 24.914919562637806,
+      "wall_time_s": 24.810910910367966,
       "pre_dice_core": 0.9537361189535103,
       "pre_assd_core_mm": 0.5127644025517557,
       "pre_log_vol_ratio_core": -0.007029423879854946,
@@ -779,7 +779,7 @@
       "growth_n_steps": 858,
       "steps_per_day": 3,
       "dt": 0.3331493120802242,
-      "wall_time_s": 21.84683381766081,
+      "wall_time_s": 21.59395943582058,
       "pre_dice_core": 0.9697150752455282,
       "pre_assd_core_mm": 0.34616992484431347,
       "pre_log_vol_ratio_core": -3.243302954381022e-05,
@@ -1020,7 +1020,7 @@
       "growth_n_steps": 694,
       "steps_per_day": 3,
       "dt": 0.33310859807550247,
-      "wall_time_s": 18.204061187803745,
+      "wall_time_s": 17.94192336499691,
       "pre_dice_core": 0.9051622418879056,
       "pre_assd_core_mm": 0.9410340208533865,
       "pre_log_vol_ratio_core": 0.010889157105409275,
@@ -1261,7 +1261,7 @@
       "growth_n_steps": 441,
       "steps_per_day": 3,
       "dt": 0.3330287951021696,
-      "wall_time_s": 13.34268070012331,
+      "wall_time_s": 13.246423192322254,
       "pre_dice_core": 0.8294504181600956,
       "pre_assd_core_mm": 1.5851361377452589,
       "pre_log_vol_ratio_core": 0.00012970790267452514,
@@ -1486,5 +1486,5 @@
       "d180_qoi_wm_fraction": 0.6025736453504129
     }
   ],
-  "wall_time_s": 211.15672152489424
+  "wall_time_s": 210.52033434063196
 }

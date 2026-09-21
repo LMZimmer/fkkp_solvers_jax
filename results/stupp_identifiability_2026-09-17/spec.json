@@ -1,11 +1,11 @@
 {
-  "name": "id_2026-09-19",
-  "created": "2026-09-19T08:06:19+00:00",
+  "name": "id_2026-09-20",
+  "created": "2026-09-20T11:39:02+00:00",
   "argv": [
     "scripts/identifiability_experiments.py",
     "design",
     "--name",
-    "id_2026-09-19",
+    "id_2026-09-20",
     "--gpus",
     "2",
     "--dt-mode",
@@ -167,9 +167,10 @@
   "dt_mode": "stability",
   "dt_modes": {
     "fixed": "12 steps per day for every patient (the base config's)",
-    "stability": "per patient dt = min(0.5, 0.25 dx^2 / (6 D_wm)) rounded down to an integer number of steps per day, raised to the solver's estimate ceil(max(8 D T_r / dx^2 + 100, 1.1 rho T_r) / T_r) and capped at 12 steps per day",
+    "stability": "per patient dt = min(0.5, 0.25 dx^2 / (6 D_wm), 0.01 / rho) rounded down to an integer number of steps per day, raised to the solver's estimate ceil(max(8 D T_r / dx^2 + 100, 1.1 rho T_r) / T_r) and capped at 12 steps per day",
     "dt_max_days": 0.5,
     "dt_safety": 0.25,
+    "rho_dt_max": 0.01,
     "base_steps_per_day": 12,
     "grid_spacing_mm": 1.0
   },
@@ -238,7 +239,7 @@
     "device": "2",
     "max_consecutive_failures": 3,
     "resumed": false,
-    "wall_time_s": 344.03370025008917,
+    "wall_time_s": 353.7059466615319,
     "counts": {
       "n_candidates": 1024,
       "n_rejected_seed_wide": 221,
@@ -428,10 +429,10 @@
       0.5,
       1.0
     ],
-    "T_0": "T_r - delta_a / rho; skipped below T_0_min or above T_0_max",
+    "T_0": "T_r - delta_a / rho; skipped below T_0_min only (T_0_max, the upper T_r bound, is recorded, not a skip)",
     "T_0_min": 5.0,
-    "T_0_max": 1000.0,
-    "maxfev": 60,
+    "T_0_max": 3000.0,
+    "maxfev": 150,
     "peak_range": [
       0.05,
       1.0

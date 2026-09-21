@@ -12,7 +12,7 @@
   "dt_refined": false,
   "cavity_volume_mm3": 17559.0,
   "dose_volume_mm3": 126366.0,
-  "truth_dir": "/mnt/Drive4/lucas/stupp_identifiability/id_2026-09-19/runs/substitute/p11/truth",
+  "truth_dir": "/mnt/Drive4/lucas/stupp_identifiability/id_2026-09-20/runs/substitute/p11/truth",
   "truth_reused": true,
   "seed": {
     "source": "argument",
@@ -306,7 +306,7 @@
       "growth_n_steps": 3801,
       "steps_per_day": 3,
       "dt": 0.3332820650498641,
-      "wall_time_s": 79.2749650478363,
+      "wall_time_s": 80.45953235775232,
       "pre_dice_core": 0.9150177351742738,
       "pre_assd_core_mm": 0.9099490952084743,
       "pre_log_vol_ratio_core": -0.02559532648199614,
@@ -531,5 +531,5 @@
       "d180_qoi_wm_fraction": 0.5918023970053662
     }
   ],
-  "wall_time_s": 107.70299632847309
+  "wall_time_s": 107.01337907463312
 }
