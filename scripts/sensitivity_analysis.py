@@ -95,9 +95,10 @@ growth factors (with --second-order).
 
 Search-space file (JSON, --search-space; default
 fisher_kpp_jax/search_spaces/stupp_fkpp_sigma_v2_search_space.json). It reads like
-a config: "solver" names StuppFKPPSolver (checked against the class the
-script uses), keys starting with '_' are comments and are dropped, every
-other key is either
+a config: "solver" names FKPPSolver (resolved through the solver registry
+and checked against the class the script uses, so a file that names it
+StuppFKPPSolver, the class's former name, still loads), keys starting
+with '_' are comments and are dropped, every other key is either
   - a StuppFKPPSolver parameter other than the derived resection_cavity
     and rt_dose, given as
       - a plain JSON value: a fixed override written into every run config, or
@@ -156,11 +157,11 @@ Three derivations are registered, and each shipped search space uses two:
     seed_enhancing_radius_mm = sigma sqrt(2 ln(c_peak / 0.6)), the
     radius of the seed's region at or above the 0.6 enhancing threshold
     (0 for a peak below it). This is the seed group of
-    stupp_fkpp_search_space.json.
+    stupp_fkpp_search_space.json (deleted 2026-09-29).
   - the same "seed" parameters from seed_peak_density and the width in
     mm itself, seed_sigma_mm (a group whose sub-entries are these two
-    factors; fisher_kpp_jax/search_spaces/stupp_fkpp_sigma_search_space.json,
-    2026-09-13): sampling sigma in mm instead of s decouples the seed
+    factors; fisher_kpp_jax/search_spaces/stupp_fkpp_sigma_search_space.json
+    (deleted 2026-09-29), 2026-09-13): sampling sigma in mm instead of s decouples the seed
     size from the front width, so that the seed-size and the front-width
     sensitivities are separately attributable (with sigma = s lambda the
     seed size carries lambda, and part of its effect lands on
@@ -180,7 +181,8 @@ Three derivations are registered, and each shipped search space uses two:
     implied range of s, [sigma_min / lambda_max, sigma_max / lambda_min],
     and the printed design summary reports it.
 Everything not listed comes from the base config (--config, default
-fisher_kpp_jax/configs/StuppFKPPSolver.json; read with
+fisher_kpp_jax/configs/FKPPSolver_stupp.json, the treated config of the
+isotropic model; read with
 fisher_kpp_jax.read_config so every run config carries absolute volume
 paths), except the tissue maps: --white-matter-pbmap and
 --gray-matter-pbmap (default the BraTS MNI152 atlas maps of PredictGBM,
@@ -536,14 +538,18 @@ from SALib.analyze import sobol as sobol_analyze  # noqa: E402
 from SALib.sample import sobol as sobol_sample  # noqa: E402
 from scipy.ndimage import distance_transform_edt  # noqa: E402
 
-from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, read_config, write_config  # noqa: E402
+from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, read_config, solver_class, write_config  # noqa: E402
 
-SOLVER_NAME = "StuppFKPPSolver"
+# The solver class of both stages. StuppFKPPSolver is its former name as
+# the treated solver; a config or search space naming it still loads.
+SOLVER_NAME = FKPPSolver.__name__
 # The solver of the growth stage (seed to resection_time, no treatment).
 GROWTH_SOLVER_NAME = "FKPPSolver"
 SOLVER_KEY = "solver"
 DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_fkpp_sigma_v2_search_space.json"
-DEFAULT_CONFIG = _ROOT / "fisher_kpp_jax" / "configs" / "StuppFKPPSolver.json"
+# The treated config of the isotropic model, the base config of the sweep,
+# identifiability and patient scripts.
+DEFAULT_CONFIG = _ROOT / "fisher_kpp_jax" / "configs" / "FKPPSolver_stupp.json"
 # The tissue maps every design uses in place of the base config's (the
 # defaults of --white-matter-pbmap / --gray-matter-pbmap): the BraTS
 # MNI152 atlas of PredictGBM, 182 x 218 x 182 at 1 mm.
@@ -1402,6 +1408,18 @@ def _parse_group(name: str, entry: Mapping[str, Any], known: frozenset[str], whe
     return DerivedGroup(name, derivation, factors)
 
 
+def names_solver(entry: Any, solver_name: str = SOLVER_NAME) -> bool:
+    """Whether a "solver" entry names the solver class registered as
+    solver_name. The entry is resolved through the solver registry and the
+    classes are compared, so StuppFKPPSolver, the former name of
+    FKPPSolver that the search spaces copied into completed sweep
+    directories carry, names FKPPSolver; an unregistered name names none."""
+    try:
+        return solver_class(str(entry)) is solver_class(solver_name)
+    except ValueError:
+        return False
+
+
 def load_search_space(
     source: str | Path | Mapping[str, Any],
     config_keys: Iterable[str],
@@ -1415,7 +1433,8 @@ def load_search_space(
         config_keys: The solver's parameter names (``config_keys()``);
             every non-comment key must be one of them or "solver", and
             none may be a derived volume (``DERIVED_VOLUME_KEYS``).
-        solver_name: The class name a "solver" entry must equal.
+        solver_name: The name of the class a "solver" entry must name
+            (``names_solver``).
 
     Returns:
         The search space: the sampled factors in file order (a derived
@@ -1451,7 +1470,7 @@ def load_search_space(
         if key.startswith("_"):
             continue
         if key == SOLVER_KEY:
-            if value != solver_name:
+            if not names_solver(value, solver_name):
                 raise ValueError(f"{where}: names solver {value!r}, not {solver_name}.")
             continue
         if isinstance(value, Mapping) and "derives" in value:
@@ -2278,10 +2297,18 @@ def run_is_done(run_dir: Path) -> bool:
         return False
 
 
-def run_records(run_dir: Path) -> dict[str, Any]:
+def run_records(run_dir: Path, growth_only: bool) -> dict[str, Any]:
     """
     The saved records of one run directory, as far as they exist: the
     fields run_status.csv and qoi.csv carry over.
+
+    Args:
+        run_dir: The run directory.
+        growth_only: The mode the run was made in (``resolve_growth_only``):
+            result.json is the growth stage's record in growth-only mode
+            and the treated stage's otherwise. The solver name it records
+            does not tell the two apart (both stages are FKPPSolver runs)
+            and is carried over without being interpreted.
 
     Returns:
         success (False without a result.json reporting success), error,
@@ -2320,7 +2347,7 @@ def run_records(run_dir: Path) -> dict[str, Any]:
             dt=result.get("dt"),
             wall_time_s=result.get("wall_time_s"),
         )
-        if result.get(SOLVER_KEY) == GROWTH_SOLVER_NAME:  # growth-only: the one stage
+        if growth_only:  # the one stage
             record.update(growth_dt=result.get("dt"), growth_n_steps=result.get("n_steps"))
         else:
             record["treated_dt"] = result.get("dt")
@@ -2399,7 +2426,7 @@ def run_subprocess(
     with open(sweep_dir / "logs" / f"{name}.log", "w", encoding="utf-8") as log:
         code = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
     own = {"run_name": name, "exit_code": code, "wall_time_s": round(time.perf_counter() - start, 3)}
-    saved = run_records(run_dir)
+    saved = run_records(run_dir, growth_only)
     return {key: own[key] if key in own else saved[key] for key in STATUS_COLUMNS}
 
 
@@ -2515,19 +2542,21 @@ def run_sweep(
 
 def growth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """
-    The growth stage's config of a run config: the FKPPSolver entries of
-    the StuppFKPPSolver config (tissue maps, dynamics, seed, grid, time
-    step, stopping settings) with stopping_time = resection_time, so the
-    stage ends at the moment of surgery, and no snapshots (the treated
-    stage's are after resection).
+    The growth stage's config of a run config: the entries of the treated
+    config other than the treatment (tissue maps, dynamics, seed, grid,
+    time step, stopping settings) with stopping_time = resection_time, so
+    the stage ends at the moment of surgery, and no snapshots (the treated
+    stage's are after resection). The treatment parameters and
+    time_after_resection are dropped, so the stage runs with the solver's
+    neutral treatment defaults: an untreated run.
 
     Args:
-        config: A StuppFKPPSolver config (``read_config``).
+        config: A treated FKPPSolver config (``read_config``).
 
     Returns:
-        The FKPPSolver config, "solver" entry included.
+        The untreated FKPPSolver config, "solver" entry included.
     """
-    keys = FKPPSolver.config_keys() - {"stopping_time", "snapshot_times"}
+    keys = FKPPSolver.config_keys() - FKPPSolver.TREATMENT_KEYS - {"stopping_time", "time_after_resection", "snapshot_times"}
     growth: dict[str, Any] = {SOLVER_KEY: GROWTH_SOLVER_NAME}
     growth.update({key: value for key, value in config.items() if key in keys})
     growth["stopping_time"] = float(config["resection_time"])
@@ -2944,6 +2973,7 @@ def qoi_record(
     wm_zooms: Sequence[float],
     tau_core: float,
     tau_edema: float,
+    growth_only: bool = False,
 ) -> dict[str, Any]:
     """
     The qoi.csv record of one run: the design bookkeeping, the carried
@@ -2954,7 +2984,8 @@ def qoi_record(
     end_crt_), of its snapshot fields (NaN, i.e. absent, for a run
     without that file: an older sweep, --no-keep-pre-resection-field or
     growth-only mode; qoi_summary.json counts them). The fields' shape
-    and zooms must match the base config's white-matter map.
+    and zooms must match the base config's white-matter map. growth_only
+    is the sweep's mode, which ``run_records`` needs.
     """
     name = design_record["run_name"]
     run_dir = sweep_dir / "runs" / name
@@ -2965,7 +2996,7 @@ def qoi_record(
         "matrix": design_record["matrix"],
         "success": False,
     }
-    saved = run_records(run_dir)
+    saved = run_records(run_dir, growth_only)
     record.update({key: saved[key] for key in CARRIED_COLUMNS})
     field_path = run_dir / FINAL_FIELD_FILE
     if not saved["success"] or not field_path.is_file():
@@ -3001,18 +3032,21 @@ def _load_field(path: Path, shape: Sequence[int], wm_zooms: Sequence[float]) -> 
     return density, zooms
 
 
-def _qoi_job(job: tuple[str, dict[str, Any], str, float, float]) -> dict[str, Any]:
-    """Worker of ``qoi_table``: (sweep_dir, design record, wm path, taus)."""
-    sweep_dir, design_record, wm_path, tau_core, tau_edema = job
+def _qoi_job(job: tuple[str, dict[str, Any], str, float, float, bool]) -> dict[str, Any]:
+    """Worker of ``qoi_table``: (sweep_dir, design record, wm path, taus,
+    growth-only mode)."""
+    sweep_dir, design_record, wm_path, tau_core, tau_edema, growth_only = job
     wm, zooms = _load_wm(wm_path)
-    return qoi_record(Path(sweep_dir), design_record, wm, zooms, tau_core, tau_edema)
+    return qoi_record(Path(sweep_dir), design_record, wm, zooms, tau_core, tau_edema, growth_only)
 
 
 def qoi_table(
     sweep_dir: str | Path, tau_core: float = TAU_CORE, tau_edema: float = TAU_EDEMA, workers: int = 1
 ) -> list[dict[str, Any]]:
     """
-    The QoIs of every run of a sweep directory, in design order.
+    The QoIs of every run of a sweep directory, in design order. The
+    sweep's mode (two-stage or growth-only), which tells what a run's
+    result.json is, is resolved from spec.json (``resolve_growth_only``).
 
     Args:
         sweep_dir: The sweep directory.
@@ -3026,7 +3060,8 @@ def qoi_table(
     sweep_dir = Path(sweep_dir)
     design = read_csv(sweep_dir / "design.csv")
     wm_path = str(read_json(sweep_dir / "base_config.json")["white_matter_pbmap"])
-    jobs = [(str(sweep_dir), record, wm_path, tau_core, tau_edema) for record in design]
+    growth_only = resolve_growth_only(sweep_dir, read_json(sweep_dir / "spec.json"), False)
+    jobs = [(str(sweep_dir), record, wm_path, tau_core, tau_edema, growth_only) for record in design]
     records: list[dict[str, Any]] = []
     if workers > 1:
         with ProcessPoolExecutor(max_workers=workers) as pool:

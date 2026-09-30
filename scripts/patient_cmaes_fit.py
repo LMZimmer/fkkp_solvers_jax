@@ -76,8 +76,9 @@ the atlas's ``transform_factor``) is a fitted factor, any other entry is a
 fixed value: a solver parameter is written into every run config,
 seed_peak_density is consumed by the seed derivation (it may be a range,
 fitted, or a fixed number, as in the 2026-09-25 file; ``FitSpace.seed_peak``);
-"solver" must be StuppFKPPSolver; the factor order in the file is the
-coordinate order of the unit cube). The factors and the derivations, per
+"solver" must name FKPPSolver (StuppFKPPSolver, its former name, is
+accepted); the factor order in the file is the coordinate order of the
+unit cube). The factors and the derivations, per
 evaluation (``FitProblem.derive``):
   growth        white_matter_diffusivity = v lambda / 2 and rho = v / (2 lambda)
                 from v = front_speed_mm_per_day and lambda = front_width_mm
@@ -116,7 +117,7 @@ rt_alpha_beta_ratio 8 Gy and diffusivity_ratio 10, which the SA found
 inert on the agreement QoIs; chemo_decay_rate 9.24
 (confounded with chemo_kill_rate); gaussian_seed_scale 1. Everything else
 comes from the base config (--config, default
-fisher_kpp_jax/configs/StuppFKPPSolver.json) with the patient's tissue
+fisher_kpp_jax/configs/FKPPSolver_stupp.json) with the patient's tissue
 maps, resection_cavity (the post-op session's label 4) and rt_dose set as
 the SA's ``run_config`` sets them (its signature takes a SearchSpace, so
 the assembly is repeated here with the same keys, ``FitProblem.config_of``).
@@ -459,6 +460,7 @@ from sensitivity_analysis import (  # noqa: E402
     _parse_parameter,
     as_float,
     growth_parameters,
+    names_solver,
     read_csv,
     read_json,
     round_field,
@@ -874,7 +876,7 @@ def read_fit_search_space(path: str | Path) -> FitSpace:
     where = f"search space {path}"
     if not isinstance(entries, Mapping):
         raise ValueError(f"{where}: must be a JSON object.")
-    if entries.get(SOLVER_KEY) != SOLVER_NAME:
+    if not names_solver(entries.get(SOLVER_KEY), SOLVER_NAME):
         raise ValueError(f"{where}: {SOLVER_KEY!r} must be {SOLVER_NAME!r}, got {entries.get(SOLVER_KEY)!r}.")
     solver_keys = StuppFKPPSolver.config_keys()
     factors: dict[str, SearchSpaceParameter] = {}
@@ -1231,10 +1233,11 @@ def n_steps_count(steps_per_day: float, preop_time_max: float, horizon_offset: f
 
 
 def resolved_constants(base: Mapping[str, Any], space: FitSpace) -> dict[str, float]:
-    """The CONSTANT_KEYS as the solver resolves them: the class default
-    config, the base config, the search space's overrides (no solver is
-    built; the design-time check confirms the values)."""
-    merged = {**StuppFKPPSolver.get_default_config(), **base, **space.overrides}
+    """The CONSTANT_KEYS as the solver resolves them: the treated default
+    config (``DEFAULT_CONFIG``, read by path), the base config, the search
+    space's overrides (no solver is built; the design-time check confirms
+    the values)."""
+    merged = {**read_config(DEFAULT_CONFIG), **base, **space.overrides}
     missing = [key for key in CONSTANT_KEYS if merged.get(key) is None]
     if missing:
         raise ValueError(f"the base config resolves no value for {missing}.")

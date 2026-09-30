@@ -63,7 +63,7 @@ carrying 2 Gy times the 30 fractions, 60 Gy in total; --cavity-threshold,
 fixed as data of every run compared with that truth. The tissue maps are
 the script's default atlas (--white-matter-pbmap, --gray-matter-pbmap:
 the BraTS MNI152 maps of PredictGBM, 182 x 218 x 182 at 1 mm). The base
-config is the script's default, fisher_kpp_jax/configs/StuppFKPPSolver.json
+config is the script's default, fisher_kpp_jax/configs/FKPPSolver_stupp.json
 (--config), whose resection_cavity and rt_dose must be null and which
 must set a time step (the fixed mode's, see Time step below); the
 design sets its precision to f64, its

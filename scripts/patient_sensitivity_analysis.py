@@ -83,7 +83,7 @@ the shifted rt_times, chemo_times (with chemo_doses) and
             total of about 60 Gy, RT_TOTAL_DOSE_PLAUSIBLE_GY)
   white_matter_pbmap / gray_matter_pbmap = the patient's maps
 and everything else from the base config (--config, default
-fisher_kpp_jax/configs/StuppFKPPSolver.json: steps_per_day 12 among
+fisher_kpp_jax/configs/FKPPSolver_stupp.json: steps_per_day 12 among
 it; the design step refuses a config without a time-step entry as the
 atlas script does). Snapshots: the session snapshot is the state at the
 start of the scan day, before any event of that day fires: run-one
@@ -278,7 +278,7 @@ import numpy as np  # noqa: E402
 from numpy.typing import NDArray  # noqa: E402
 from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure  # noqa: E402
 
-from fisher_kpp_jax import StuppFKPPSolver, read_config, write_config  # noqa: E402
+from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, read_config, write_config  # noqa: E402
 from sensitivity_analysis import (  # noqa: E402
     DEFAULT_BOOTSTRAP_SEED,
     DEFAULT_CONFIG,
@@ -325,7 +325,9 @@ from sensitivity_analysis import (  # noqa: E402
     write_json,
 )
 
-SOLVER_NAME = "StuppFKPPSolver"
+# StuppFKPPSolver is the former name of FKPPSolver as the treated solver; a
+# config or search space naming it still loads.
+SOLVER_NAME = FKPPSolver.__name__
 DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_v2_search_space.json"
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_patient")
 DEFAULT_PATIENT = "sub-01"
@@ -1750,7 +1752,7 @@ def run_subprocess(sweep_dir: Path, name: str, gpu: str | None, snapshots: Mappi
     with open(sweep_dir / "logs" / f"{name}.log", "w", encoding="utf-8") as log:
         code = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
     own = {"run_name": name, "exit_code": code, "wall_time_s": round(time.perf_counter() - start, 3)}
-    saved = run_records(run_dir)
+    saved = run_records(run_dir, False)  # a patient run is always treated
     return {key: own[key] if key in own else saved.get(key) for key in STATUS_COLUMNS}
 
 
@@ -2181,7 +2183,7 @@ def run_qoi_records(
             in order.
     """
     run_dir = sweep_dir / "runs" / run_name
-    saved = run_records(run_dir)
+    saved = run_records(run_dir, False)  # a patient run is always treated
     records: list[dict[str, Any]] = []
     for row in rows:
         record: dict[str, Any] = {

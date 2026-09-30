@@ -2,7 +2,7 @@
 
 Written 2026-09-17, revised 2026-09-29 after review, implemented from
 2026-09-30 on in the order of section 7, which marks each step when it is
-committed: steps 0 to 6 are done. Section 10 records what the
+committed: steps 0 to 7 are done. Section 10 records what the
 implementation added to the plan or does differently. The plan records the
 design agreed for `fisher_kpp_jax` and the order in which to build it. Work
 happens on branch `stupp_all`.
@@ -512,7 +512,7 @@ arises only from an exception or from the non-finite check.
 6. Done 2026-09-30: `configs/` and `search_spaces/`: the three class configs; the rename
    to `FKPPSolver_stupp.json` and its notes; the solver entry of the four
    live search spaces; delete the three first versions.
-7. `scripts/`: `DEFAULT_CONFIG` and the docstrings naming the file;
+7. Done 2026-09-30: `scripts/`: `DEFAULT_CONFIG` and the docstrings naming the file;
    `growth_config`; `run_records` and its callers; `resolved_constants`;
    the class check of `load_search_space` and of the fit loader;
    `SOLVER_NAME`; docstring corrections.
@@ -613,3 +613,10 @@ Model-specific:
   `fisher_kpp_jax/configs/StuppFKPPSolver.json` (now
   `FKPPSolver_stupp.json`) and `StuppFKPPSolver`. Open: whether to update
   those mentions.
+- **Step 7.** `sensitivity_analysis.names_solver(entry, solver_name)` is
+  the class check of `load_search_space` and of the fit script's loader.
+  `qoi_record` takes the mode as `growth_only=False`; `qoi_table` resolves
+  it with `resolve_growth_only`, which, as in a run pass, records
+  `growth_only: false` in the `spec.json` of a design older than that
+  entry. The scripts keep addressing the class as `StuppFKPPSolver`
+  (the alias); only the statements listed in section 5 changed.
