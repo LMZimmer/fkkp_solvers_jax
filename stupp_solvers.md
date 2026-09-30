@@ -609,11 +609,14 @@ Model-specific:
   returns the class's own name in the "solver" entry, also for a file that
   names the class by its former name.
 - **Step 6.** Each class config also gained a `_treatment` comment entry.
-  In the four live search spaces only the "solver" entry and the
-  "(deleted 2026-09-29)" marks changed: their comment entries still name
-  `fisher_kpp_jax/configs/StuppFKPPSolver.json` (now
-  `FKPPSolver_stupp.json`) and `StuppFKPPSolver`. Open: whether to update
-  those mentions.
+  In the four live search spaces the "solver" entry and the
+  "(deleted 2026-09-29)" marks changed, and, in a follow-up of 2026-09-30
+  asked for after the review of step 8, the comment entries of three of
+  them (`sailor_patient_fit`, `sailor_patient_v2`, `stupp_fkpp_sigma_v2`)
+  name `fisher_kpp_jax/configs/FKPPSolver_stupp.json` and `FKPPSolver`
+  where they named `configs/StuppFKPPSolver.json` and `StuppFKPPSolver`
+  (eleven mentions; no value changed). No shipped config or search space
+  carries the former name any more.
 - **Step 7.** `sensitivity_analysis.names_solver(entry, solver_name)` is
   the class check of `load_search_space` and of the fit script's loader.
   `qoi_record` takes the mode as `growth_only=False`; `qoi_table` resolves
