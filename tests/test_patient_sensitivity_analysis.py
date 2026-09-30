@@ -15,9 +15,8 @@ thresholds and the row thresholds on a synthetic field, (5) the
 cheap-factor dedup (N (k_dyn + 2) distinct solves, every row mapped to a
 run of equal dynamics) and edema_threshold < core_threshold on every
 sampled row, (6) the shipped search space in both modes (factor order,
-cheap factors, the refusal of timeline keys, the v1 space's shared ranges
-equal to sigma_v2's, the v2 space differing from v1 in exactly its three
-widened ranges, the script's defaults) and the snapshot-day rule.
+cheap factors, the refusal of timeline keys, the three ranges v2 widened,
+the script's defaults) and the snapshot-day rule.
 """
 
 from __future__ import annotations
@@ -34,12 +33,10 @@ import pytest
 from fisher_kpp_jax import StuppFKPPSolver, read_config
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "patient_sensitivity_analysis.py"
-# The script's default (v2, 2026-09-17) and its predecessor (v1, 2026-09-15).
+# The script's default (v2, 2026-09-17).
 SEARCH_SPACE = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_v2_search_space.json"
-SEARCH_SPACE_V1 = SEARCH_SPACE.with_name("sailor_patient_search_space.json")
-BASE_CONFIG = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "configs" / "StuppFKPPSolver.json"
-SIGMA_V2_SEARCH_SPACE = SEARCH_SPACE.with_name("stupp_fkpp_sigma_v2_search_space.json")
-# The entries v2 changes against v1 (patient-fit priors widened toward non-response).
+BASE_CONFIG = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "configs" / "FKPPSolver_stupp.json"
+# The ranges v2 widened against its predecessor (patient-fit priors widened toward non-response).
 V2_CHANGES = {
     "growth.front_width_mm": {"min": 1.0, "max": 8.0, "scale": "log"},
     "chemo_kill_rate": {"min": 5.0e-5, "max": 1.0e-2, "scale": "log"},
@@ -472,28 +469,6 @@ def test_search_space_modes():
         psa.read_patient_search_space(SEARCH_SPACE, "fixed")
 
 
-def test_shared_ranges_equal_sigma_v2():
-    """Every range and scale the v1 patient space shares with the sigma_v2
-    atlas space (growth, seed, diffusivity_ratio, chemo_kill_rate,
-    chemo_decay_rate, rt_alpha, rt_alpha_beta_ratio, the seed fractions,
-    gaussian_seed_scale) equals it; preop_time stands in for
-    resection_time with its range, and only the threshold factors are
-    the patient space's own. This documents the sigma_v2 alignment of v1
-    (2026-09-15); v2 departs from it in three ranges (below)."""
-    patient = {k: v for k, v in json.loads(SEARCH_SPACE_V1.read_text()).items() if not k.startswith("_")}
-    atlas = {k: v for k, v in json.loads(SIGMA_V2_SEARCH_SPACE.read_text()).items() if not k.startswith("_")}
-    shared = set(patient) & set(atlas)
-    assert shared == set(atlas) - {"resection_time", "time_after_resection"}
-    for key in shared:
-        assert patient[key] == atlas[key], key
-    assert patient["preop_time"] == atlas["resection_time"]
-    assert set(patient) - shared == {"preop_time", "core_threshold", "edema_threshold_ratio"}
-    space, _ = psa.read_patient_search_space(SEARCH_SPACE_V1, "sampled")
-    assert space.factors["front_width_mm"].high == 4.0 and space.factors["seed_sigma_mm"].low == 5.0
-    assert space.factors["chemo_kill_rate"].low == 1e-3 and space.factors["chemo_kill_rate"].high == 3.5e-2
-    assert space.factors["rt_alpha"].low == 1e-3 and space.factors["rt_alpha"].high == 0.2
-
-
 def _flat_entries(path: Path) -> dict[str, object]:
     """The non-comment entries of a search-space file with the derived
     groups' sub-entries flattened to '<group>.<factor>' (their 'derives'
@@ -510,25 +485,14 @@ def _flat_entries(path: Path) -> dict[str, object]:
     return flat
 
 
-def test_v2_differs_from_v1_in_three_ranges():
-    """The v2 space (the script's default) equals v1 in every non-comment
-    entry except rt_alpha, chemo_kill_rate and growth.front_width_mm, whose
-    ranges are V2_CHANGES; the loader sees the same factors in the same
-    order, and the parser's default search space is the v2 file."""
-    v1, v2 = _flat_entries(SEARCH_SPACE_V1), _flat_entries(SEARCH_SPACE)
-    assert set(v1) == set(v2)
-    changed = {key for key in v1 if v1[key] != v2[key]}
-    assert changed == set(V2_CHANGES)
+def test_v2_widened_ranges():
+    """The v2 space (the script's default) holds the three ranges it
+    widened, V2_CHANGES (rt_alpha, chemo_kill_rate and
+    growth.front_width_mm, log-scaled), and the parser's default search
+    space is the v2 file."""
+    v2 = _flat_entries(SEARCH_SPACE)
     for key, entry in V2_CHANGES.items():
-        assert v2[key] == entry, key
-        assert v1[key]["scale"] == entry["scale"] == "log", key
-    for key in set(v1) - changed:
-        assert v1[key] == v2[key], key
-    for mode in ("profiled", "sampled"):
-        space_v1, meta_v1 = psa.read_patient_search_space(SEARCH_SPACE_V1, mode)
-        space_v2, meta_v2 = psa.read_patient_search_space(SEARCH_SPACE, mode)
-        assert space_v1.names == space_v2.names and meta_v1["cheap_factors"] == meta_v2["cheap_factors"]
-        assert space_v2.overrides == space_v1.overrides
+        assert v2[key] == entry and entry["scale"] == "log", key
     space, _ = psa.read_patient_search_space(SEARCH_SPACE, "sampled")
     assert (space.factors["rt_alpha"].low, space.factors["rt_alpha"].high) == (5e-4, 0.1)
     assert (space.factors["chemo_kill_rate"].low, space.factors["chemo_kill_rate"].high) == (5e-5, 1e-2)

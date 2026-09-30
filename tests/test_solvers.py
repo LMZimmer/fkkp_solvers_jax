@@ -213,17 +213,6 @@ def test_n_steps_override(tissue_phantom):
     assert abs(n_taken - round(n_taken)) < 1e-9
 
 
-def test_dti_guard_exit(tensor_phantom):
-    """A shrinking tumor (negative rho) fires a DTI guard: success=False,
-    stopping_criterion='error', final_time at the actual exit step."""
-    params = dti_params(tensor_phantom, rho=-1.0, stopping_time=40)
-    result = AnisotropicFKPPSolver(params).solve()
-    assert result.success is False
-    assert result.stopping_criterion == "error"
-    assert result.error is not None and "guard fired" in result.error
-    assert 0.0 < result.final_time < 40.0
-
-
 def test_time_series_recording(tissue_phantom):
     """All requested snapshot days are recorded on a full run, each at the
     nearest step end (within half a step), and the one at the horizon equals

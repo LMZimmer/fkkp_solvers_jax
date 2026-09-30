@@ -2,10 +2,11 @@
 
 Written 2026-09-17, revised 2026-09-29 after review, implemented from
 2026-09-30 on in the order of section 7, which marks each step when it is
-committed: steps 0 to 7 are done. Section 10 records what the
-implementation added to the plan or does differently. The plan records the
-design agreed for `fisher_kpp_jax` and the order in which to build it. Work
-happens on branch `stupp_all`.
+committed: steps 0 to 8 are done, step 9 (the reference solves and the
+final confirmation) is open. Section 10 records what the implementation
+added to the plan or does differently. The plan records the design agreed
+for `fisher_kpp_jax` and the order in which to build it. Work happens on
+branch `stupp_all`.
 
 ## 1. Goal and decisions
 
@@ -516,7 +517,7 @@ arises only from an exception or from the non-finite check.
    `growth_config`; `run_records` and its callers; `resolved_constants`;
    the class check of `load_search_space` and of the fit loader;
    `SOLVER_NAME`; docstring corrections.
-8. `tests/`: the adaptations listed in section 5.
+8. Done 2026-09-30: `tests/`: the adaptations listed in section 5.
 9. Open. Run `scripts/run_reference_solves.py --solvers all` and the test
    suite; confirm the isotropic agreement is unchanged, the two-compartment
    fields match the stored reference, and a config from a completed sweep
@@ -620,3 +621,34 @@ Model-specific:
   `growth_only: false` in the `spec.json` of a design older than that
   entry. The scripts keep addressing the class as `StuppFKPPSolver`
   (the alias); only the statements listed in section 5 changed.
+- **Step 8.** Adaptations beyond the list of section 5, each forced by
+  the change: `tests/test_stupp.py`: `read_config` of a file naming
+  `StuppFKPPSolver` returns "FKPPSolver" (two expected dicts),
+  `stopping_time` is a key of every config (`solver.config` holds it as
+  null; the "unknown key" case became a positive one), `None` is no longer
+  a wrong value for `rt_alpha_beta_ratio` or `rt_alpha` (the config
+  mistake checked is a negative `rt_alpha`), a non-empty cavity with an
+  infinite `resection_time` raises. `tests/test_config.py`: the mismatch
+  case of `read_config(path, solver=...)` uses the two-compartment class.
+  `tests/test_sensitivity_analysis.py`: the mismatching-solver case of
+  `load_search_space` uses the two-compartment class; with the shipped
+  fixture now the sigma v2 file, the expectations of
+  `test_load_search_space` and `test_design_bookkeeping` are those of that
+  file (seed_sigma_mm 5-16 mm, front width 1-4 mm, extras
+  seed_enhancing_radius_mm and s, the kill-rate range 1e-3-3.5e-2);
+  `test_load_sigma_search_space` went with its file, including its check
+  that the base config lies inside the ranges.
+  `tests/test_patient_sensitivity_analysis.py`: the v2-only part of the
+  v1-versus-v2 test is kept as `test_v2_widened_ranges`.
+- Test suite after step 8 (2026-09-30, on a GPU and with JAX_PLATFORMS=cpu):
+  153 passed (157 before the
+  change: four cases deleted with the guard, the deleted search spaces and
+  the `StuppFKPPSolver` default config).
+- The treated two-compartment and anisotropic paths have no case in the
+  test suite (none was planned). Checked once by hand on the phantoms,
+  f64: neutral values compile no new program and equal the untreated run
+  bit for bit; radiotherapy and chemotherapy closed forms for the P + N
+  mass; all three two-compartment fields empty in the cavity, P mass and
+  nutrient outside the cavity conserved after the resection; the
+  anisotropic cavity empty and isolated; a fully resected anisotropic
+  tumor and a decaying one (rho < 0) complete with "time".

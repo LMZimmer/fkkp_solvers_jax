@@ -33,14 +33,13 @@ from fisher_kpp_jax import (
     solver_class,
     write_config,
 )
-from fisher_kpp_jax.base import DEFAULT_CONFIG_DIR, TIME_STEP_KEYS, n_steps_from_dt
+from fisher_kpp_jax.base import DEFAULT_CONFIG_DIR, HORIZON_KEYS, TIME_STEP_KEYS, n_steps_from_dt
 from fisher_kpp_jax.config import jsonable
 
 SOLVERS = [
     FKPPSolver,
     TwoCompartmentWithNutrientFKPPSolver,
     AnisotropicFKPPSolver,
-    StuppFKPPSolver,
 ]
 
 _COMMON = dict(
@@ -102,43 +101,52 @@ def phantom_paths(tmp_path: Path, tissue_phantom) -> dict[str, str]:
 # The entries with class defaults that a default config must keep at the
 # default: the structural and solver-behaviour entries (volume paths, the
 # grid, the snapshots, the stopping settings, the tissue and seed
-# thresholds, the state dtype, logging, the tensor model switch). The
-# time-step keys are exempt (a default config may set one of them). Every
+# thresholds, the state dtype, logging, the tensor model switch) and the
+# treatment entries whose default is what makes the config untreated (no
+# resection, no cavity, no session, no kill rate, no fraction, no dose, no
+# radiosensitivity). The time-step keys are exempt (a default config may
+# set one of them), and so is the horizon pair stopping_time /
+# time_after_resection (a default config sets one of the two). Every
 # other defaulted entry is a physical parameter (dynamics, seed shape,
 # treatment response, tensor model) that a default config may set to a
-# value of its own, e.g. StuppFKPPSolver.json to the medians of the
-# sensitivity search space.
+# value of its own.
 PINNED_DEFAULT_KEYS = frozenset({
     "gray_matter_pbmap", "white_matter_pbmap", "voxel_size_mm", "snapshot_times",
-    "stopping_time", "stopping_threshold", "stopping_mode", "volume_threshold",
+    "stopping_threshold", "stopping_mode", "volume_threshold",
     "min_tissue_fraction", "gaussian_seed_floor", "precision", "verbose", "uniform_gray_matter",
+    "resection_time", "resection_cavity", "rt_dose", "chemo_times", "chemo_doses", "chemo_kill_rate",
+    "rt_times", "rt_alpha",
 })
 PHYSICAL_DEFAULT_KEYS = frozenset({
     "diffusivity_ratio", "gaussian_seed_scale", "gaussian_seed_diffusion_time", "gaussian_seed_mass",
-    "rt_alpha_beta_ratio", "diffusivity_lower_limit", "diffusivity_upper_limit", "ellipsoid_scaling",
-    "normalization_std", "tensor_exponent", "tensor_linear_term", "max_tumor_occupancy", "nt_multiplier",
+    "chemo_decay_rate", "rt_alpha_beta_ratio", "diffusivity_lower_limit", "diffusivity_upper_limit",
+    "ellipsoid_scaling", "normalization_std", "tensor_exponent", "tensor_linear_term",
+    "max_tumor_occupancy", "nt_multiplier",
 })
 
 
 @pytest.mark.parametrize("cls", SOLVERS, ids=[cls.__name__ for cls in SOLVERS])
 def test_default_config_file(cls):
-    """Every parameter is defined; the structural entries with class
-    defaults (PINNED_DEFAULT_KEYS) equal the defaults, the time step
-    excepted (a default config may set one of the three time-step keys:
-    StuppFKPPSolver.json sets steps_per_day 12 for the sensitivity
-    analysis), while the physical parameters (PHYSICAL_DEFAULT_KEYS) may
-    differ from them; every defaulted key is classified as one or the
+    """Every parameter is defined; the structural and the neutral
+    treatment entries with class defaults (PINNED_DEFAULT_KEYS) equal the
+    defaults, the time step and the horizon excepted (a default config
+    may set one of the three time-step keys and sets one of the two
+    horizon keys), while the physical parameters (PHYSICAL_DEFAULT_KEYS)
+    may differ from them; every defaulted key is classified as one or the
     other; the volume paths are absolute and point to existing files (or
     are null); and the class is registered under its name."""
     config = cls.get_default_config()
     assert config[SOLVER_KEY] == cls.__name__
     assert set(config) - {SOLVER_KEY} == cls.config_keys()
-    unclassified = set(cls._DEFAULTS) - PINNED_DEFAULT_KEYS - PHYSICAL_DEFAULT_KEYS - set(TIME_STEP_KEYS)
+    unclassified = (
+        set(cls._DEFAULTS) - PINNED_DEFAULT_KEYS - PHYSICAL_DEFAULT_KEYS - set(TIME_STEP_KEYS) - set(HORIZON_KEYS)
+    )
     assert not unclassified, unclassified
     for key, default in cls._DEFAULTS.items():
         if key in PINNED_DEFAULT_KEYS:
             assert jsonable(config[key]) == jsonable(default), key
     assert sum(config[key] is not None for key in TIME_STEP_KEYS) <= 1
+    assert sum(config[key] is not None for key in HORIZON_KEYS) <= 1
     for key in cls._VOLUME_KEYS:
         value = config[key]
         if value is not None:
@@ -168,18 +176,27 @@ def test_default_config_runs(cls):
     assert result.derived == {"voxel_size_mm": (1.0, 1.0, 1.0)}
 
 
-@pytest.mark.parametrize(
-    "cls,key",
-    [(AnisotropicFKPPSolver, "diffusion_tensors"), (StuppFKPPSolver, "resection_cavity")],
-    ids=["AnisotropicFKPPSolver", "StuppFKPPSolver"],
-)
-def test_blank_default_config_fails_at_construction(cls, key):
+def test_blank_default_config_fails_at_construction():
     """A default config whose example volume is not available yet holds
     null there; constructing from it fails naming the parameter."""
-    config = cls.get_default_config()
-    assert config[key] is None
-    with pytest.raises(ValueError, match=key):
-        cls(config)
+    config = AnisotropicFKPPSolver.get_default_config()
+    assert config["diffusion_tensors"] is None
+    with pytest.raises(ValueError, match="diffusion_tensors"):
+        AnisotropicFKPPSolver(config)
+
+
+def test_treated_config_constructs():
+    """configs/FKPPSolver_stupp.json, the treated config of the isotropic
+    model (not a class default), loads by path, names FKPPSolver and, its
+    cavity and dose being null, constructs; its horizon is resection_time
+    + time_after_resection."""
+    config = read_config(DEFAULT_CONFIG_DIR / "FKPPSolver_stupp.json")
+    assert config[SOLVER_KEY] == "FKPPSolver"
+    assert json.loads((DEFAULT_CONFIG_DIR / "FKPPSolver_stupp.json").read_text())[SOLVER_KEY] == "FKPPSolver"
+    assert config["resection_cavity"] is None and config["rt_dose"] is None
+    assert set(config) - {SOLVER_KEY} <= FKPPSolver.config_keys()
+    solver = FKPPSolver(config)
+    assert solver.params["stopping_time"] == config["resection_time"] + config["time_after_resection"] == 360.0
 
 
 # --- construction and the recorded config ---
@@ -375,7 +392,9 @@ def test_read_write_config(tmp_path, tissue_phantom, phantom_paths):
     with pytest.raises(ValueError, match="no 'solver' entry"):
         read_config(bare)
     with pytest.raises(ValueError, match="names solver 'FKPPSolver', not"):
-        read_config(path, solver=StuppFKPPSolver)
+        read_config(path, solver=TwoCompartmentWithNutrientFKPPSolver)
+    # StuppFKPPSolver is a former name of FKPPSolver, not another class.
+    assert read_config(path, solver=StuppFKPPSolver) == config
     with pytest.raises(FileNotFoundError, match="config not found"):
         read_config(tmp_path / "missing.json")
     (tmp_path / "list.json").write_text("[1, 2]")

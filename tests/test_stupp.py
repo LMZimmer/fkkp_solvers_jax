@@ -1,16 +1,21 @@
-"""Behavior tests of the treatment-extended ``StuppFKPPSolver`` and its
-config entries, self-contained.
+"""Behavior tests of the treatments built into the solvers (resection,
+chemotherapy, radiotherapy) on the isotropic model and of their config
+entries, self-contained. The solver is addressed as ``StuppFKPPSolver``,
+the former name of ``FKPPSolver``, and the configs written here name it
+so, which covers the alias.
 
-Short f64 solves on the 24^3 tissue phantom checking (a) that the solver
-reduces to ``FKPPSolver`` with neutral treatment values (every treatment
-parameter is required; ``neutral_treatment_params`` switches the three
-treatments off through their values), (b) closed forms of the three
+Short f64 solves on the 24^3 tissue phantom checking (a) that a run with
+neutral treatment values is the untreated ``FKPPSolver`` run exactly
+(every treatment parameter has a neutral default;
+``neutral_treatment_params`` switches the three treatments off through
+their values), (b) closed forms of the three
 treatment effects in limits where they decouple from growth/diffusion (RT
 impulse under mass-conserving diffusion, the exact chemotherapy exposure
 without growth and diffusion, resection projection and cavity isolation),
 (c) the jit-cache and precision
-behavior, (d) parameter validation and (e) the JSON config with the
-treatment volumes as NIfTI paths (the cavity as a labelled segmentation).
+behavior, (d) parameter validation with the horizon rule and (e) the JSON
+config with the treatment volumes as NIfTI paths (the cavity as a labelled
+segmentation).
 """
 
 from __future__ import annotations
@@ -26,12 +31,15 @@ from loguru import logger
 
 from fisher_kpp_jax import (
     SOLVER_KEY,
+    AnisotropicFKPPSolver,
     FKPPSolver,
     StuppFKPPSolver,
+    TwoCompartmentWithNutrientFKPPSolver,
     operators,
     read_config,
     write_config,
 )
+from fisher_kpp_jax.base import HORIZON_KEYS
 
 _COMMON = dict(
     gaussian_seed_x_fraction=0.5,
@@ -120,32 +128,27 @@ def lowres_seed_mass(solver: StuppFKPPSolver) -> float:
 
 
 def test_neutral_treatment_equals_fkpp(tissue_phantom):
-    """With every treatment switched off by its values the solver
-    reproduces FKPPSolver: the same step count and final time, and the same
-    fields up to rounding (the zero-valued treatment terms are still
-    evaluated, so the compiled arithmetic is not identical; the observed
-    difference is ~1e-16 relative)."""
+    """With every treatment switched off by its values the run is the
+    untreated run exactly: the solver compiles the untreated program, so
+    the neutral solve traces nothing once that program is cached
+    (operators.SCAN_TRACE_COUNT is a trace-time counter), and the step
+    count, the final time, the stopping quantity and every field and
+    snapshot are equal bit for bit."""
     gm, wm = tissue_phantom
     params = base_params(gm, wm, snapshot_times=[3.0, 6.0, 10.0])
     untreated = {k: v for k, v in params.items() if k not in neutral_treatment_params(gm.shape)}
     reference = FKPPSolver({**untreated, "stopping_time": HORIZON}).solve()
+    traces = operators.SCAN_TRACE_COUNT
     result = StuppFKPPSolver(params).solve()
+    assert operators.SCAN_TRACE_COUNT == traces
     assert reference.success and result.success, (reference.error, result.error)
-    assert result.final_time == reference.final_time
-    np.testing.assert_allclose(
-        result.final_stopping_quantity, reference.final_stopping_quantity, rtol=1e-13
+    assert result.n_steps == reference.n_steps and result.final_time == reference.final_time
+    assert result.final_stopping_quantity == reference.final_stopping_quantity
+    np.testing.assert_array_equal(
+        result.final_state["cell_density"], reference.final_state["cell_density"]
     )
-    np.testing.assert_allclose(
-        result.final_state["cell_density"],
-        reference.final_state["cell_density"],
-        rtol=0,
-        atol=1e-14,
-    )
-    np.testing.assert_allclose(
-        result.time_series["cell_density"],
-        reference.time_series["cell_density"],
-        rtol=0,
-        atol=1e-14,
+    np.testing.assert_array_equal(
+        result.time_series["cell_density"], reference.time_series["cell_density"]
     )
 
 
@@ -466,17 +469,22 @@ def test_validation_errors(tissue_phantom):
         return StuppFKPPSolver(base_params(gm, wm, **treatment))
 
     build(**full)  # the complete set is accepted
-    # Every treatment parameter is required; None is not a way to disable one.
-    for key in ("resection_cavity", "chemo_decay_rate", "rt_alpha"):
-        with pytest.raises(KeyError, match=key):
-            StuppFKPPSolver({k: v for k, v in base_params(gm, wm).items() if k != key})
-        with pytest.raises(ValueError, match=key):
-            build(**{**full, key: None})
-    # ...except the alpha/beta ratio, which defaults to 10 Gy and must be a
-    # positive finite scalar (it divides rt_alpha).
+    # No treatment parameter is required: omitting one, or giving None,
+    # yields its neutral value (None itself for the two volumes).
+    for key, neutral in (("resection_cavity", None), ("chemo_decay_rate", 9.24), ("rt_alpha", 0.0)):
+        omitted = StuppFKPPSolver({k: v for k, v in base_params(gm, wm, **full).items() if k != key})
+        given_none = build(**{**full, key: None})
+        for solver in (omitted, given_none):
+            if neutral is None:
+                assert solver.params[key] is None
+            else:
+                assert solver.params[key] == neutral
+    # The alpha/beta ratio defaults to 10 Gy and must be a positive finite
+    # scalar (it divides rt_alpha).
     without_ratio = {k: v for k, v in base_params(gm, wm, **full).items() if k != "rt_alpha_beta_ratio"}
     assert StuppFKPPSolver(without_ratio).params["rt_alpha_beta_ratio"] == 10.0
-    for bad in (None, 0.0, -8.0, np.inf, np.nan, [8.0]):
+    assert build(**{**full, "rt_alpha_beta_ratio": None}).params["rt_alpha_beta_ratio"] == 10.0
+    for bad in (0.0, -8.0, np.inf, np.nan, [8.0]):
         with pytest.raises(ValueError, match="rt_alpha_beta_ratio"):
             build(**{**full, "rt_alpha_beta_ratio": bad})
     # rt_beta is not a parameter any more.
@@ -499,8 +507,17 @@ def test_validation_errors(tissue_phantom):
         build(**{**full, "chemo_times": np.array([-1.0, 2.0])})
     with pytest.raises(ValueError, match="rt_times"):
         build(**{**full, "rt_times": np.array([np.inf])})
-    with pytest.raises(ValueError, match="at least one"):
-        build(**{**full, "rt_times": np.array([])})
+    # An empty rt_times is accepted: no fraction, a zero log kill. Without
+    # growth and the other treatments the dose map then leaves the mass
+    # untouched.
+    no_fraction = build(
+        **{**full, "rt_times": np.array([]), "resection_cavity": None, "chemo_kill_rate": 0.0, "rho": 0.0}
+    )
+    unirradiated = no_fraction.solve()
+    assert unirradiated.success, unirradiated.error
+    np.testing.assert_allclose(
+        unirradiated.final_stopping_quantity, lowres_seed_mass(no_fraction), rtol=1e-12
+    )
     with pytest.raises(ValueError, match="chemo_kill_rate"):
         build(**{**full, "chemo_kill_rate": -0.1})
     # Chemo doses: one finite nonnegative dose per session.
@@ -526,11 +543,24 @@ def test_validation_errors(tissue_phantom):
         build(**{**full, "time_after_resection": -1.0})
     with pytest.raises(ValueError, match="unknown"):
         build(**{**full, "rt_gamma": 1.0})
-    # The horizon is time_after_resection only; stopping_time is not accepted.
-    with pytest.raises(ValueError, match="stopping_time"):
+    # An infinite resection_time (no resection) is accepted with the
+    # horizon given as stopping_time; time_after_resection and a non-empty
+    # cavity both need a finite one.
+    never = {**full, "resection_time": np.inf, "time_after_resection": None, "stopping_time": HORIZON}
+    assert build(**{**never, "resection_cavity": None}).params["stopping_time"] == HORIZON
+    build(**{**never, "resection_cavity": np.zeros(gm.shape, dtype=bool)})
+    with pytest.raises(ValueError, match="requires a finite resection_time"):
+        build(**never)
+    with pytest.raises(ValueError, match="time_after_resection needs a finite resection_time"):
+        build(**{**full, "resection_time": np.inf, "resection_cavity": None})
+    # The horizon: at most one of stopping_time and time_after_resection;
+    # the latter counts from resection_time, and neither gives 100 days.
+    with pytest.raises(ValueError, match="at most one of .*stopping_time"):
         build(**{**full, "stopping_time": 10.0})
     solver = build(**full)
     assert solver.params["stopping_time"] == full["resection_time"] + full["time_after_resection"]
+    assert build(**{**full, "time_after_resection": None, "stopping_time": 7.0}).params["stopping_time"] == 7.0
+    assert build(**{**full, "time_after_resection": None}).params["stopping_time"] == 100
 
 
 # --- configs ---
@@ -559,11 +589,17 @@ def config_dir(tmp_path: Path) -> tuple[Path, np.ndarray, np.ndarray]:
 
 
 def test_treatment_keys():
-    """TREATMENT_KEYS are exactly the parameters FKPPSolver does not have
-    (besides time_after_resection), so dropping them gives an FKPPSolver run."""
-    stupp = StuppFKPPSolver._REQUIRED | set(StuppFKPPSolver._DEFAULTS)
-    fkpp = FKPPSolver._REQUIRED | set(FKPPSolver._DEFAULTS)
-    assert StuppFKPPSolver.TREATMENT_KEYS == stupp - fkpp - {"time_after_resection"}
+    """All three solver classes share one TREATMENT_KEYS set, contained in
+    each class's config_keys(); time_after_resection is a parameter of
+    every solver too, as one of the two horizon keys, and not a treatment
+    key. Dropping TREATMENT_KEYS and time_after_resection from a params
+    dict gives an untreated run."""
+    for cls in (FKPPSolver, TwoCompartmentWithNutrientFKPPSolver, AnisotropicFKPPSolver):
+        assert cls.TREATMENT_KEYS is FKPPSolver.TREATMENT_KEYS
+        assert cls.TREATMENT_KEYS <= cls.config_keys()
+        assert set(HORIZON_KEYS) <= cls.config_keys() - cls.TREATMENT_KEYS
+    assert HORIZON_KEYS == ("stopping_time", "time_after_resection")
+    assert StuppFKPPSolver is FKPPSolver
     assert set(neutral_treatment_params((2, 2, 2))) == StuppFKPPSolver.TREATMENT_KEYS | {
         "time_after_resection"
     }
@@ -587,7 +623,7 @@ def test_read_config_cavity_entry(config_dir):
     }
     entries = read_config(_write_config(tmp_path, config))
     assert entries == {
-        SOLVER_KEY: "StuppFKPPSolver",
+        SOLVER_KEY: "FKPPSolver",  # the class's own name, whatever the file says
         "white_matter_pbmap": str(tmp_path / "seg.nii.gz"),
         "rho": 0.12,
         "chemo_times": [24, 25, 26],
@@ -602,8 +638,7 @@ def test_read_config_cavity_entry(config_dir):
         "nope.nii.gz"
     )
     assert read_config(_write_config(tmp_path, {**stupp, "resection_cavity": None}))["resection_cavity"] is None
-    with pytest.raises(ValueError, match="unknown key.*stopping_time"):
-        read_config(_write_config(tmp_path, {**stupp, "stopping_time": 5}))
+    assert read_config(_write_config(tmp_path, {**stupp, "stopping_time": 5}))["stopping_time"] == 5
     with pytest.raises(ValueError, match="rt_dose must be a NIfTI path"):
         read_config(_write_config(tmp_path, {**stupp, "rt_dose": 60.0}))
     for cavity in ("seg.nii.gz", {"segmentation": "seg.nii.gz"}, {"path": "x", "label": 4}):
@@ -646,11 +681,11 @@ def test_cavity_from_segmentation(config_dir, tissue_phantom):
 
 
 def test_config_drives_solver(config_dir, tissue_phantom):
-    """A complete config file is a complete StuppFKPPSolver run: dt becomes
-    n_steps with the horizon resection_time + time_after_resection, the
-    derived stopping_time stays out of the config, and the written config
-    reads back equal. The solver's own validation reports config
-    mistakes."""
+    """A complete config file naming StuppFKPPSolver is a complete
+    FKPPSolver run: dt becomes n_steps with the horizon resection_time +
+    time_after_resection, the derived stopping_time stays null in the
+    config, which names FKPPSolver, and the written config reads back
+    equal. The solver's own validation reports config mistakes."""
     tmp_path, _, _ = config_dir
     gm, wm = tissue_phantom
     segmentation = np.zeros(gm.shape, dtype=np.int16)
@@ -682,9 +717,9 @@ def test_config_drives_solver(config_dir, tissue_phantom):
     }
     entries = read_config(_write_config(tmp_path, config))
     solver = StuppFKPPSolver(entries)
-    assert solver.config[SOLVER_KEY] == "StuppFKPPSolver"
+    assert solver.config[SOLVER_KEY] == "FKPPSolver"
     assert solver.resolve_time_stepping() == (200, 0.05)
-    assert solver.params["stopping_time"] == HORIZON and "stopping_time" not in solver.config
+    assert solver.params["stopping_time"] == HORIZON and solver.config["stopping_time"] is None
     assert solver.config["dt"] == 0.05 and solver.config["n_steps"] is None
     result = solver.solve()
     assert result.success, result.error
@@ -695,13 +730,13 @@ def test_config_drives_solver(config_dir, tissue_phantom):
     written = write_config(solver.config, tmp_path / "written.json")
     assert read_config(written) == solver.config
     # The solver's own validation reports config mistakes: a dose list of
-    # the wrong length, a missing required parameter.
+    # the wrong length, a negative radiosensitivity.
     mismatched = read_config(_write_config(tmp_path, {**config, "chemo_doses": [75.0]}))
     with pytest.raises(ValueError, match="chemo_doses"):
         StuppFKPPSolver(mismatched)
-    incomplete = read_config(_write_config(tmp_path, {**config, "rt_alpha": None}))
+    negative = read_config(_write_config(tmp_path, {**config, "rt_alpha": -0.1}))
     with pytest.raises(ValueError, match="rt_alpha"):
-        StuppFKPPSolver(incomplete)
+        StuppFKPPSolver(negative)
 
 
 def test_read_config_rejects_rt_beta(config_dir):
@@ -717,6 +752,7 @@ def test_read_config_rejects_rt_beta(config_dir):
             _write_config(tmp_path, {**stupp, "rt_alpha_beta_ratio": 10.0, "rt_beta": 0.006})
         )
     assert read_config(_write_config(tmp_path, {**stupp, "rt_alpha_beta_ratio": 10.0})) == {
-        **stupp,
+        SOLVER_KEY: "FKPPSolver",
+        "rt_alpha": 0.06,
         "rt_alpha_beta_ratio": 10.0,
     }

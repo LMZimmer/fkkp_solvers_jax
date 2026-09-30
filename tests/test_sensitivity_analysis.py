@@ -13,8 +13,8 @@ sigma_min >= 2 lambda_max guard and the shipped sigma search space, the
 rejection of a mixed seed group), (4) the design bookkeeping on the 24^3 phantom with the
 shipped search space (every AB run differs from its block's A run only
 through its factor, or through the derived parameters of its group,
-seeds lie on seedable tissue voxels, every config constructs a
-StuppFKPPSolver once the derived maps are given, design.csv carries the
+seeds lie on seedable tissue voxels, every config constructs a treated
+FKPPSolver once the derived maps are given, design.csv carries the
 derived and the extra columns), the nested-range seed mapping, the
 time-step check, the schedule truncation and the snapshot definition,
 (5) the growth stage config, the treatment maps, the snapshot days, one
@@ -44,14 +44,13 @@ import pytest
 from fisher_kpp_jax import SOLVER_KEY, FKPPSolver, StuppFKPPSolver, read_config
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "sensitivity_analysis.py"
+# The script's default search space (the seed width sampled in mm).
 SHIPPED_SEARCH_SPACE = (
     Path(__file__).resolve().parent.parent
     / "fisher_kpp_jax"
     / "search_spaces"
-    / "stupp_fkpp_search_space.json"
+    / "stupp_fkpp_sigma_v2_search_space.json"
 )
-SIGMA_SEARCH_SPACE = SHIPPED_SEARCH_SPACE.with_name("stupp_fkpp_sigma_search_space.json")
-SIGMA_V2_SEARCH_SPACE = SHIPPED_SEARCH_SPACE.with_name("stupp_fkpp_sigma_v2_search_space.json")
 
 
 def _load_script():
@@ -89,7 +88,7 @@ SEED_GROUP = {
     "seed_peak_density": {"min": 0.6, "max": 1.0, "scale": "linear"},
     "seed_relative_width": {"min": 2.0, "max": 4.0, "scale": "log"},
 }
-# The groups of the sigma search space: the seed width in mm, the front
+# The groups of a sigma search space: the seed width in mm, the front
 # width capped at 3 mm so that sigma_min = 2 lambda_max.
 SIGMA_SEED_GROUP = {
     "derives": ["gaussian_seed_mass", "gaussian_seed_diffusion_time"],
@@ -97,6 +96,11 @@ SIGMA_SEED_GROUP = {
     "seed_sigma_mm": {"min": 6.0, "max": 20.0, "scale": "log"},
 }
 SIGMA_GROWTH_GROUP = {**GROWTH_GROUP, "front_width_mm": {"min": 1.0, "max": 3.0, "scale": "log"}}
+# The groups of the shipped search space: the front width capped at 4 mm
+# and the seed width 5-16 mm, so sigma_min lies below 2 lambda_max and the
+# design step warns.
+SHIPPED_GROWTH_GROUP = {**GROWTH_GROUP, "front_width_mm": {"min": 1.0, "max": 4.0, "scale": "log"}}
+SHIPPED_SEED_GROUP = {**SIGMA_SEED_GROUP, "seed_sigma_mm": {"min": 5.0, "max": 16.0, "scale": "log"}}
 
 
 def _group_entries(**overrides) -> dict:
@@ -261,24 +265,26 @@ def test_load_search_space():
     position, the seed scale, the horizon and the chemotherapy decay rate
     fixed; a mapping loads too; unknown keys, a derived volume, a bad
     scale, a mismatching solver, seed entries off [0, 1] or missing each
-    raise."""
+    raise; a "solver" entry naming StuppFKPPSolver, the former name of
+    FKPPSolver, loads."""
     space = sa.load_search_space(SHIPPED_SEARCH_SPACE, CONFIG_KEYS)
     assert len(space.names) == 12
     assert space.overrides == {"gaussian_seed_scale": 1.0, "time_after_resection": 120.0, "chemo_decay_rate": 9.24}
     assert space.names[:3] == ["front_speed_mm_per_day", "front_width_mm", "diffusivity_ratio"]
-    assert space.names[-5:] == ["seed_peak_density", "seed_relative_width", *SEED_KEYS]
-    assert list(space.groups) == ["growth", "seed"]
+    assert space.names[-5:] == ["seed_peak_density", "seed_sigma_mm", *SEED_KEYS]
+    assert list(space.groups) == ["growth", "seed"] and space.groups["seed"].derivation is sa.SEED_SIGMA_DERIVATION
     assert space.derived_keys == ["white_matter_diffusivity", "rho", "gaussian_seed_mass", "gaussian_seed_diffusion_time"]
-    assert space.extra_keys == ["seed_sigma_mm", "seed_enhancing_radius_mm"]
+    assert space.extra_keys == ["seed_enhancing_radius_mm", "s"]
     assert space.plain_names == ["diffusivity_ratio", "resection_time", "chemo_kill_rate", "rt_alpha", "rt_alpha_beta_ratio", *SEED_KEYS]
-    assert space.group_factor_names == {"front_speed_mm_per_day", "front_width_mm", "seed_peak_density", "seed_relative_width"}
+    assert space.group_factor_names == {"front_speed_mm_per_day", "front_width_mm", "seed_peak_density", "seed_sigma_mm"}
     shipped = json.loads(SHIPPED_SEARCH_SPACE.read_text())
-    assert shipped["growth"] == GROWTH_GROUP and shipped["seed"] == SEED_GROUP and shipped["gaussian_seed_scale"] == 1.0
-    assert "rho" not in shipped and "white_matter_diffusivity" not in shipped and "seed_sigma_mm" not in shipped
+    assert shipped[SOLVER_KEY] == "FKPPSolver"
+    assert shipped["growth"] == SHIPPED_GROWTH_GROUP and shipped["seed"] == SHIPPED_SEED_GROUP and shipped["gaussian_seed_scale"] == 1.0
+    assert "rho" not in shipped and "white_matter_diffusivity" not in shipped and "seed_relative_width" not in shipped
     assert space.factors["front_speed_mm_per_day"] == sa.SearchSpaceParameter("front_speed_mm_per_day", 0.03, 0.25, "log")
-    assert space.factors["front_width_mm"] == sa.SearchSpaceParameter("front_width_mm", 1.0, 5.0, "log")
+    assert space.factors["front_width_mm"] == sa.SearchSpaceParameter("front_width_mm", 1.0, 4.0, "log")
     assert space.factors["rt_alpha_beta_ratio"].scale == "linear"
-    assert space.factors["seed_relative_width"] == sa.SearchSpaceParameter("seed_relative_width", 2.0, 4.0, "log")
+    assert space.factors["seed_sigma_mm"] == sa.SearchSpaceParameter("seed_sigma_mm", 5.0, 16.0, "log")
     assert space.factors["seed_peak_density"] == sa.SearchSpaceParameter("seed_peak_density", 0.6, 1.0, "linear")
     assert "_note" in space.source and "_note" not in space.factors
     for key in ("_growth_band", "_seed_band", "_chemo_decay_rate", "_horizon", "_sources", "_scales"):
@@ -302,8 +308,11 @@ def test_load_search_space():
         sa.load_search_space(_seed_entries(rho={"min": 0.0, "max": 0.1, "scale": "log"}), CONFIG_KEYS)
     with pytest.raises(ValueError, match='"min"'):
         sa.load_search_space(_seed_entries(rho={"min": 0.1, "scale": "log"}), CONFIG_KEYS)
-    with pytest.raises(ValueError, match="names solver 'FKPPSolver'"):
-        sa.load_search_space(_seed_entries(solver="FKPPSolver"), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="names solver 'TwoCompartmentWithNutrientFKPPSolver'"):
+        sa.load_search_space(_seed_entries(solver="TwoCompartmentWithNutrientFKPPSolver"), CONFIG_KEYS)
+    with pytest.raises(ValueError, match="names solver 'Nope'"):
+        sa.load_search_space(_seed_entries(solver="Nope"), CONFIG_KEYS)
+    sa.load_search_space(_seed_entries(solver="FKPPSolver"), CONFIG_KEYS)
     bad_seed = {"min": 0.0, "max": 1.5, "scale": "linear"}
     with pytest.raises(ValueError, match="gaussian_seed_y_fraction must be a linear factor within"):
         sa.load_search_space(_seed_entries(gaussian_seed_y_fraction=bad_seed), CONFIG_KEYS)
@@ -615,81 +624,22 @@ def test_seed_sigma_guard():
         validate(factors, {**params, "gaussian_seed_scale": 2.0}, width(3.0))
 
 
-def test_load_sigma_search_space():
-    """The shipped sigma search space loads with 12 factors in file order
-    (the 12 of stupp_fkpp_search_space.json with seed_relative_width
-    replaced by seed_sigma_mm), seed_sigma_mm log-scaled 6-20 mm and
-    front_width_mm 1-3 mm, the same
-    overrides and the same other entries as stupp_fkpp_search_space.json
-    except rt_alpha (0.01-0.2 here, 0.001-0.2 there), the seed group
-    matched to the sigma derivation; the growth group
-    implies D in [0.015, 0.375] and rho in [0.005, 0.125], the seed
-    group passes the guard at equality with s in [2, 20], and the base
-    config lies inside the ranges."""
-    space = sa.load_search_space(SIGMA_SEARCH_SPACE, CONFIG_KEYS)
-    assert space.names == [
-        "front_speed_mm_per_day", "front_width_mm", "diffusivity_ratio", "resection_time", "chemo_kill_rate",
-        "rt_alpha", "rt_alpha_beta_ratio", "seed_peak_density", "seed_sigma_mm", *SEED_KEYS,
-    ]
-    assert len(space.names) == 12
-    assert space.factors["seed_sigma_mm"] == sa.SearchSpaceParameter("seed_sigma_mm", 6.0, 20.0, "log")
-    assert space.factors["front_width_mm"] == sa.SearchSpaceParameter("front_width_mm", 1.0, 3.0, "log")
-    assert space.factors["seed_peak_density"] == sa.SearchSpaceParameter("seed_peak_density", 0.6, 1.0, "linear")
-    assert space.overrides == {"gaussian_seed_scale": 1.0, "time_after_resection": 120.0, "chemo_decay_rate": 9.24}
-    assert list(space.groups) == ["growth", "seed"] and space.groups["seed"].derivation is sa.SEED_SIGMA_DERIVATION
-    assert space.derived_keys == ["white_matter_diffusivity", "rho", "gaussian_seed_mass", "gaussian_seed_diffusion_time"]
-    assert space.extra_keys == ["seed_enhancing_radius_mm", "s"]
-    assert "seed_relative_width" not in space.factors
-    shipped, old = json.loads(SIGMA_SEARCH_SPACE.read_text()), json.loads(SHIPPED_SEARCH_SPACE.read_text())
-    assert shipped["seed"] == SIGMA_SEED_GROUP and shipped["growth"] == SIGMA_GROWTH_GROUP
-    assert [key for key in shipped if not key.startswith("_")] == [key for key in old if not key.startswith("_")]
-    for key in old:
-        if not key.startswith("_") and key not in ("growth", "seed", "rt_alpha"):
-            assert shipped[key] == old[key], key
-    assert shipped["rt_alpha"] == {"min": 0.01, "max": 0.2, "scale": "log"}
-    assert old["rt_alpha"] == {"min": 0.001, "max": 0.2, "scale": "log"}
-    for key in ("_note", "_growth_band", "_seed_band", "_scales", "_units", "_sources", "_chemo", "_horizon"):
-        assert key in shipped
-    assert "2026-09-13" in shipped["_seed_band"] and "seed_relative_width" not in shipped["_units"]
-    params = {"gaussian_seed_floor": 0.1, "gaussian_seed_scale": 1.0}
-    seed = sa.SEED_SIGMA_DERIVATION.validate(space.groups["seed"].factors, params, space.group_inputs(space.groups["seed"]))
-    np.testing.assert_allclose(seed["s_range"], [2.0, 20.0])
-    np.testing.assert_allclose(seed["seed_enhancing_radius_mm_range"], [0.0, 20.0 * np.sqrt(2 * np.log(1 / 0.6))])
-    growth = sa.DERIVATIONS[sa.GROWTH_DERIVED_KEYS].validate(space.groups["growth"].factors, {}, {})
-    np.testing.assert_allclose(growth["white_matter_diffusivity_range"], [0.015, 0.375])
-    np.testing.assert_allclose(growth["rho_range"], [0.005, 0.125])
-    # The shipped base config lies inside the ranges without edits.
-    base = read_config(sa.DEFAULT_CONFIG)
-    front = sa.front_parameters(base["white_matter_diffusivity"], base["rho"])
-    sigma = np.sqrt(2 * base["gaussian_seed_diffusion_time"])
-    peak = sa.seed_peak_density(base["gaussian_seed_mass"], base["gaussian_seed_diffusion_time"])
-    for name, value in (("front_speed_mm_per_day", front["front_speed_mm_per_day"]), ("front_width_mm", front["front_width_mm"]),
-                        ("seed_sigma_mm", sigma), ("seed_peak_density", peak), ("chemo_kill_rate", base["chemo_kill_rate"])):
-        factor = space.factors[name]
-        assert factor.low <= value <= factor.high, (name, value)
-
-
 def test_design_of_sigma_v2_search_space(phantom_base):
-    """The third sigma search space (2026-09-15) differs from
-    stupp_fkpp_sigma_search_space.json only in chemo_kill_rate 1e-3-3.5e-2,
-    rt_alpha 0.001-0.2, front_width_mm 1-4 mm and seed_sigma_mm 5-16 mm
-    (scales kept); its seed floor lies below 2 x the front width cap, so
-    the design step warns instead of refusing it and writes the design
-    with s in [1.25, 16] (s_min 2 kept in the record), D in [0.015, 0.5]
-    and rho in [0.00375, 0.125]; every row's s is within that range."""
-    v2, v1 = json.loads(SIGMA_V2_SEARCH_SPACE.read_text()), json.loads(SIGMA_SEARCH_SPACE.read_text())
-    assert [key for key in v2 if not key.startswith("_")] == [key for key in v1 if not key.startswith("_")]
+    """The shipped sigma search space (2026-09-15): chemo_kill_rate
+    1e-3-3.5e-2, rt_alpha 0.001-0.2, front_width_mm 1-4 mm and
+    seed_sigma_mm 5-16 mm, log-scaled; its seed floor lies below 2 x the
+    front width cap, so the design step warns instead of refusing it and
+    writes the design with s in [1.25, 16] (s_min 2 kept in the record), D
+    in [0.015, 0.5] and rho in [0.00375, 0.125]; every row's s is within
+    that range."""
+    v2 = json.loads(SHIPPED_SEARCH_SPACE.read_text())
     assert v2["chemo_kill_rate"] == {"min": 1.0e-3, "max": 3.5e-2, "scale": "log"}
     assert v2["rt_alpha"] == {"min": 0.001, "max": 0.2, "scale": "log"}
-    assert v2["growth"] == {**SIGMA_GROWTH_GROUP, "front_width_mm": {"min": 1.0, "max": 4.0, "scale": "log"}}
-    assert v2["seed"] == {**SIGMA_SEED_GROUP, "seed_sigma_mm": {"min": 5.0, "max": 16.0, "scale": "log"}}
-    for key in v1:
-        if not key.startswith("_") and key not in ("growth", "seed", "chemo_kill_rate", "rt_alpha"):
-            assert v2[key] == v1[key], key
+    assert v2["growth"] == SHIPPED_GROWTH_GROUP and v2["seed"] == SHIPPED_SEED_GROUP
     assert "2026-09-15" in v2["_seed_band"] and "1.25" in v2["_seed_band"]
     tmp_path = phantom_base["tmp_path"]
     with pytest.warns(UserWarning, match=r"seed_sigma_mm: min 5 mm is below 2 x the front_width_mm max 4 mm \(8 mm\)"):
-        sweep_dir = sa.make_design(SIGMA_V2_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "v2", log2_n=1, seed=3)
+        sweep_dir = sa.make_design(SHIPPED_SEARCH_SPACE, phantom_base["path"], tmp_path / "sa", "v2", log2_n=1, seed=3)
     spec = json.loads((sweep_dir / "spec.json").read_text())
     assert spec["k"] == 12 and spec["n_runs"] == 28 and spec["factor_names"][8] == "seed_sigma_mm"
     seed_group, growth_group = spec["derived_groups"]["seed"], spec["derived_groups"]["growth"]
@@ -741,11 +691,11 @@ def test_design_bookkeeping(phantom_base):
     config differs from its block's A config only through its factor (the
     seed fractions for a seed factor, the shifted event times for
     resection_time, the derived dynamics for a growth-group factor, the
-    derived seed parameters for a seed-group factor, both for the front
-    width the seed's width follows); design.csv carries the unit-cube
+    derived seed parameters for a seed-group factor, whose width in mm
+    does not follow the front width); design.csv carries the unit-cube
     coordinates, the sampled factors, the derived parameters, which the
     configs hold and which invert to the sampled peak and front, and the
-    extra columns (sigma, the enhancing radius); every seed is a seedable
+    extra columns (the enhancing radius, s = sigma / lambda); every seed is a seedable
     tissue voxel whose fractions the config holds; the derived volumes
     stay null in the run configs and every config constructs a solver
     once they are given; spec.json records the schedule within the
@@ -767,18 +717,20 @@ def test_design_bookkeeping(phantom_base):
     assert spec["overrides"] == {"gaussian_seed_scale": 1.0, "time_after_resection": 120.0, "chemo_decay_rate": 9.24}
     assert spec["time_step"] == {"n_steps": None, "dt": None, "steps_per_day": PHANTOM_STEPS_PER_DAY}
     assert spec["derived_keys"] == ["white_matter_diffusivity", "rho", "gaussian_seed_mass", "gaussian_seed_diffusion_time"]
-    assert spec["extra_keys"] == ["seed_sigma_mm", "seed_enhancing_radius_mm"]
+    assert spec["extra_keys"] == ["seed_enhancing_radius_mm", "s"]
     assert list(spec["derived_groups"]) == ["growth", "seed"]
     growth_group, seed_group = spec["derived_groups"]["growth"], spec["derived_groups"]["seed"]
     assert growth_group["derives"] == spec["derived_keys"][:2] and growth_group["factors"] == ["front_speed_mm_per_day", "front_width_mm"]
     assert growth_group["requires"] == [] and growth_group["extras"] == [] and growth_group["formula"] == sa.GROWTH_FORMULA
-    np.testing.assert_allclose(growth_group["white_matter_diffusivity_range"], [0.015, 0.625])
-    np.testing.assert_allclose(growth_group["rho_range"], [0.003, 0.125])
-    assert seed_group["derives"] == spec["derived_keys"][2:] and seed_group["factors"] == ["seed_peak_density", "seed_relative_width"]
-    assert seed_group["requires"] == ["front_width_mm"] and seed_group["extras"] == spec["extra_keys"]
+    np.testing.assert_allclose(growth_group["white_matter_diffusivity_range"], [0.015, 0.5])
+    np.testing.assert_allclose(growth_group["rho_range"], [0.00375, 0.125])
+    assert seed_group["derives"] == spec["derived_keys"][2:] and seed_group["factors"] == ["seed_peak_density", "seed_sigma_mm"]
+    assert seed_group["requires"] == [] and seed_group["optional"] == ["front_width_mm"]
+    assert seed_group["extras"] == spec["extra_keys"]
     assert seed_group["gaussian_seed_floor"] == 0.1 and seed_group["gaussian_seed_scale"] == 1.0
-    assert seed_group["formula"] == sa.SEED_FORMULA
-    np.testing.assert_allclose(seed_group["seed_sigma_mm_range"], [2.0, 20.0])
+    assert seed_group["formula"] == sa.SEED_SIGMA_FORMULA
+    np.testing.assert_allclose(seed_group["seed_sigma_mm_range"], [5.0, 16.0])
+    np.testing.assert_allclose(seed_group["s_range"], [1.25, 16.0])
     group_factors = set(growth_group["factors"]) | set(seed_group["factors"])
     assert spec["treatment"] == {
         "cavity_threshold": 0.6, "rt_margin_mm": 15.0, "rt_dose_per_fraction_gy": 2.0,
@@ -831,13 +783,11 @@ def test_design_bookkeeping(phantom_base):
                 shift = ab["resection_time"] - base["resection_time"]
                 np.testing.assert_allclose(ab["chemo_times"], np.asarray(base["chemo_times"]) + shift)
                 np.testing.assert_allclose(ab["rt_times"], np.asarray(base["rt_times"]) + shift)
-            elif factor == "front_speed_mm_per_day":
+            elif factor in ("front_speed_mm_per_day", "front_width_mm"):  # the seed's width is its own
                 assert differing == {"white_matter_diffusivity", "rho"}
-            elif factor == "front_width_mm":  # the seed's width follows the front width
-                assert differing == {"white_matter_diffusivity", "rho", "gaussian_seed_mass", "gaussian_seed_diffusion_time"}
             elif factor == "seed_peak_density":
                 assert differing == {"gaussian_seed_mass"}
-            elif factor == "seed_relative_width":
+            elif factor == "seed_sigma_mm":
                 assert differing == {"gaussian_seed_mass", "gaussian_seed_diffusion_time"}
             else:
                 assert differing == {factor}
@@ -854,17 +804,16 @@ def test_design_bookkeeping(phantom_base):
         for key in spec["derived_keys"]:
             assert config[key] == float(record[key])
         assert config["gaussian_seed_scale"] == 1.0 and "seed_peak_density" not in config and "front_width_mm" not in config
-        assert "seed_sigma_mm" not in config and "seed_enhancing_radius_mm" not in config
+        assert "seed_sigma_mm" not in config and "seed_enhancing_radius_mm" not in config and "s" not in config
         speed, width = float(record["front_speed_mm_per_day"]), float(record["front_width_mm"])
-        assert 0.03 <= speed <= 0.25 and 1.0 <= width <= 5.0
+        assert 0.03 <= speed <= 0.25 and 1.0 <= width <= 4.0
         np.testing.assert_allclose(config["white_matter_diffusivity"], speed * width / 2)
         np.testing.assert_allclose(config["rho"], speed / (2 * width))
         front = sa.front_parameters(config["white_matter_diffusivity"], config["rho"])
         np.testing.assert_allclose([front["front_speed_mm_per_day"], front["front_width_mm"]], [speed, width])
-        peak, relative = float(record["seed_peak_density"]), float(record["seed_relative_width"])
-        assert 0.6 <= peak <= 1.0 and 2.0 <= relative <= 4.0
-        sigma = float(record["seed_sigma_mm"])
-        np.testing.assert_allclose(sigma, relative * width)
+        peak, sigma = float(record["seed_peak_density"]), float(record["seed_sigma_mm"])
+        assert 0.6 <= peak <= 1.0 and 5.0 <= sigma <= 16.0
+        np.testing.assert_allclose(float(record["s"]), sigma / width)
         np.testing.assert_allclose(config["gaussian_seed_diffusion_time"], sigma**2 / 2)
         np.testing.assert_allclose(sa.seed_peak_density(config["gaussian_seed_mass"], config["gaussian_seed_diffusion_time"]), peak)
         np.testing.assert_allclose(float(record["seed_enhancing_radius_mm"]), sigma * np.sqrt(2 * np.log(peak / 0.6)))
@@ -908,14 +857,14 @@ def test_design_bookkeeping(phantom_base):
     kill, decay = space.factors["chemo_kill_rate"], space.overrides["chemo_decay_rate"]
     assert spec["chemo_total_dose"] == 3900.0
     np.testing.assert_allclose(spec["chemo_log_kill_range"], [kill.low * 3900 / decay, kill.high * 3900 / decay])
-    # Every config is a complete StuppFKPPSolver run once the derived maps
-    # are given (here: empty).
+    # Every config is a complete treated FKPPSolver run once the derived
+    # maps are given (here: empty).
     shape = seedable.shape
     for path in sorted((sweep_dir / "configs").iterdir())[:5]:
         config = read_config(path)
         assert config["resection_cavity"] is None and config["rt_dose"] is None
         solver = StuppFKPPSolver({**config, "resection_cavity": np.zeros(shape, bool), "rt_dose": np.zeros(shape)})
-        assert solver.config[SOLVER_KEY] == "StuppFKPPSolver"
+        assert solver.config[SOLVER_KEY] == "FKPPSolver"
         FKPPSolver(sa.growth_config(config))
     # A base config with a cavity or a dose map, or without tissue maps, is refused.
     entries = json.loads(phantom_base["path"].read_text())
@@ -1009,7 +958,7 @@ def test_truncate_schedule_and_snapshot_offsets():
     space = sa.load_search_space(SHIPPED_SEARCH_SPACE, CONFIG_KEYS)
     total, (low, high) = sa.chemo_log_kill_range(base, space)
     assert total == 4900.0
-    np.testing.assert_allclose([low, high], [5e-4 * 4900 / 9.24, 1e-2 * 4900 / 9.24])
+    np.testing.assert_allclose([low, high], [1e-3 * 4900 / 9.24, 3.5e-2 * 4900 / 9.24])
     # Snapshot offsets.
     assert sa.crt_snapshot_offsets(base["rt_times"], base["chemo_times"], base["resection_time"]) == {"mid_crt": 34.0, "end_crt": 55.0}
     assert sa.crt_snapshot_offsets(shipped["rt_times"], shipped["chemo_times"], 100.0) == {"mid_crt": 34.0, "end_crt": 55.0}
@@ -1416,8 +1365,8 @@ def test_run_one_two_stages(phantom_base):
     # The saved records feed run_status.csv and qoi.csv: the time
     # stepping of both stages, the volumes; the qoi record holds the
     # pre_ QoIs of the pre-resection field next to those of the final one.
-    saved_records = sa.run_records(run_dir)
-    assert saved_records["success"] and saved_records["solver"] == "StuppFKPPSolver"
+    saved_records = sa.run_records(run_dir, False)
+    assert saved_records["success"] and saved_records["solver"] == "FKPPSolver"
     assert saved_records["growth_dt"] == growth["dt"] and saved_records["growth_n_steps"] == growth["n_steps"]
     assert saved_records["treated_dt"] == result["dt"] and saved_records["n_steps"] == result["n_steps"]
     assert saved_records["cavity_volume_mm3"] == record["cavity_volume_mm3"]
@@ -1500,12 +1449,12 @@ def test_growth_only(phantom_base):
     assert result["files"] == ["config.json", "final_cell_density.nii.gz", "result.json"]
     saved = read_config(run_dir / "config.json")
     assert saved[SOLVER_KEY] == "FKPPSolver" and saved["stopping_time"] == config["resection_time"]
-    records = sa.run_records(run_dir)
+    records = sa.run_records(run_dir, True)
     assert records["success"] and records["solver"] == "FKPPSolver"
     assert records["growth_dt"] == result["dt"] and records["growth_n_steps"] == result["n_steps"]
     assert records["treated_dt"] is None and records["cavity_volume_mm3"] is None
     design = {r["run_name"]: r for r in _read_csv(sweep_dir / "design.csv")}
-    qoi = sa.qoi_record(sweep_dir, design["r0000_A"], phantom_base["wm"], (1.0, 1.0, 1.0), 0.6, 0.3)
+    qoi = sa.qoi_record(sweep_dir, design["r0000_A"], phantom_base["wm"], (1.0, 1.0, 1.0), 0.6, 0.3, growth_only=True)
     assert qoi["success"] and qoi["mass"] > 0 and qoi["V_core"] > 0
     for name in sa.QOI_NAMES:
         assert qoi[f"pre_{name}"] == qoi[name], name
