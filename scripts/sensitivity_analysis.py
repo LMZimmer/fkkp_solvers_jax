@@ -2304,8 +2304,9 @@ def run_records(run_dir: Path, growth_only: bool) -> dict[str, Any]:
 
     Args:
         run_dir: The run directory.
-        growth_only: The mode the run was made in (``resolve_growth_only``):
-            result.json is the growth stage's record in growth-only mode
+        growth_only: The mode the run was made in (spec.json's
+            growth_only entry, which the design or the run pass records,
+            see ``resolve_growth_only``): result.json is the growth stage's record in growth-only mode
             and the treated stage's otherwise. The solver name it records
             does not tell the two apart (both stages are FKPPSolver runs)
             and is carried over without being interpreted.
@@ -3046,7 +3047,11 @@ def qoi_table(
     """
     The QoIs of every run of a sweep directory, in design order. The
     sweep's mode (two-stage or growth-only), which tells what a run's
-    result.json is, is resolved from spec.json (``resolve_growth_only``).
+    result.json is, is read from spec.json's growth_only entry; a spec
+    without the entry (a design older than it that no run pass has
+    recorded a mode for) counts as two-stage. Nothing is written into the
+    sweep directory: recording the mode in spec.json is left to the run
+    pass (``resolve_growth_only``).
 
     Args:
         sweep_dir: The sweep directory.
@@ -3060,7 +3065,7 @@ def qoi_table(
     sweep_dir = Path(sweep_dir)
     design = read_csv(sweep_dir / "design.csv")
     wm_path = str(read_json(sweep_dir / "base_config.json")["white_matter_pbmap"])
-    growth_only = resolve_growth_only(sweep_dir, read_json(sweep_dir / "spec.json"), False)
+    growth_only = bool(read_json(sweep_dir / "spec.json").get("growth_only", False))
     jobs = [(str(sweep_dir), record, wm_path, tau_core, tau_edema, growth_only) for record in design]
     records: list[dict[str, Any]] = []
     if workers > 1:

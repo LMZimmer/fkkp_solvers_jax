@@ -406,8 +406,11 @@ arises only from an exception or from the non-finite check.
     `run_records(run_dir, growth_only)`; `result.json` is the growth stage
     in growth-only mode and the treated stage otherwise, and the solver
     name is recorded but no longer interpreted. `run_subprocess` passes
-    its own `growth_only`, the collect stage passes the mode it resolves
-    from `spec.json` (`resolve_growth_only`), and the two callers in
+    its own `growth_only`, the collect stage passes the mode it reads
+    from `spec.json` (`spec.get("growth_only", False)`; revised
+    2026-09-30 after review: the collect stage writes nothing,
+    `resolve_growth_only` and its write into `spec.json` belong to the
+    run pass only), and the two callers in
     `patient_sensitivity_analysis.py` pass `False` (patient runs are
     always treated).
   - `patient_cmaes_fit.resolved_constants` calls
@@ -619,11 +622,14 @@ Model-specific:
   carries the former name any more.
 - **Step 7.** `sensitivity_analysis.names_solver(entry, solver_name)` is
   the class check of `load_search_space` and of the fit script's loader.
-  `qoi_record` takes the mode as `growth_only=False`; `qoi_table` resolves
-  it with `resolve_growth_only`, which, as in a run pass, records
-  `growth_only: false` in the `spec.json` of a design older than that
-  entry. The scripts keep addressing the class as `StuppFKPPSolver`
-  (the alias); only the statements listed in section 5 changed.
+  `qoi_record` takes the mode as `growth_only=False`; `qoi_table` reads
+  it as `spec.get("growth_only", False)` and writes nothing (follow-up of
+  2026-09-30 after the review: as first committed it called
+  `resolve_growth_only`, which records `growth_only: false` in the
+  `spec.json` of a design older than that entry; that write is the run
+  pass's alone). The scripts keep addressing the class as
+  `StuppFKPPSolver` (the alias); only the statements listed in section 5
+  changed.
 - **Step 8.** Adaptations beyond the list of section 5, each forced by
   the change: `tests/test_stupp.py`: `read_config` of a file naming
   `StuppFKPPSolver` returns "FKPPSolver" (two expected dicts),
