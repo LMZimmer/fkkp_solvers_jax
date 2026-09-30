@@ -6,6 +6,16 @@ config of the run and saves results with their config (``Result.save``:
 ``config.json``, ``result.json`` and the state volumes). A saved run is
 reproduced by ``SolverClass(read_config(path))``, the caller choosing the
 class; the config's ``"solver"`` entry is checked against it.
+
+The treatment effects of a Stupp protocol (resection, chemotherapy,
+radiotherapy) are implemented here once for every solver: the treatment
+parameters and their neutral defaults (``TREATMENT_DEFAULTS``), the
+horizon rule, their validation, the decision whether a run is treated at
+all (``BaseFKPPSolver._is_treated``), the treatment volumes on the
+low-resolution grid, the treatment device constants and the choice between
+the model's update and its treated step. A solver class contributes only
+what depends on the model (``_valid_mask_host``,
+``_structural_constants``, its update and its treated step).
 """
 
 from __future__ import annotations
@@ -36,16 +46,12 @@ from .config import (
     write_config,
 )
 from .operators import (
-    SHRINKAGE_LIMIT,
-    VANISHING_DENSITY_LIMIT,
     _RUNNING,
-    _STOP_SHRINKAGE,
     _STOP_THRESHOLD,
-    _STOP_VANISHING,
-    _no_guard,
     _run_time_loop,
     clipped_gaussian,
     embed,
+    lq_log_kill,
     tissue_bounding_box,
 )
 
@@ -59,6 +65,37 @@ DEFAULT_VOXEL_SIZE_MM: tuple[float, float, float] = (1.0, 1.0, 1.0)
 
 # The three ways to give the time step; at most one of them may be set.
 TIME_STEP_KEYS: tuple[str, ...] = ("n_steps", "dt", "steps_per_day")
+
+# The two ways to give the horizon; at most one of them may be set
+# (``_resolve_horizon``). With neither the horizon is DEFAULT_STOPPING_TIME.
+HORIZON_KEYS: tuple[str, ...] = ("stopping_time", "time_after_resection")
+DEFAULT_STOPPING_TIME: float = 100.0  # days
+
+# The treatment parameters of every solver with their neutral defaults: a
+# run that gives none of them is untreated. The two volumes are the only
+# entries in which None stands for the neutral value (no cavity, no dose);
+# every other entry is neutral by its value.
+TREATMENT_DEFAULTS: dict[str, Any] = {
+    "resection_time": np.inf,  # days; inf is never reached
+    "resection_cavity": None,  # 3D bool or 0/1 array
+    "chemo_times": (),  # days, one per session
+    "chemo_doses": (),  # mg/m^2 per session, one per chemo_times entry
+    "chemo_kill_rate": 0.0,  # 1/day per mg/m^2
+    # 1/day, must stay > 0. Temozolomide's plasma decay, a half-life of
+    # about 1.8 h (Baker et al. 1999, Clin Cancer Res 5:309). Inert while
+    # there is no session; with sessions it is a physical choice.
+    "chemo_decay_rate": 9.24,
+    "rt_times": (),  # days, one per fraction
+    "rt_dose": None,  # TOTAL dose over all fractions, 3D array in Gy
+    "rt_alpha": 0.0,  # 1/Gy
+    # Gy, the linear-quadratic alpha/beta ratio; rt_beta = rt_alpha / it
+    # is derived on the host.
+    "rt_alpha_beta_ratio": 10.0,
+}
+
+# The treatment parameters holding volumes (part of every solver's
+# ``_VOLUME_KEYS``), given on the grid of the solver's reference volume.
+TREATMENT_VOLUME_KEYS: frozenset[str] = frozenset({"resection_cavity", "rt_dose"})
 
 # Parameters the solver may derive when the config does not give them;
 # their derived values are reported in Result.derived.
@@ -76,7 +113,8 @@ class _SharedConstants(TypedDict):
     """
     Device constants shared by all solvers, built by
     ``BaseFKPPSolver._run_device_loop`` and merged flat with the
-    solver-specific keys returned by ``_build_device_constants``.
+    solver-specific keys returned by ``_build_device_constants`` and
+    ``_structural_constants``.
 
     Attributes:
         dt: Time step size, 0-d scalar at the state dtype.
@@ -274,14 +312,9 @@ class _TimeLoopOutputs:
         initial_state: Initial fields on the full low-resolution grid.
         final_state_cropped: Final fields on the cropped grid.
         crop_box: Slices of the tissue bounding box the loop ran on.
-        stop_kind: Stop-kind code (_RUNNING, _STOP_THRESHOLD,
-            _STOP_SHRINKAGE or _STOP_VANISHING).
+        stop_kind: Stop-kind code (_RUNNING or _STOP_THRESHOLD).
         stop_step: Step index at which the loop stopped, 0 if it never did.
         stopping_quantity: Stopping quantity of the last active step.
-        guard_mass_change: Guard diagnostic of the stopping step, 0.0
-            unless a guard fired.
-        guard_density: Guard diagnostic of the stopping step, 0.0 unless a
-            guard fired.
         buffers: Recorded snapshot frames per field on the cropped grid, or
             None if none were requested.
         snapshot_times: Simulation day of each recorded frame, or None if
@@ -294,8 +327,6 @@ class _TimeLoopOutputs:
     stop_kind: int
     stop_step: int
     stopping_quantity: float
-    guard_mass_change: float
-    guard_density: float
     buffers: dict[str, NDArray] | None
     snapshot_times: NDArray | None
 
@@ -521,10 +552,15 @@ def _validate_event_times(
 
 
 def _validate_volume(
-    parameters: Mapping[str, Any], key: str, shape: tuple[int, ...], solver_name: str
+    parameters: Mapping[str, Any],
+    key: str,
+    shape: tuple[int, ...],
+    reference_key: str,
+    solver_name: str,
 ) -> NDArray:
     """Check that the parameter named key is a 3D numpy array of the given
-    (tissue map) shape; return it."""
+    shape, the 3D shape of the reference volume named reference_key; return
+    it."""
     value = parameters[key]
     if not isinstance(value, np.ndarray):
         raise ValueError(f"{solver_name}: {key} must be a numpy array.")
@@ -532,10 +568,106 @@ def _validate_volume(
         raise ValueError(f"{solver_name}: {key} must be a 3D array.")
     if value.shape != shape:
         raise ValueError(
-            f"{solver_name}: {key} shape {value.shape} differs from the tissue map "
-            f"shape {shape}."
+            f"{solver_name}: {key} shape {value.shape} differs from the "
+            f"{reference_key} shape {shape}."
         )
     return value
+
+
+def _resolve_horizon(parameters: dict[str, Any], solver_name: str) -> None:
+    """
+    Apply the horizon rule: set parameters['stopping_time'] (in place) from
+    the two ``HORIZON_KEYS``, of which at most one may be given.
+
+    - stopping_time given: the horizon is that value;
+    - time_after_resection given: the horizon is
+      resection_time + time_after_resection, and resection_time must be
+      finite;
+    - neither given: ``DEFAULT_STOPPING_TIME``.
+
+    resection_time, which the rule reads, is checked here: a nonnegative
+    scalar that may be infinite (never reached). Runs before
+    ``_validate_treatment``, whose event-time checks read the horizon.
+
+    Args:
+        parameters: Merged parameter dict, modified in place.
+        solver_name: Solver class name, used in error messages.
+    """
+    resection_time = parameters["resection_time"]
+    if not (np.isscalar(resection_time) and resection_time >= 0):
+        raise ValueError(
+            f"{solver_name}: resection_time must be a nonnegative scalar (inf: no "
+            f"resection), got {resection_time!r}."
+        )
+    given = [key for key in HORIZON_KEYS if parameters[key] is not None]
+    if len(given) > 1:
+        raise ValueError(
+            f"{solver_name}: set at most one of {list(HORIZON_KEYS)}, got {given}."
+        )
+    if parameters["time_after_resection"] is not None:
+        time_after = _validate_nonnegative_scalar(parameters, "time_after_resection", solver_name)
+        if not np.isfinite(resection_time):
+            raise ValueError(
+                f"{solver_name}: time_after_resection needs a finite resection_time, "
+                f"got {resection_time!r}."
+            )
+        parameters["stopping_time"] = float(resection_time) + time_after
+    elif parameters["stopping_time"] is None:
+        parameters["stopping_time"] = DEFAULT_STOPPING_TIME
+
+
+def _validate_treatment(
+    parameters: Mapping[str, Any], reference_key: str, solver_name: str
+) -> None:
+    """
+    Check the treatment parameters (``TREATMENT_DEFAULTS``), which are the
+    same for every solver. Runs after the solver's own validation and after
+    ``_resolve_horizon``.
+
+    A treatment volume (resection_cavity, rt_dose) that is given must be a
+    3D array with the 3D shape of the reference volume; one that is None is
+    not checked and stays None. The event times may be empty.
+
+    Args:
+        parameters: Merged parameter dict with the horizon resolved.
+        reference_key: Name of the solver's reference volume parameter.
+        solver_name: Solver class name, used in error messages.
+    """
+    shape = tuple(parameters[reference_key].shape[:3])
+    if parameters["resection_cavity"] is not None:
+        cavity = _validate_volume(parameters, "resection_cavity", shape, reference_key, solver_name)
+        if cavity.dtype != bool and not np.isin(cavity, (0, 1)).all():
+            raise ValueError(
+                f"{solver_name}: resection_cavity must be a binary (bool or 0/1) array."
+            )
+        if cavity.any() and not np.isfinite(parameters["resection_time"]):
+            raise ValueError(
+                f"{solver_name}: a non-empty resection_cavity requires a finite "
+                "resection_time."
+            )
+
+    chemo_times = _validate_event_times(parameters, "chemo_times", solver_name)
+    chemo_doses = _validate_nonnegative_sequence(parameters, "chemo_doses", solver_name)
+    if chemo_doses.size != chemo_times.size:
+        raise ValueError(
+            f"{solver_name}: chemo_doses has {chemo_doses.size} entries but chemo_times "
+            f"has {chemo_times.size}; one dose per session is required."
+        )
+    _validate_nonnegative_scalar(parameters, "chemo_kill_rate", solver_name)
+    _validate_positive_scalar(parameters, "chemo_decay_rate", solver_name)
+
+    rt_times = _validate_event_times(parameters, "rt_times", solver_name)
+    if np.any(rt_times == 0):
+        logger.warning(
+            f"{solver_name}: rt_times contains 0, which lies in no step interval "
+            "(t0, t1] and will never fire."
+        )
+    if parameters["rt_dose"] is not None:
+        dose = _validate_volume(parameters, "rt_dose", shape, reference_key, solver_name)
+        if not np.all(np.isfinite(dose)) or np.any(dose < 0):
+            raise ValueError(f"{solver_name}: rt_dose must be finite and nonnegative.")
+    _validate_nonnegative_scalar(parameters, "rt_alpha", solver_name)
+    _validate_positive_scalar(parameters, "rt_alpha_beta_ratio", solver_name)
 
 
 class BaseFKPPSolver(ABC):
@@ -550,8 +682,17 @@ class BaseFKPPSolver(ABC):
     class's _REQUIRED / _DEFAULTS key sets and loads the volumes given as
     NIfTI paths; subclasses implement the solver-specific hooks.
 
+    Every solver takes the treatment parameters (``TREATMENT_KEYS``) and
+    the two horizon keys (``HORIZON_KEYS``); ``FKPPSolver`` documents
+    them. All default to neutral values, and a run whose treatment values
+    are all neutral is the untreated run: it compiles the model's update
+    alone and builds no treatment volume (``_is_treated``).
+
     Attributes:
-        params: Merged and validated solver parameters, volumes as arrays.
+        TREATMENT_KEYS: Names of the treatment parameters, the same for
+            every solver.
+        params: Merged and validated solver parameters, volumes as arrays
+            (a treatment volume that was not given stays None).
         config: The run's config: the "solver" entry plus every parameter
             as given, the class defaults filled in for the ones not given
             and volumes recorded as their path (or the entry they were
@@ -585,6 +726,11 @@ class BaseFKPPSolver(ABC):
     grid_spacing: tuple[float, float, float]
     seed_voxel: tuple[int, int, int]
 
+    # The treatment parameters (a params dict without them is an untreated
+    # run). Every solver's _DEFAULTS holds them at their neutral values
+    # (``TREATMENT_DEFAULTS``), next to the two ``HORIZON_KEYS``.
+    TREATMENT_KEYS: ClassVar[frozenset[str]] = frozenset(TREATMENT_DEFAULTS)
+
     # Required and default parameters, implemented by each solver
     _REQUIRED: ClassVar[frozenset[str]]
     _DEFAULTS: ClassVar[dict[str, Any]]
@@ -596,17 +742,16 @@ class BaseFKPPSolver(ABC):
     _REFERENCE_VOLUME_KEY: ClassVar[str]
 
     # Device functions of the time loop, set per solver class. They must be
-    # module-level functions (see ``operators._run_time_loop`` for the
-    # required signatures). _step_func performs one time step.
-    # _mass_func/_volume_func are the stopping quantities dispatched on
-    # stopping_mode; _guard_func is the post-step sanity check (the default
-    # never fires).
+    # module-level objects (see ``operators._run_time_loop`` for the
+    # required signatures). _step_func is the model's update, one time step
+    # of an untreated run; _treated_step_func is that update wrapped with
+    # the treatment events, one time step of a treated run (``_is_treated``
+    # decides which of the two is compiled). _mass_func/_volume_func are
+    # the stopping quantities dispatched on stopping_mode.
     _step_func: ClassVar[Callable[..., dict[str, jax.Array]]]
+    _treated_step_func: ClassVar[Callable[..., dict[str, jax.Array]]]
     _mass_func: ClassVar[Callable[..., jax.Array]]
     _volume_func: ClassVar[Callable[..., jax.Array]]
-    _guard_func: ClassVar[
-        Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
-    ] = staticmethod(_no_guard)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -630,12 +775,20 @@ class BaseFKPPSolver(ABC):
         self.result = None
         self.n_steps = None
         self.dt = None
+        # A treatment parameter given as None stands for its neutral default.
+        for key, default in TREATMENT_DEFAULTS.items():
+            if merged[key] is None:
+                merged[key] = default
         header_voxel_size = self._load_volumes(merged)
         self._resolve_voxel_size(merged, header_voxel_size)
         _validate_parameters(merged, name)
         for key in GAUSSIAN_SEED_POSITION_FRACTION:
             _validate_unit_interval(merged, key, name)
         self._validate_extra(merged)
+        # The horizon first: the event-time checks of the treatment
+        # validation read parameters["stopping_time"].
+        _resolve_horizon(merged, name)
+        _validate_treatment(merged, self._REFERENCE_VOLUME_KEY, name)
         self.params = merged
 
     @classmethod
@@ -664,14 +817,16 @@ class BaseFKPPSolver(ABC):
         The config of the given parameters: the "solver" entry, the given
         entries in their order, then the defaults not given. A volume given
         as an array is recorded as ``VOLUME_IN_MEMORY``; a path or a
-        solver-specific entry is kept.
+        cavity entry is kept. A default that is a tuple (the empty event
+        lists) is recorded as a new list, the form it has in a JSON file,
+        so a written config reads back equal.
         """
         config: dict[str, Any] = {SOLVER_KEY: type(self).__name__}
         for key, value in given.items():
             config[key] = self._config_volume_entry(value) if key in self._VOLUME_KEYS else value
         for key, value in self._DEFAULTS.items():
             if key not in config:
-                config[key] = value
+                config[key] = list(value) if isinstance(value, tuple) else value
         return config
 
     @staticmethod
@@ -688,27 +843,52 @@ class BaseFKPPSolver(ABC):
         """
         Resolve a volume entry of a config file for ``read_config``: a
         NIfTI path is made absolute (relative to base_dir, the config's
-        directory), None stays None. Solvers with other entry formats
-        override this.
+        directory), None stays None. The cavity entry is
+        ``{"segmentation": <NIfTI path>, "label": <int>}`` with the path
+        made absolute.
         """
         if value is None:
             return None
-        return resolve_config_path(value, base_dir, f"{where}: {key}")
+        if key != "resection_cavity":
+            return resolve_config_path(value, base_dir, f"{where}: {key}")
+        if not isinstance(value, Mapping) or set(value) != {"segmentation", "label"}:
+            raise ValueError(
+                f"{where}: resection_cavity must be an object "
+                '{"segmentation": <NIfTI path>, "label": <int>}.'
+            )
+        return {
+            "segmentation": resolve_config_path(
+                value["segmentation"], base_dir, f"{where}: resection_cavity segmentation"
+            ),
+            "label": int(value["label"]),
+        }
 
     def _load_volume_entry(self, key: str, value: Any) -> tuple[NDArray, Any] | None:
         """
-        Load one volume parameter given as a NIfTI path.
+        Load one volume parameter given as a NIfTI path, or the cavity
+        given as ``{"segmentation": <NIfTI path>, "label": <int>}``: the
+        boolean mask of the label in the segmentation (values rounded to
+        the nearest integer first).
 
         Args:
             key: Parameter name.
             value: The parameter value as given.
 
         Returns:
-            (array, image) with the float64 array and the nibabel image the
-            path was loaded from, or None if the value is not a path (an
-            array passes through unchanged). Solvers with other entry
-            formats (a labelled segmentation) override this.
+            (array, image) with the float64 array (the bool mask for a
+            cavity entry) and the nibabel image the path was loaded from,
+            or None if the value is neither (an array passes through
+            unchanged).
         """
+        if key == "resection_cavity" and isinstance(value, Mapping):
+            if set(value) != {"segmentation", "label"}:
+                raise ValueError(
+                    f"{type(self).__name__}: resection_cavity must be an array or "
+                    '{"segmentation": <NIfTI path>, "label": <int>}.'
+                )
+            image = nib.load(str(value["segmentation"]))
+            segmentation = np.rint(np.asarray(image.get_fdata(), dtype=np.float64)).astype(np.int64)
+            return segmentation == int(value["label"]), image
         if isinstance(value, (str, Path)):
             if str(value) == VOLUME_IN_MEMORY:
                 raise ValueError(
@@ -786,9 +966,104 @@ class BaseFKPPSolver(ABC):
             self.affine = np.diag((*voxel_size, 1.0))
 
     def _validate_extra(self, params: dict[str, Any]) -> None:
-        """Solver-specific validation beyond the shared parameters. The
-        merged dict is passed and may be completed with derived parameters
-        (as ``_validate_parameters`` does for volume_threshold)."""
+        """Solver-specific validation beyond the shared parameters, run
+        before the horizon rule and the treatment validation. The merged
+        dict is passed and may be completed with derived parameters (as
+        ``_validate_parameters`` does for volume_threshold)."""
+
+    def _is_treated(self) -> bool:
+        """
+        Whether the run has any treatment, decided on the host from the
+        parameter values alone::
+
+            treated = the cavity is given and not empty
+                   or (chemo_kill_rate > 0 and any chemo dose is nonzero)
+                   or (rt_alpha > 0 and the dose map is given and not zero)
+
+        The decision is deliberately conservative: it ignores the event
+        times, so a treatment scheduled beyond the horizon still counts
+        (the treated step then does nothing). It never reports untreated
+        while an effect exists. An untreated run compiles the model's
+        update alone and builds no treatment volume.
+        """
+        params = self.params
+        cavity = params["resection_cavity"]
+        if cavity is not None and np.any(cavity):
+            return True
+        chemo_doses = np.asarray(params["chemo_doses"], dtype=np.float64)
+        if float(params["chemo_kill_rate"]) > 0 and np.any(chemo_doses):
+            return True
+        dose = params["rt_dose"]
+        return bool(float(params["rt_alpha"]) > 0 and dose is not None and np.any(dose))
+
+    def _treatment_fields(self) -> tuple[NDArray, NDArray]:
+        """
+        The treatment volumes on the low-resolution grid, built only for a
+        treated run and after ``_prepare_input_fields``.
+
+        A given volume is downsampled linearly with the factor of the
+        model's input fields, so the low-resolution grids coincide: the
+        cavity is thresholded at 0.5, the dose clipped at 0. A volume that
+        was not given is built directly at the low-resolution shape, an
+        all-False cavity or an all-zero dose.
+
+        Returns:
+            (cavity, dose): the boolean cavity mask and the total dose in
+            Gy, both of shape ``grid_shape``.
+        """
+        params = self.params
+        factor = params["resolution_factor"]
+        if params["resection_cavity"] is None:
+            cavity_lowres = np.zeros(self.grid_shape, dtype=bool)
+        else:
+            cavity = np.asarray(params["resection_cavity"], dtype=np.float64)
+            cavity_lowres = self._downsample(cavity, factor) >= 0.5
+        if params["rt_dose"] is None:
+            dose_lowres = np.zeros(self.grid_shape)
+        else:
+            dose = np.asarray(params["rt_dose"], dtype=np.float64)
+            dose_lowres = np.clip(self._downsample(dose, factor), 0, None)
+        return cavity_lowres, dose_lowres
+
+    def _build_treatment_constants(
+        self, cavity_host: NDArray, dose_host: NDArray
+    ) -> dict[str, Any]:
+        """
+        Build the treatment device inputs of a treated run on the cropped
+        grid (the keys of ``solvers._TreatmentConstants`` other than
+        'post_resection').
+
+        Args:
+            cavity_host: Boolean cavity mask on the cropped grid.
+            dose_host: Total dose in Gy on the cropped grid.
+        """
+        params = self.params
+        rt_times = np.asarray(params["rt_times"], dtype=np.float64)
+        # Per-fraction dose: rt_dose is the TOTAL dose over all fractions;
+        # without fractions there is no dose.
+        if rt_times.size:
+            dose_per_fraction_host = dose_host / rt_times.size
+        else:
+            dose_per_fraction_host = np.zeros(dose_host.shape)
+        dose_per_fraction = jnp.asarray(dose_per_fraction_host, dtype=self._dtype)
+        # The quadratic coefficient from the alpha/beta ratio, on the host;
+        # rt_beta is derived here and is not a parameter.
+        rt_alpha = float(params["rt_alpha"])
+        rt_beta = rt_alpha / float(params["rt_alpha_beta_ratio"])
+        return {
+            "resection_time": self._dynamic_scalar(params["resection_time"]),
+            "cavity": jnp.asarray(cavity_host),
+            "chemo_times": jnp.asarray(
+                np.asarray(params["chemo_times"], dtype=np.float64), dtype=self._dtype
+            ),
+            "chemo_doses": jnp.asarray(
+                np.asarray(params["chemo_doses"], dtype=np.float64), dtype=self._dtype
+            ),
+            "chemo_kill_rate": self._dynamic_scalar(params["chemo_kill_rate"]),
+            "chemo_decay_rate": self._dynamic_scalar(params["chemo_decay_rate"]),
+            "rt_times": jnp.asarray(rt_times, dtype=self._dtype),
+            "rt_log_kill": lq_log_kill(dose_per_fraction, rt_alpha, rt_beta),
+        }
 
     @property
     def voxel_volume(self) -> float:
@@ -1032,7 +1307,7 @@ class BaseFKPPSolver(ABC):
 
         # x64 is enabled locally (never globally on import): the state keeps
         # its explicit f32/f64 dtype either way, while the stopping-quantity
-        # and guard reductions always run in float64.
+        # reduction always runs in float64.
         with jax.enable_x64():
             state_lowres = self._initialize_state()
             initial_state = {
@@ -1062,19 +1337,33 @@ class BaseFKPPSolver(ABC):
                 shared["volume_threshold"] = self._dynamic_scalar(
                     params["volume_threshold"]
                 )
-            # shared is spread last so a stray solver key can never
-            # overwrite a shared entry.
+            valid_mask_host = self._valid_mask_host(box)
             constants: dict[str, Any] = {
                 **self._build_device_constants(box),
-                **shared,
+                **self._structural_constants(box, valid_mask_host),
             }
+            step_func = self._step_func
+            if self._is_treated():
+                # Only a treated run builds the treatment volumes and
+                # constants and compiles the treated step. Post-resection
+                # structure: the cavity is removed from the valid mask, so
+                # every face touching a cavity voxel carries no flux.
+                cavity_lowres, dose_lowres = self._treatment_fields()
+                cavity_host = cavity_lowres[box]
+                constants.update(self._build_treatment_constants(cavity_host, dose_lowres[box]))
+                constants["post_resection"] = self._structural_constants(
+                    box, np.logical_and(valid_mask_host, ~cavity_host)
+                )
+                step_func = self._treated_step_func
+            # shared is merged last so a stray solver key can never
+            # overwrite a shared entry.
+            constants.update(shared)
 
             device_outputs = _run_time_loop(
                 state_cropped,
                 constants,
-                self._step_func,
+                step_func,
                 self._quantity_func(),
-                self._guard_func,
                 n_steps,
                 record_steps,
             )
@@ -1099,34 +1388,9 @@ class BaseFKPPSolver(ABC):
             stop_kind=int(device_outputs["stop_kind"]),
             stop_step=int(device_outputs["stop_step"]),
             stopping_quantity=float(device_outputs["stopping_quantity"]),
-            guard_mass_change=float(device_outputs["guard_mass_change"]),
-            guard_density=float(device_outputs["guard_density"]),
             buffers=buffers,
             snapshot_times=snapshot_times,
         )
-
-    def _guard_error_message(
-        self,
-        stop_kind: int,
-        stop_step: int,
-        dt: float,
-        guard_mass_change: float,
-        guard_density: float,
-    ) -> str | None:
-        """Build the error message of a fired guard, or None if none fired."""
-        if stop_kind == _STOP_SHRINKAGE:
-            return (
-                "shrinkage guard fired: step-to-step cell-density sum "
-                f"decreased by {-guard_mass_change} (> {SHRINKAGE_LIMIT:g}) "
-                f"(at simulation time {stop_step * dt})"
-            )
-        if stop_kind == _STOP_VANISHING:
-            return (
-                "vanishing-volume guard fired: integrated cell density "
-                f"{guard_density} < {VANISHING_DENSITY_LIMIT:g} "
-                f"(at simulation time {stop_step * dt})"
-            )
-        return None
 
     def _assemble_result(
         self,
@@ -1156,24 +1420,14 @@ class BaseFKPPSolver(ABC):
         else:
             final_time = stop_step * dt
 
-        guard_error = self._guard_error_message(
-            stop_kind,
-            stop_step,
-            dt,
-            loop_results.guard_mass_change,
-            loop_results.guard_density,
-        )
-        if guard_error is not None and self.params["verbose"]:
-            logger.info(f"Early loop exit at t={stop_step * dt}: {guard_error}")
-
         final_state = {
             k: embed(v, box, lowres_shape)
             for k, v in loop_results.final_state_cropped.items()
         }
-        # Solvers without a device guard: an explicit-Euler blow-up surfaces
-        # as NaN/inf in the final state.
-        error = guard_error
-        if error is None and not all(np.isfinite(v).all() for v in final_state.values()):
+        # The only blow-up detector: an explicit-Euler blow-up surfaces as
+        # NaN/inf in the final state.
+        error: str | None = None
+        if not all(np.isfinite(v).all() for v in final_state.values()):
             error = "non-finite final state (time step too large?)"
             if self.params["verbose"]:
                 logger.error(f"Solver failed: {error}")
@@ -1261,20 +1515,54 @@ class BaseFKPPSolver(ABC):
         """
 
     @abstractmethod
+    def _valid_mask_host(self, box: tuple[slice, slice, slice]) -> NDArray:
+        """
+        Return the boolean host mask, on the cropped grid, of the cells
+        that may carry flux: tissue above min_tissue_fraction for the
+        tissue-based solvers, every cell for the DTI solver.
+
+        Args:
+            box: Slices of the tissue bounding box.
+        """
+
+    @abstractmethod
+    def _structural_constants(
+        self, box: tuple[slice, slice, slice], valid_mask_host: NDArray
+    ) -> Mapping[str, Any]:
+        """
+        Build the device inputs that depend on the valid mask, on the
+        cropped grid: the face diffusivities of the single-field solvers,
+        the tissue mask and the nutrient faces of the two-compartment
+        solver.
+
+        Called once per solve with ``_valid_mask_host`` and, in a treated
+        run, a second time with the cavity removed from that mask; the
+        second result is the 'post_resection' entry of the constants, which
+        the treated step substitutes for the first from the resection on.
+
+        Args:
+            box: Slices of the tissue bounding box; the solver's host
+                fields are cropped to it before moving to the device.
+            valid_mask_host: Boolean host mask of the cells that may carry
+                flux, on the cropped grid.
+        """
+
+    @abstractmethod
     def _build_device_constants(
         self, box: tuple[slice, slice, slice]
     ) -> Mapping[str, Any]:
         """
-        Build the solver-specific device inputs of the scan, once per
-        solve on the cropped grid: the field arrays (face diffusivities,
-        tissue masks) and the solver's physical parameters as 0-d device
-        scalars.
+        Build the solver-specific device inputs of the scan that do not
+        depend on the valid mask, once per solve on the cropped grid: the
+        solver's physical parameters as 0-d device scalars and the fields
+        its update reads directly.
 
-        Each solver types the returned dict as its own TypedDict, so its
-        key set is visible and checkable in one place. The base solver
-        merges it flat with the ``_SharedConstants`` it builds itself;
-        solver keys must not collide with the shared ones (the flat
-        per-solver TypedDicts enforce this statically).
+        The base solver merges the returned dict flat with the structural
+        constants (``_structural_constants``), in a treated run the
+        treatment constants, and the ``_SharedConstants`` it builds
+        itself; each solver documents the flat key set as its own
+        TypedDict. Solver keys must not collide with the shared or the
+        treatment ones.
 
         Args:
             box: Slices of the tissue bounding box; the solver's host

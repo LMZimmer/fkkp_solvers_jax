@@ -4,7 +4,7 @@ Fisher-KPP solvers.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Any
 
@@ -18,15 +18,11 @@ GAUSSIAN_SEED_DIFFUSION_TIME: float = 15.0  # width of the analytic heat kernel 
 GAUSSIAN_SEED_MASS: float = 1500.0  # total mass of the kernel; with the width above a peak density of 0.58
 GAUSSIAN_SEED_FLOOR: float = 0.1  # values at or below this are zeroed
 
-# DTI guard thresholds (see solvers._dti_guard)
-SHRINKAGE_LIMIT: float = 10.0
-VANISHING_DENSITY_LIMIT: float = 1e-6
-
 # Stop-kind codes
 _RUNNING: int = 0
 _STOP_THRESHOLD: int = 1
-_STOP_SHRINKAGE: int = 2
-_STOP_VANISHING: int = 3
+
+_AXES = ("x", "y", "z")
 
 SCAN_TRACE_COUNT: int = 0
 
@@ -100,6 +96,50 @@ def masked_face_average(
     """
     condition = jnp.logical_and(shift_grid_by_one(valid_mask, -1, axis=axis), valid_mask)
     return jnp.where(condition, (shift_grid_by_one(field, -1, axis=axis) + field) / 2, 0)
+
+
+def face_diffusivities(
+    diffusivity: float | jax.Array,
+    terms: Sequence[tuple[jax.Array, float | jax.Array]],
+    valid_mask: jax.Array,
+) -> dict[str, jax.Array]:
+    """
+    Build the six face diffusivity arrays consumed by ``diffusion_term``
+    from cell-centered fields.
+
+    For every axis::
+
+        fwd = diffusivity * (avg(field_1) / divisor_1 + avg(field_2) / divisor_2 + ...)
+        bwd = the edge-replicated shift of fwd by +1
+
+    with avg the masked face average (``masked_face_average``) and the sum
+    accumulated left to right. The division is always performed, a divisor
+    of 1 included: dividing by 1 is exact in floating point, so no term
+    needs a special case and a divisor may be a traced device scalar.
+
+    Args:
+        diffusivity: Scalar multiplying every face.
+        terms: (field, divisor) pairs. A field is 3D, or 4D with a trailing
+            axis of three holding one value per axis, of which each axis
+            averages its own component.
+        valid_mask: Boolean mask of the cells that may carry flux; a face
+            touching an invalid cell is zero.
+
+    Returns:
+        The face diffusivities: keys 'fwd_x/y/z' and 'bwd_x/y/z', each the
+        shape of the grid.
+    """
+    faces: dict[str, jax.Array] = {}
+    for axis, name in enumerate(_AXES):
+        mixture = None
+        for field, divisor in terms:
+            values = field[..., axis] if field.ndim == 4 else field
+            term = masked_face_average(values, valid_mask, axis) / divisor
+            mixture = term if mixture is None else mixture + term
+        fwd = diffusivity * mixture
+        faces[f"fwd_{name}"] = fwd
+        faces[f"bwd_{name}"] = shift_grid_by_one(fwd, 1, axis=axis)
+    return faces
 
 
 def diffusion_term(
@@ -406,25 +446,12 @@ def lq_log_kill(
 # --- jitted time loop ---
 
 
-def _no_guard(
-    new_state: dict[str, jax.Array],
-    previous_state: dict[str, jax.Array],
-    constants: Mapping[str, Any],
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Default guard: never fires (pruned by XLA)."""
-    del new_state, previous_state, constants
-    zero_i = jnp.asarray(0, dtype=jnp.int32)
-    zero_f = jnp.asarray(0.0, dtype=jnp.float64)
-    return zero_i, zero_f, zero_f
-
-
 def _time_step(
     carry: dict[str, Any],
     step_input: tuple[jax.Array, jax.Array],
     *,
     step_func: Callable[..., dict[str, jax.Array]],
     quantity_func: Callable[..., jax.Array],
-    guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
     constants: Mapping[str, Any],
     n_slots: int,
 ) -> tuple[dict[str, Any], None]:
@@ -447,14 +474,9 @@ def _time_step(
     new_state = step_func(previous_state, constants, step_index)
     stopping_quantity = quantity_func(new_state, constants)
     threshold_hit = stopping_quantity >= constants["stopping_threshold"]
-    guard_code, guard_mass_change, guard_density = guard_func(
-        new_state, previous_state, constants
-    )
 
-    stop_threshold = is_active & threshold_hit
-    stop_guard = is_active & jnp.logical_not(threshold_hit) & (guard_code > 0)
-    stopped_now = stop_threshold | stop_guard
-    
+    stopped_now = is_active & threshold_hit
+
     do_record = is_active & jnp.logical_not(stopped_now) & (snapshot_slot >= 0)
 
     buffers = carry["buffers"]
@@ -467,13 +489,9 @@ def _time_step(
             for k, buf in buffers.items()
         }
 
-    # First true condition wins; once the loop is inactive all conditions
-    # are False and the default latches the recorded value.
-    stop_kind = jnp.select(
-        [stop_threshold, stop_guard & (guard_code == 1), stop_guard],
-        [_STOP_THRESHOLD, _STOP_SHRINKAGE, _STOP_VANISHING],
-        default=carry["stop_kind"],
-    )
+    # Once the loop is inactive stopped_now is False and the recorded value
+    # is latched.
+    stop_kind = jnp.where(stopped_now, _STOP_THRESHOLD, carry["stop_kind"])
     next_carry = {
         "state": {
             k: jnp.where(is_active, new_state[k], previous_state[k])
@@ -486,12 +504,6 @@ def _time_step(
         "stopping_quantity": jnp.where(
             is_active, stopping_quantity, carry["stopping_quantity"]
         ),
-        "guard_mass_change": jnp.where(
-            stop_guard, guard_mass_change, carry["guard_mass_change"]
-        ),
-        "guard_density": jnp.where(
-            stop_guard, guard_density, carry["guard_density"]
-        ),
         "n_recorded": carry["n_recorded"] + do_record.astype(jnp.int32),
         "buffers": buffers,
     }
@@ -503,7 +515,6 @@ def _time_step(
     static_argnames=(
         "step_func",
         "quantity_func",
-        "guard_func",
         "n_steps",
         "n_slots",
     ),
@@ -515,7 +526,6 @@ def _run_time_scan(
     *,
     step_func: Callable[..., dict[str, jax.Array]],
     quantity_func: Callable[..., jax.Array],
-    guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
     n_steps: int,
     n_slots: int,
 ) -> dict[str, Any]:
@@ -538,7 +548,6 @@ def _run_time_scan(
         slot_ids: Snapshot slot of each step (-1: no snapshot).
         step_func: Step function, see ``_run_time_loop``.
         quantity_func: Stopping-quantity function, see ``_run_time_loop``.
-        guard_func: Post-step guard function, see ``_run_time_loop``.
         n_steps: Number of scan iterations.
         n_slots: Number of snapshot slots.
 
@@ -546,14 +555,11 @@ def _run_time_scan(
         The final scan carry: a dict of device values with keys
         'state' (the fields after the last active step),
         'active' (False if a stop fired),
-        'stop_kind' (_RUNNING, _STOP_THRESHOLD, _STOP_SHRINKAGE or
-        _STOP_VANISHING),
+        'stop_kind' (_RUNNING or _STOP_THRESHOLD),
         'stop_step' (step index at which the loop stopped, 0 if it never
         did),
         'stopping_quantity' (stopping quantity of the last active step,
-        float64),
-        'guard_mass_change' and 'guard_density' (guard diagnostics of the
-        stopping step, 0.0 unless a guard fired) and
+        float64) and
         'buffers' / 'n_recorded' (per-field snapshot arrays of shape
         (n_slots, *field_shape) and the number of frames written).
     """
@@ -567,7 +573,6 @@ def _run_time_scan(
         _time_step,
         step_func=step_func,
         quantity_func=quantity_func,
-        guard_func=guard_func,
         constants=constants,
         n_slots=n_slots,
     )
@@ -578,8 +583,6 @@ def _run_time_scan(
         "stop_kind": jnp.asarray(_RUNNING, dtype=jnp.int32),
         "stop_step": jnp.asarray(0, dtype=jnp.int32),
         "stopping_quantity": jnp.asarray(0.0, dtype=jnp.float64),
-        "guard_mass_change": jnp.asarray(0.0, dtype=jnp.float64),
-        "guard_density": jnp.asarray(0.0, dtype=jnp.float64),
         "n_recorded": jnp.asarray(0, dtype=jnp.int32),
         "buffers": {
             k: jnp.zeros((n_slots,) + v.shape, dtype=v.dtype)
@@ -595,15 +598,14 @@ def _run_time_loop(
     constants: Mapping[str, Any],
     step_func: Callable[..., dict[str, jax.Array]],
     quantity_func: Callable[..., jax.Array],
-    guard_func: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
     n_steps: int,
     record_steps: NDArray,
 ) -> dict[str, Any]:
     """
     Prepare the host-side inputs and call the time scan (jitted loop).
 
-    The three functions must be defined at module level so that every solve
-    passes the identical function object and the jit cache is reused. Their
+    The two functions must be module-level objects so that every solve
+    passes the identical object and the jit cache is reused. Their
     required signatures::
 
         def step_func(
@@ -616,18 +618,8 @@ def _run_time_loop(
             state: dict[str, jax.Array], constants: Mapping[str, Any]
         ) -> jax.Array: ...  # the float64 stopping quantity
 
-        def guard_func(
-            new_state: dict[str, jax.Array],
-            previous_state: dict[str, jax.Array],
-            constants: Mapping[str, Any],
-        ) -> tuple[jax.Array, jax.Array, jax.Array]: ...
-
-    The guard is a post-step sanity check: it compares the stepped state
-    against the previous one to detect a solve gone wrong (e.g. an
-    explicit-Euler instability) and returns (code, mass change, integrated
-    density); code 0 = no guard fired, 1 = shrinkage, 2 = vanishing volume.
-    If it fires, the time loop stops and the run is reported as a failure.
-    The default guard (``_no_guard``) never fires.
+    The loop stops early only when the stopping quantity reaches the
+    stopping threshold; it has no other exit.
 
     Args:
         state: Initial device state on the cropped grid.
@@ -638,7 +630,6 @@ def _run_time_loop(
             'stopping_threshold' and, in volume mode, 'volume_threshold').
         step_func: Step function, see above.
         quantity_func: Stopping-quantity function, see above.
-        guard_func: Post-step guard function, see above.
         n_steps: Number of time steps.
         record_steps: Step indices in [0, n_steps) after which a snapshot
             of the state is recorded, in ascending order; empty records
@@ -658,7 +649,6 @@ def _run_time_loop(
         jnp.asarray(slot_ids),
         step_func=step_func,
         quantity_func=quantity_func,
-        guard_func=guard_func,
         n_steps=n_steps,
         n_slots=n_slots,
     )

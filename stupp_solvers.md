@@ -1,10 +1,11 @@
 # Stupp treatments in all three solvers: implementation plan
 
-Written 2026-09-17, revised 2026-09-29 after review. Nothing of sections 2
-to 7 is implemented yet, with one exception: step 0 of section 7, the
-two-compartment reference solve of section 9, is done. The plan records
-the design agreed for `fisher_kpp_jax` and the order in which to build it.
-Work happens on branch `stupp_all`.
+Written 2026-09-17, revised 2026-09-29 after review, implemented from
+2026-09-30 on in the order of section 7, which marks each step when it is
+committed: steps 0 to 3 are done. Section 10 records what the
+implementation added to the plan or does differently. The plan records the
+design agreed for `fisher_kpp_jax` and the order in which to build it. Work
+happens on branch `stupp_all`.
 
 ## 1. Goal and decisions
 
@@ -492,15 +493,15 @@ arises only from an exception or from the non-finite check.
 
 0. Done 2026-09-29: the two-compartment reference solve stored
    (section 9), the script extended.
-1. `operators.py`: add `face_diffusivities`; delete the guard mechanism
+1. Done 2026-09-30: `operators.py`: add `face_diffusivities`; delete the guard mechanism
    (section 4.5) and shrink the scan carry accordingly.
-2. `solvers.py`: switch the three models to the builder; add
+2. Done 2026-09-30: `solvers.py`: switch the three models to the builder; add
    `_valid_mask_host` and `_structural_constants`; rename the two steps to
    updates; add `_treated_step` and the two bindings; delete
    `_stupp_step`, `_mixture_face_fields`, `_dti_guard`, the
    `StuppFKPPSolver` class and its TypedDicts; add `_TreatmentConstants`;
    set `_step_func` and `_treated_step_func` on each class.
-3. `base.py`: treatment keys and defaults in the shared defaults, the
+3. Done 2026-09-30: `base.py`: treatment keys and defaults in the shared defaults, the
    horizon rule, the cavity config entry methods, the treatment validation
    with `null` volumes left alone, the treated predicate, the treatment
    volumes on the low-resolution grid (section 3.5), the constants
@@ -575,3 +576,28 @@ Model-specific:
   stored ones; `--write-two-compartment-reference` rewrites them.
 - **Anisotropic:** none; a tensor field has to be processed first
   (section 8).
+
+## 10. Implementation notes (2026-09-30)
+
+- **Steps 1 to 3.** Old against new on the 24^3 phantoms, 90 arrays
+  (final fields, snapshots, step counts and stopping quantities of the
+  untreated isotropic, two-compartment and anisotropic runs with the time,
+  threshold and volume stops, and of treated isotropic runs, the former
+  `StuppFKPPSolver` against `FKPPSolver`; f32 and f64): max|d| = 0 for
+  every array on the GPU and on the CPU.
+- `base.py` holds `TREATMENT_DEFAULTS`, `TREATMENT_VOLUME_KEYS`,
+  `HORIZON_KEYS` and `DEFAULT_STOPPING_TIME`; the shared defaults
+  (`_COMMON_DEFAULTS` in `solvers.py`) take the treatment defaults from
+  there. The horizon rule is `_resolve_horizon`, the treatment validation
+  `_validate_treatment`, the treated predicate `BaseFKPPSolver._is_treated`
+  (evaluated at solve time from `params`), the volumes
+  `_treatment_fields`, the device constants `_build_treatment_constants`.
+- The treatment volumes are built in `_run_device_loop`, right before the
+  constants, not during the grid setup: `resolve_time_stepping()` builds
+  none, a treated solve builds them once.
+- `_TreatmentConstants` lives in `solvers.py` as planned, while its values
+  are built in `base.py`, whose builders therefore return plain dicts.
+- A default that is a tuple is recorded in `solver.config` as a list
+  (section 3.1).
+- `stopping_time` itself is still not validated (as before); the horizon
+  rule only decides which of the two keys gives it.
