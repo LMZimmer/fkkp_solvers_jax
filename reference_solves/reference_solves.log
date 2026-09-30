@@ -4,22 +4,22 @@ config: Dw=0.927641 rho=0.091541 RatioDw_Dg=100 days=100 Nt=4608 (dt=0.0217014 d
 grid: (182, 218, 182), seed voxel (140, 116, 55), GliODIL seed (Dt=15, M=1500)
 
 == fkpp_jax_f64_cpu ==
-  wall time: 1.1 min
-  CPU time:  11.3 min -> 10.40 cores busy on average
+  wall time: 1.2 min
+  CPU time:  12.3 min -> 10.40 cores busy on average
   final_time=100, criterion=time, final mass=58181.566, max density=0.999241
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/result_fkpp_jax_f64_cpu.nii.gz
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/segmentation_fkpp_jax_f64_cpu.nii.gz
 
 == fkpp_jax_f64_gpu ==
-  wall time: 0.1 min
-  CPU time:  0.1 min -> 0.88 cores busy on average
+  wall time: 0.3 min
+  CPU time:  0.3 min -> 0.93 cores busy on average
   final_time=100, criterion=time, final mass=58181.566, max density=0.999241
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/result_fkpp_jax_f64_gpu.nii.gz
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/segmentation_fkpp_jax_f64_gpu.nii.gz
 
 == fkpp_jax_f32_gpu ==
   wall time: 0.1 min
-  CPU time:  0.1 min -> 0.92 cores busy on average
+  CPU time:  0.1 min -> 0.90 cores busy on average
   final_time=100, criterion=time, final mass=58181.56, max density=0.99924
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/result_fkpp_jax_f32_gpu.nii.gz
   saved /home/home/lucas/projects/pde_solver_development/reference_solves/segmentation_fkpp_jax_f32_gpu.nii.gz
@@ -28,5 +28,20 @@ grid: (182, 218, 182), seed voxel (140, 116, 55), GliODIL seed (Dt=15, M=1500)
   fkpp_jax_f64_cpu     max|d|=2.776e-16  relL2=3.869e-17
   fkpp_jax_f64_gpu     max|d|=2.220e-16  relL2=6.983e-18
   fkpp_jax_f32_gpu     max|d|=1.473e-06  relL2=2.166e-07
+
+== two_compartment_f64 ==
+  config: fisher_kpp_jax/configs/TwoCompartmentWithNutrientFKPPSolver.json at precision f64 on gpu
+  n_steps=941, dt=0.106364 d
+  wall time: 0.2 min
+  CPU time:  0.1 min -> 0.61 cores busy on average
+  final_time=100, criterion=time, final mass (P + N)=42880.563
+  proliferative  sum=31666.031  max=0.349407
+  necrotic       sum=11214.532  max=0.875379
+  nutrient       sum=1562492  max=1
+
+== comparison vs reference_two_compartment_<field>.nii.gz ==
+  proliferative  max|d|=0.000e+00  relL2=0.000e+00
+  necrotic       max|d|=0.000e+00  relL2=0.000e+00
+  nutrient       max|d|=0.000e+00  relL2=0.000e+00
 
 done.
