@@ -1,9 +1,13 @@
 """Fisher-KPP tumor growth forward solvers.
 
-Four solvers share one parameter interface and return a ``Result``
-(``StuppFKPPSolver`` extends the isotropic model with resection,
-chemotherapy and radiotherapy). A solver is built from its parameters as
-one mapping or as keyword arguments, ``Solver(params)`` or
+Three solvers (``FKPPSolver``, ``TwoCompartmentWithNutrientFKPPSolver``,
+``AnisotropicFKPPSolver``) share one parameter interface and return a
+``Result``. Each has the treatment effects of a Stupp protocol built in
+(resection, chemotherapy, radiotherapy); the treatment parameters default
+to neutral values, and a run that leaves them neutral is the untreated run
+exactly. ``StuppFKPPSolver`` is a former name of ``FKPPSolver``, kept so
+that saved configs naming it still load. A solver is built from its
+parameters as one mapping or as keyword arguments, ``Solver(params)`` or
 ``Solver(**config)``; volumes (tissue maps, tensors, treatment maps) may be
 arrays or NIfTI paths, in which case the voxel size and affine come from
 the header. Every solver holds its ``config`` (the parameters as given,
@@ -17,11 +21,13 @@ names the class, and a ``"solver"`` entry in the config is checked against
 it, never used to pick one.
 
 Common solver options: ``precision: "f32" | "f64"`` (default "f32")
-selects the device state dtype; the time step is given as at most one of
-``n_steps``, ``dt`` (days) or ``steps_per_day``, raised to the solver's
-stability estimate with a warning when coarser (none given: the
-estimate); ``snapshot_times`` (a list of days) records the state at the
-nearest steps into ``Result.time_series`` with the recorded days in
+selects the device state dtype; the horizon is given as at most one of
+``stopping_time`` or ``time_after_resection`` (days; neither: 100 days);
+the time step is given as at most one of ``n_steps``, ``dt`` (days) or
+``steps_per_day``, raised to the solver's stability estimate with a
+warning when coarser (none given: the estimate); ``snapshot_times`` (a
+list of days) records the state at the nearest steps into
+``Result.time_series`` with the recorded days in
 ``Result.snapshot_times``. The explicit-Euler time loop runs as a jitted
 ``jax.lax.scan`` on GPU when one is available, with automatic CPU
 fallback. ``scripts/run_reference_solves.py`` checks that the reference
@@ -45,9 +51,12 @@ from .config import (
 from .solvers import (
     AnisotropicFKPPSolver,
     FKPPSolver,
-    StuppFKPPSolver,
     TwoCompartmentWithNutrientFKPPSolver,
 )
+
+# Former name of FKPPSolver (the isotropic solver with the treatments,
+# which every solver has now); saved configs naming it still load.
+StuppFKPPSolver = FKPPSolver
 
 # Persistent compilation cache: shapes are static per crop box, so identical
 # repeat solves (and re-runs of the same script) skip XLA recompilation.
