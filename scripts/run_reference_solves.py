@@ -1,8 +1,10 @@
 #!/usr/bin/env python
-"""Forward-solve the GliODIL single-patient config with the JAX FKPP solver.
+"""Forward-solve the reference configurations with the fisher_kpp_jax solvers
+and compare against the stored references in reference_solves/.
 
-Mirrors the GliODIL run captured in reference_solves/reference.log (produced
-by /home/home/lucas/projects/dockerize/GliODIL/forward_solve_single.py): same
+Isotropic section (``--solvers isotropic``). Mirrors the GliODIL run captured
+in reference_solves/reference.log (produced by
+/home/home/lucas/projects/dockerize/GliODIL/forward_solve_single.py): same
 D, rho, ratio, time horizon, timestep count, seed position, tissue maps and
 full-volume grid, but runs fisher_kpp_jax.FKPPSolver instead of GliODIL's
 synthetic_generator.py:
@@ -10,10 +12,6 @@ synthetic_generator.py:
   1. fkpp_jax_f64_cpu — f64 on CPU,
   2. fkpp_jax_f64_gpu — f64 on GPU (skipped when no GPU is visible),
   3. fkpp_jax_f32_gpu — f32 on GPU (falls back to CPU, named _cpu then).
-
-Only the plain FKPP solver is run: the GliODIL config does not define the
-nutrient/necrosis parameters of FK_2c or a DTI tensor field, so the other two
-solvers have no clean parameter mapping and are skipped.
 
 Two parameter choices pin the run to the GliODIL configuration:
 
@@ -28,21 +26,39 @@ Two parameter choices pin the run to the GliODIL configuration:
     device at the state dtype; differences to GliODIL's host float64 profile
     are at the ULP level.
 
-Inputs: reference_solves/{gm,wm}_pbmap.nii.gz (the patient's tissue
-probability maps). Outputs per run, GliODIL-style with identity affine:
-result_<run>.nii.gz and segmentation_<run>.nii.gz, next to the GliODIL
-reference pair result_reference.nii.gz / segmentation_reference.nii.gz.
+Inputs: reference_solves/{gm,wm}_pbmap.nii.gz (the tissue probability maps
+of SAILOR sub-01, session 1, on the 182x218x182 1 mm grid). Outputs per
+run, GliODIL-style with identity affine: result_<run>.nii.gz and
+segmentation_<run>.nii.gz, next to the GliODIL reference pair
+result_reference.nii.gz / segmentation_reference.nii.gz. Everything printed
+is also written to reference_solves/reference_solves.log (the counterpart
+of reference.log): the config, available CPUs, wall-clock and CPU time per
+solver, and the comparison table against the GliODIL reference.
 
-Everything printed is also written to reference_solves/reference_solves.log
-(the counterpart of reference.log): the config, available CPUs, wall-clock and
-CPU time per solver, and the comparison table against the GliODIL reference.
+Two-compartment section (``--solvers two_compartment``). There is no
+external reference for TwoCompartmentWithNutrientFKPPSolver; the stored
+fields are a regression baseline of fisher_kpp_jax itself, taken on
+2026-09-29 before the treatment extension. The run is the class default
+config fisher_kpp_jax/configs/TwoCompartmentWithNutrientFKPPSolver.json
+(the same tissue maps, D, rho, seed and grid as FKPPSolver.json plus the
+placeholder nutrient and necrosis values) solved once at f64 on the GPU
+(CPU when none is visible), at the solver's own stability step. Its three
+final fields are stored as
+reference_solves/reference_two_compartment_<field>.nii.gz (float64, the
+maps' affine; no config and no log are stored). Every later run of this
+section solves the same config and prints max|d| and relL2 of each field
+against the stored one; ``--write-two-compartment-reference`` (re)writes
+the stored fields instead of comparing.
 
 Run from the project root:
   CUDA_VISIBLE_DEVICES=<free gpu> python scripts/run_reference_solves.py
+      [--solvers all|isotropic|two_compartment]
+      [--write-two-compartment-reference]
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import resource
 import sys
@@ -94,6 +110,9 @@ SEED_Z_FRACTION = (55 + 0.5) / 182
 
 AFFINE = np.eye(4)  # the generator saves everything with an identity affine
 
+# --- two-compartment regression baseline ---
+TWO_COMPARTMENT_FIELDS = ("proliferative", "necrotic", "nutrient")
+
 CPU_DEVICE = jax.devices("cpu")[0]
 try:
     GPU_DEVICE = jax.devices("gpu")[0]
@@ -104,7 +123,8 @@ _log_file = None
 
 
 def emit(message: str = "") -> None:
-    """Print and append to the run log (the counterpart of reference.log)."""
+    """Print and append to the run log (the counterpart of reference.log)
+    when the log is open (the isotropic section opens it)."""
     print(message)
     if _log_file is not None:
         _log_file.write(message + "\n")
@@ -153,19 +173,9 @@ def save_outputs(name: str, cell_density: np.ndarray) -> None:
     emit(f"  saved {segm_path}")
 
 
-def main() -> None:
-    global _log_file
-    os.makedirs(OUT_DIR, exist_ok=True)
-    _log_file = open(LOG_PATH, "w")
-
-    emit(f"jax {jax.__version__}, default backend: {jax.default_backend()}")
-    if GPU_DEVICE is None:
-        emit("No GPU visible: the f64 GPU run is skipped, f32 executes on CPU.")
-    emit(
-        f"CPUs: {len(os.sched_getaffinity(0))} available of {os.cpu_count()} "
-        "on this host"
-    )
-
+def run_isotropic() -> list[str]:
+    """The three FKPPSolver runs of the GliODIL configuration and their
+    comparison against the GliODIL reference. Returns the failed runs."""
     gm, wm = load_tissue_maps()
     emit(
         f"config: Dw={DW} rho={RHO} RatioDw_Dg={RATIO_DW_DG} days={DAYS} Nt={NT} "
@@ -246,16 +256,133 @@ def main() -> None:
                 continue
             max_abs, rel = rel_l2(field, reference)
             emit(f"  {name:20s} max|d|={max_abs:.3e}  relL2={rel:.3e}")
+    return failures
+
+
+def two_compartment_reference_path(field: str) -> str:
+    """The stored reference of one two-compartment final field."""
+    return os.path.join(OUT_DIR, f"reference_two_compartment_{field}.nii.gz")
+
+
+def run_two_compartment(write_reference: bool) -> list[str]:
+    """
+    Solve the two-compartment default config at f64 (GPU when visible) and
+    compare its final fields against the stored reference, or write the
+    stored reference with write_reference. Returns the failures (the run
+    itself, or a missing stored reference).
+    """
+    name = "two_compartment_f64"
+    device = GPU_DEVICE if GPU_DEVICE is not None else CPU_DEVICE
+    config = jax_pkg.TwoCompartmentWithNutrientFKPPSolver.get_default_config()
+    emit(f"\n== {name} ==")
+    emit(
+        "  config: fisher_kpp_jax/configs/TwoCompartmentWithNutrientFKPPSolver.json "
+        f"at precision f64 on {device.platform}"
+    )
+    solver = jax_pkg.TwoCompartmentWithNutrientFKPPSolver({**config, "precision": "f64"})
+    wall_start = time.perf_counter()
+    cpu_start = cpu_seconds()
+    with jax.default_device(device):
+        result = solver.solve()
+    wall = time.perf_counter() - wall_start
+    cpu = cpu_seconds() - cpu_start
+    if not result.success:
+        emit(f"  FAILED after {wall / 60:.1f} min: {result.error}")
+        return [f"{name}: {result.error}"]
+    finals = {
+        field: np.asarray(result.final_state[field], dtype=np.float64)
+        for field in TWO_COMPARTMENT_FIELDS
+    }
+    emit(f"  n_steps={result.n_steps}, dt={result.dt:.6g} d")
+    emit(f"  wall time: {wall / 60:.1f} min")
+    emit(f"  CPU time:  {cpu / 60:.1f} min -> {cpu / wall:.2f} cores busy on average")
+    emit(
+        f"  final_time={result.final_time:g}, "
+        f"criterion={result.stopping_criterion}, "
+        f"final mass (P + N)={result.final_stopping_quantity:.8g}"
+    )
+    for field, values in finals.items():
+        emit(f"  {field:14s} sum={values.sum():.8g}  max={values.max():.6g}")
+
+    if write_reference:
+        for field, values in finals.items():
+            path = two_compartment_reference_path(field)
+            nib.save(nib.Nifti1Image(values, result.affine), path)
+            emit(f"  saved {path}")
+        return []
+
+    missing = [
+        field
+        for field in TWO_COMPARTMENT_FIELDS
+        if not os.path.exists(two_compartment_reference_path(field))
+    ]
+    if missing:
+        emit(
+            f"  no stored reference for {missing}; run with "
+            "--write-two-compartment-reference to create it."
+        )
+        return [f"{name}: no stored reference for {missing}"]
+    emit("\n== comparison vs reference_two_compartment_<field>.nii.gz ==")
+    for field, values in finals.items():
+        stored = np.asarray(
+            nib.load(two_compartment_reference_path(field)).get_fdata(), dtype=np.float64
+        )
+        max_abs, rel = rel_l2(values, stored)
+        emit(f"  {field:14s} max|d|={max_abs:.3e}  relL2={rel:.3e}")
+    return []
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--solvers",
+        choices=("all", "isotropic", "two_compartment"),
+        default="all",
+        help="which section(s) to run (default: all)",
+    )
+    parser.add_argument(
+        "--write-two-compartment-reference",
+        action="store_true",
+        help="(re)write reference_solves/reference_two_compartment_<field>.nii.gz "
+        "from this run instead of comparing against them",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    global _log_file
+    args = parse_args()
+    os.makedirs(OUT_DIR, exist_ok=True)
+    isotropic = args.solvers in ("all", "isotropic")
+    two_compartment = args.solvers in ("all", "two_compartment")
+    if isotropic:
+        _log_file = open(LOG_PATH, "w")
+
+    emit(f"jax {jax.__version__}, default backend: {jax.default_backend()}")
+    if GPU_DEVICE is None:
+        emit("No GPU visible: the f64 GPU run is skipped, f32 executes on CPU.")
+    emit(
+        f"CPUs: {len(os.sched_getaffinity(0))} available of {os.cpu_count()} "
+        "on this host"
+    )
+
+    failures: list[str] = []
+    if isotropic:
+        failures += run_isotropic()
+    if two_compartment:
+        failures += run_two_compartment(args.write_two_compartment_reference)
 
     emit()
     if failures:
         emit("FAILED runs:")
         for failure in failures:
             emit(f" - {failure}")
-        _log_file.close()
+        if _log_file is not None:
+            _log_file.close()
         sys.exit(1)
     emit("done.")
-    _log_file.close()
+    if _log_file is not None:
+        _log_file.close()
 
 
 if __name__ == "__main__":

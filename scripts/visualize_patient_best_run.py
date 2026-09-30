@@ -1,21 +1,40 @@
 #!/usr/bin/env python
 """Re-solve the best run of a scripts/patient_sensitivity_analysis.py sweep
-and render it next to the patient's longitudinal tumour segmentations.
+or of a scripts/patient_cmaes_fit.py fit and render it next to the
+patient's longitudinal tumour segmentations.
 
-The best run is the qoi.csv row with the largest --criterion (default
-dice_mean_core, the sweep's per-run metric: the mean core Dice over the
-post-op sessions at the row's sampled thresholds). Its run config
-(<run-root>/configs/<run>.json, the sweep's own; --run-root defaults to
-the sweep's default output root joined with spec.json's name) is solved
-once more with fisher_kpp_jax.StuppFKPPSolver, recording the state at the
-patient's session moments exactly as the sweep did (the last step end at
-least half a step before t_pre + offset, ``session_snapshot_days``) plus a
-frame every --snapshot-interval-days days (default 2) that samples the
-core volume curve; the sweep's saved run is not read.
+Sweep (--sweep-dir). The best run is the qoi.csv row with the largest
+--criterion (default dice_mean_core, the sweep's per-run metric: the mean
+core Dice over the post-op sessions at the row's sampled thresholds). Its
+run config (<run-root>/configs/<run>.json, the sweep's own; --run-root
+defaults to the sweep's default output root joined with spec.json's name)
+is solved once more with fisher_kpp_jax.StuppFKPPSolver, recording the
+state at the patient's session moments exactly as the sweep did (the last
+step end at least half a step before t_pre + offset,
+``session_snapshot_days``), with --volume-curve plus a frame every
+--snapshot-interval-days days (default 2) that samples the core volume
+curve; the sweep's saved run is not read.
+
+Fit (--fit-dir). The best run is the fit's re-solved best evaluation
+(best/config.json, written by the fit's resolve). It is solved once more
+as the fit saved it: its schedule, its fixed n_steps and the session
+moments and snapshot days of the config's "_fit" record, over the
+sessions the fit simulated (plus the curve frames with --volume-curve); the patient and the
+sessions come from the fit's spec.json. The criterion is the re-solve's
+J (best/objective.json). --run-root, --criterion and --schedule are
+sweep options.
 
 Core threshold. --core-threshold logged (the default) takes the best
 row's core_threshold column (sampled mode records it per row; in
-profiled mode the column is absent and the script falls back to infer).
+profiled mode the column is absent and the script falls back to infer);
+for a fit it is the re-solve's profiled core threshold, so the
+per-session Dice equals the fit's dice_core_star (printed next to it and
+recorded as fit_dice_core) when the fit was scored with the current
+masks (its spec.json's label_conventions equal FIT_LABEL_CONVENTIONS;
+a note is printed otherwise). A fit's masks are
+patient_cmaes_fit.fit_session_references: the ones below with the
+resection cavity (the post-op session's label 4) also removed in every
+later session.
 --core-threshold infer maximises the mean over all sessions of the Dice
 between the segmented core and the thresholded field over the grid
 0.05..0.95 step 0.01. A number fixes it. Masks follow the sweep
@@ -29,9 +48,11 @@ volumes, the cavity outline and the threshold inference use the
 corrected masks. The session frames are
 rounded for storage as the sweep rounds its fields before the masks are
 taken, so the per-session Dice and volumes equal the sweep's. The
-volume curve between sessions has no segmentation to exclude with, so
-the curve is the plain thresholded volume; the session markers on it
-carry the exclusion, as the Dice does.
+volume curve (only with --volume-curve) masks every frame with the valid mask (the corrected
+cavity excluded) of the most recent session recorded at or before it,
+nothing before the first session, so at each session it equals the
+session's model core volume and in between it carries the last scan's
+mask forward.
 
 Schedule. --schedule current (the default) rebuilds the clinical
 timeline from spec.json's sessions and protocol doses with the patient
@@ -66,32 +87,40 @@ config.json):
                   per session, each point labelled with its session id
   model           the recorded field overlaid (inferno at alpha 0.75 as
                   PredictGBM's prediction overlay, densities below
-                  --display-threshold transparent) with the core
-                  threshold as a white contour and the session's cavity
-                  outlined in the palette's green; below, the thresholded
-                  core volume along the run, the session values marked,
-                  the reference core volumes as hollow markers, and the
+                  --display-threshold transparent) with the session's
+                  segmented enhancing tumour (label 3, the pre-op 4 -> 3)
+                  as a white contour and the session's cavity (after the
+                  cavity correction, the one the Dice excludes) outlined
+                  in the palette's green; below, the model core
+                  volume per session (cavity excluded), with
+                  --volume-curve the thresholded core volume along the
+                  run (latest scan's mask) as a line through them, the
+                  reference core volumes as hollow markers, and the
                   per-session Dice in each panel
 Written into <output-dir>/<run-name>/ (exist_ok=False, nothing outside
 it): config.json, result.json, initial_cell_density.nii.gz and
 final_cell_density.nii.gz (fisher_kpp_jax.Result.save), the session
 frames <session>_cell_density.nii.gz, segmentations.pdf/.png,
-model.pdf/.png and run_summary.json (the best row and its criterion
+model.pdf/.png and run_summary.json (the best row, or the fit's best
+restart and evaluation, and its criterion
 value, the threshold and how it was chosen, the slice, per session the
 model moment, post-op day, recorded day, Dice, model and reference core
-volume, excluded cavity and relabelled voxel counts, and the
-snapshot days and volumes of the curve).
+volume, excluded cavity and relabelled voxel counts, and with
+--volume-curve the snapshot days and volumes of the curve).
 
 Run from the project root, e.g.:
   CUDA_VISIBLE_DEVICES=<free gpu> python scripts/visualize_patient_best_run.py \\
       --sweep-dir results/sa_2026-09-14_SAILOR_sub-01 --output-dir runs/
   JAX_PLATFORMS=cpu python scripts/visualize_patient_best_run.py --sweep-dir <dir> \\
       --output-dir runs/ --core-threshold infer
+  CUDA_VISIBLE_DEVICES=<free gpu> python scripts/visualize_patient_best_run.py \\
+      --fit-dir /mnt/Drive4/lucas/stupp_patient_fit/fit_sub01_2026-09-27 --output-dir runs/
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from datetime import date, datetime, timezone
@@ -102,6 +131,11 @@ from typing import Any
 # jax initializes the backend.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "32")
+# numpy asks for transparent hugepages on large arrays; on a host with
+# fragmented memory every page fault of the multi-GB frame stack then stalls
+# in direct compaction (2026-09-28: np.stack of 37 frames ran > 4 min in
+# kernel time, 12 s without). Read by numpy at import.
+os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
@@ -142,10 +176,15 @@ from patient_sensitivity_analysis import (  # noqa: E402
     session_snapshot_days,
     snapshot_file,
 )
+from patient_cmaes_fit import FIT_LABEL_CONVENTIONS, fit_session_references  # noqa: E402
 from sensitivity_analysis import as_float, read_csv, read_json, round_field, write_json  # noqa: E402
 
 DEFAULT_CRITERION = "dice_mean_core"
 THRESHOLD_COLUMN = "core_threshold"
+# A fit directory's re-solved best run (scripts/patient_cmaes_fit.py resolve).
+FIT_BEST_DIR = "best"
+FIT_OBJECTIVE_FILE = "objective.json"
+FIT_CRITERION = "J"
 INFER_GRID: NDArray = np.round(np.arange(0.05, 0.95 + 1e-9, 0.01), 2)
 # Background image per session below <root>/<patient>/<session>/.
 PREOP_T1C = Path("skull_stripped") / "t1c_skullstripped.nii.gz"
@@ -168,7 +207,7 @@ LABEL_COLORS: dict[int, tuple[float, float, float, float]] = {
 SEGMENTATION_ALPHA = 0.6
 FIELD_ALPHA = 0.75
 CAVITY_OUTLINE_COLOR = LABEL_COLORS[LABEL_CAVITY]
-CORE_CONTOUR_COLOR = "white"
+ENHANCING_CONTOUR_COLOR = "white"
 MODEL_COLOR = "black"
 REFERENCE_COLOR = (0.85, 0.25, 0.10, 1.0)
 
@@ -177,33 +216,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
-        "--sweep-dir", required=True, help="sweep directory holding spec.json, design.csv and qoi.csv"
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--sweep-dir", default=None, help="sweep directory holding spec.json, design.csv and qoi.csv"
+    )
+    source.add_argument(
+        "--fit-dir",
+        default=None,
+        help="scripts/patient_cmaes_fit.py fit directory holding spec.json and the re-solved best/",
     )
     parser.add_argument(
         "--run-root",
         default=None,
         help="sweep directory holding configs/<run>.json (default: the patient script's "
-        "default output root joined with spec.json's name)",
+        "default output root joined with spec.json's name; --sweep-dir only)",
     )
     parser.add_argument(
-        "--criterion", default=DEFAULT_CRITERION, help=f"qoi.csv column maximised (default {DEFAULT_CRITERION})"
+        "--criterion",
+        default=DEFAULT_CRITERION,
+        help=f"qoi.csv column maximised (default {DEFAULT_CRITERION}; --sweep-dir only)",
     )
     parser.add_argument(
         "--core-threshold",
         default="logged",
-        help="'logged' (the best row's core_threshold; default), 'infer' (mean Dice over the sessions "
-        "maximised on a grid) or a number",
+        help="'logged' (the best row's core_threshold, or the fit's profiled core threshold; default), "
+        "'infer' (mean Dice over the sessions maximised on a grid) or a number",
     )
     parser.add_argument(
         "--schedule",
         choices=("current", "sweep"),
-        default="current",
+        default=None,
         help="'current' (default) rebuilds the treatment schedule with the patient script's present "
-        "protocol constants; 'sweep' solves the config as the sweep saved it",
+        "protocol constants; 'sweep' solves the config as the sweep saved it (--sweep-dir only; a fit's "
+        "config is solved with its own schedule)",
     )
     parser.add_argument(
-        "--snapshot-interval-days", type=float, default=2.0, help="spacing of the curve frames (default 2)"
+        "--volume-curve",
+        action="store_true",
+        help="draw the model core volume along the run as a line on the model figure's volume panel",
+    )
+    parser.add_argument(
+        "--snapshot-interval-days",
+        type=float,
+        default=2.0,
+        help="spacing of the curve frames (default 2; --volume-curve only)",
     )
     parser.add_argument("--output-dir", required=True, help="parent of the run directory")
     parser.add_argument(
@@ -219,7 +275,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--display-threshold", type=float, default=0.01, help="field below which the overlay is transparent"
     )
     parser.add_argument("--columns", type=int, default=4, help="panels per row (default 4)")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.fit_dir is not None:
+        if args.run_root is not None or args.schedule is not None or args.criterion != DEFAULT_CRITERION:
+            parser.error("--run-root, --criterion and --schedule apply to --sweep-dir only.")
+    elif args.schedule is None:
+        args.schedule = "current"
+    return args
 
 
 SCHEDULE_KEYS = ("resection_time", "time_after_resection", "rt_times", "chemo_times", "chemo_doses")
@@ -271,6 +333,27 @@ def best_row(qoi_rows: list[dict[str, str]], criterion: str) -> dict[str, str]:
     if not np.isfinite(values).any():
         raise ValueError(f"no row has a finite {criterion}.")
     return qoi_rows[int(np.nanargmax(values))]
+
+
+def fit_best_run(fit_dir: Path) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    """
+    The re-solved best run of a fit directory: the path of its config, the
+    config's "_fit" record (schedule-independent moments, snapshot days,
+    n_steps, dt) and best/objective.json (restart, eval_id and the
+    "resolved" objective).
+    """
+    config_path = fit_dir / FIT_BEST_DIR / "config.json"
+    objective_path = fit_dir / FIT_BEST_DIR / FIT_OBJECTIVE_FILE
+    for path in (config_path, objective_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"{path} not found (the fit's resolve writes it).")
+    fit = read_json(config_path).get("_fit")
+    if fit is None:
+        raise ValueError(f"{config_path} has no \"_fit\" record.")
+    objective = read_json(objective_path)
+    if not objective["resolved"].get("success"):
+        raise ValueError(f"{objective_path}: the re-solve failed ({objective['resolved'].get('error')}).")
+    return config_path, fit, objective
 
 
 def logged_threshold(row: dict[str, str]) -> float | None:
@@ -409,6 +492,7 @@ def render_model(
     sessions: list[dict[str, Any]],
     fields: list[NDArray],
     references: list[Reference],
+    labels: list[NDArray],
     backgrounds: list[NDArray],
     z: int,
     threshold: float,
@@ -418,16 +502,19 @@ def render_model(
     dices: list[float],
     model_volumes: list[float],
     reference_volumes: list[float],
-    curve_times: NDArray,
-    curve_volumes: NDArray,
+    curve_times: NDArray | None,
+    curve_volumes: NDArray | None,
     params: dict[str, Any],
     stopping_time: float,
     n_col: int,
 ) -> None:
+    """The model figure: per session the segmented enhancing tumour of the
+    display labels (white) and the session's corrected cavity (green) over
+    the field; the volume curve is drawn only when given."""
     fig, axes, (bottom, colorbar_ax) = _figure(len(sessions), n_col)
     image = None
-    for ax, session, field, reference, background, day, value in zip(
-        axes, sessions, fields, references, backgrounds, days, dices, strict=True
+    for ax, session, field, reference, label_volume, background, day, value in zip(
+        axes, sessions, fields, references, labels, backgrounds, days, dices, strict=True
     ):
         ax.imshow(np.rot90(background[:, :, z]), cmap="gray", interpolation="none")
         field_slice = np.rot90(field[:, :, z])
@@ -435,9 +522,9 @@ def render_model(
             np.ma.masked_less(field_slice, display_threshold), cmap="inferno", alpha=FIELD_ALPHA,
             vmin=0.0, vmax=1.0, interpolation="none",
         )
-        core = np.rot90(((field >= threshold) & reference.valid)[:, :, z])
-        if core.any():
-            ax.contour(core.astype(float), levels=[0.5], colors=[CORE_CONTOUR_COLOR], linewidths=1.0)
+        enhancing = np.rot90((label_volume == LABEL_ENHANCING)[:, :, z])
+        if enhancing.any():
+            ax.contour(enhancing.astype(float), levels=[0.5], colors=[ENHANCING_CONTOUR_COLOR], linewidths=1.0)
         cavity = np.rot90((~reference.valid)[:, :, z])
         if cavity.any():
             ax.contour(cavity.astype(float), levels=[0.5], colors=[CAVITY_OUTLINE_COLOR], linewidths=1.2)
@@ -448,7 +535,11 @@ def render_model(
         ax.axis("off")
     if image is not None:
         fig.colorbar(image, cax=colorbar_ax, label="cell density")
-    bottom.plot(curve_times, curve_volumes, "-", color=MODEL_COLOR, linewidth=1.2, label=f"model core (u >= {threshold:g})")
+    if curve_times is not None and curve_volumes is not None:
+        bottom.plot(
+            curve_times, curve_volumes, "-", color=MODEL_COLOR, linewidth=1.2,
+            label=f"model core (u >= {threshold:g}, latest scan's cavity excluded)",
+        )
     bottom.plot(moments, model_volumes, "s", color=MODEL_COLOR, markersize=6, label="model core at scan (cavity excluded)")
     bottom.plot(
         moments, reference_volumes, "o", markerfacecolor="none", markeredgecolor=REFERENCE_COLOR,
@@ -462,27 +553,61 @@ def render_model(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    sweep_dir = Path(args.sweep_dir)
-    spec = read_json(sweep_dir / "spec.json")
-    run_root = Path(args.run_root) if args.run_root else DEFAULT_OUTPUT_DIR / spec["name"]
-    row = best_row(read_csv(sweep_dir / "qoi.csv"), args.criterion)
-    run_name_sweep = row["run_name"]
-    design_record = next(r for r in read_csv(sweep_dir / "design.csv") if r["row_name"] == row["row_name"])
-    config_path = run_root / "configs" / f"{run_name_sweep}.json"
-    if not config_path.is_file():
-        raise FileNotFoundError(f"run config {config_path} not found (pass --run-root).")
-    criterion_value = as_float(row[args.criterion])
-    print(f"best row {row['row_name']} (run {run_name_sweep}): {args.criterion} = {criterion_value:.4f}")
+    fit_logged_dice: dict[str, float] = {}
+    if args.fit_dir is not None:
+        fit_dir = Path(args.fit_dir)
+        spec = read_json(fit_dir / "spec.json")
+        config_path, fit, objective = fit_best_run(fit_dir)
+        resolved = objective["resolved"]
+        criterion, criterion_value = FIT_CRITERION, float(resolved[FIT_CRITERION])
+        recorded_threshold = resolved.get("core_threshold_star")
+        recorded_threshold = None if recorded_threshold is None else float(recorded_threshold)
+        fit_logged_dice = {sid: float(v["dice_core_star"]) for sid, v in resolved["per_session"].items()}
+        default_name = f"best_{spec['name']}_restart{objective['restart']}_eval{objective['eval_id']}"
+        origin: dict[str, Any] = {
+            "fit_dir": str(fit_dir.resolve()),
+            "best_restart": objective["restart"],
+            "best_eval_id": objective["eval_id"],
+            "fit_loss": float(resolved["loss"]),
+        }
+        print(
+            f"best of fit {spec['name']}: restart {objective['restart']}, evaluation {objective['eval_id']}: "
+            f"{criterion} = {criterion_value:.4f}"
+        )
+    else:
+        sweep_dir = Path(args.sweep_dir)
+        spec = read_json(sweep_dir / "spec.json")
+        run_root = Path(args.run_root) if args.run_root else DEFAULT_OUTPUT_DIR / spec["name"]
+        row = best_row(read_csv(sweep_dir / "qoi.csv"), args.criterion)
+        run_name_sweep = row["run_name"]
+        design_record = next(r for r in read_csv(sweep_dir / "design.csv") if r["row_name"] == row["row_name"])
+        config_path = run_root / "configs" / f"{run_name_sweep}.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(f"run config {config_path} not found (pass --run-root).")
+        criterion, criterion_value = args.criterion, as_float(row[args.criterion])
+        recorded_threshold = logged_threshold(row)
+        default_name = f"best_{run_name_sweep}"
+        origin = {"sweep_dir": str(sweep_dir.resolve()), "best_row": row["row_name"], "best_run": run_name_sweep}
+        print(f"best row {row['row_name']} (run {run_name_sweep}): {criterion} = {criterion_value:.4f}")
 
     run_name = args.run_name or (
-        f"best_{run_name_sweep}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{os.getpid()}"
+        f"{default_name}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{os.getpid()}"
     )
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    # The sweep's snapshot rule for the session moments, plus the curve frames.
+    # The sweep's snapshot rule for the session moments (a fit records its
+    # own), plus the curve frames.
     config = read_config(config_path, solver=StuppFKPPSolver)
-    if args.schedule == "current":
+    if args.fit_dir is not None:
+        schedule: dict[str, Any] = {"source": "fit"}
+        n_steps, dt = int(fit["n_steps"]), float(fit["dt"])
+        moments = {sid: float(moment) for sid, moment in fit["snapshot_moments"].items()}
+        session_days = {sid: float(day) for sid, day in fit["snapshot_days"].items()}
+        sessions = [s for s in spec["patient"]["sessions"] if s["id"] in session_days]
+        if len(sessions) != len(session_days):
+            raise ValueError(f"spec.json lacks sessions of the fit's snapshot days {sorted(session_days)}.")
+    elif args.schedule == "current":
         schedule = current_schedule(config, spec, as_float(design_record[PREOP_TIME_FACTOR]))
         print(
             f"schedule rebuilt with the current protocol (adjuvant cycle {schedule['protocol']['adjuvant_cycle_days']} d; "
@@ -492,14 +617,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         schedule = {"source": "sweep", "sweep_adjuvant_cycle_days": spec["protocol"].get("adjuvant_cycle_days")}
-    probe = StuppFKPPSolver(config)
-    n_steps, dt = probe.resolve_time_stepping()
-    del probe
-    moments = run_snapshots(spec, design_record)
-    session_days = session_snapshot_days(moments, dt)
+    if args.fit_dir is None:
+        probe = StuppFKPPSolver(config)
+        n_steps, dt = probe.resolve_time_stepping()
+        del probe
+        moments = run_snapshots(spec, design_record)
+        session_days = session_snapshot_days(moments, dt)
+        sessions = spec["patient"]["sessions"]
     stopping_time = float(config["resection_time"]) + float(config["time_after_resection"])
-    curve_days = np.arange(0.0, stopping_time, args.snapshot_interval_days)
-    config["snapshot_times"] = sorted({*session_days.values(), *curve_days.tolist(), stopping_time})
+    if args.volume_curve:
+        curve_days = np.arange(0.0, stopping_time, args.snapshot_interval_days)
+        config["snapshot_times"] = sorted({*session_days.values(), *curve_days.tolist(), stopping_time})
+    else:
+        config["snapshot_times"] = sorted(set(session_days.values()))
     solver = StuppFKPPSolver(config)
     params = solver.params
     print(f"run directory: {run_dir}")
@@ -507,6 +637,8 @@ def main(argv: list[str] | None = None) -> int:
     result = solver.solve(store_result=True, outdir=run_dir)
     if not result.success:
         raise RuntimeError(f"solve failed: {result.error}")
+    if result.n_steps != n_steps:
+        raise RuntimeError(f"the solver used n_steps={result.n_steps}, not the planned {n_steps}.")
     times = np.asarray(result.snapshot_times, dtype=np.float64)
     frames = result.time_series["cell_density"]
     affine = np.eye(4) if result.affine is None else np.asarray(result.affine, dtype=np.float64)
@@ -516,7 +648,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # Per session: the recorded frame (saved as the sweep saves it), the
     # reference masks, the display labels and the background.
-    sessions = spec["patient"]["sessions"]
     patient_root = Path(args.patient_root) if args.patient_root else Path(spec["patient"]["root"])
     patient = spec["patient"]["patient"]
     fields: list[NDArray] = []
@@ -544,18 +675,29 @@ def main(argv: list[str] | None = None) -> int:
         labels.append(relabel_preop(segmentation) if preop else segmentation)
         backgrounds.append(load_volume(session_background(patient_root, patient, session), shape))
     # The sweep's reference masks: the later sessions corrected with the
-    # earlier sessions' cavities before their own cavity is excluded. The
+    # earlier sessions' cavities before their own cavity is excluded; a
+    # fit's also exclude the resection cavity in every later session. The
     # overlay (labels) stays the raw segmentation.
-    references: list[Reference] = session_references(segmentations, sessions)
+    if args.fit_dir is not None:
+        cavity_spec = config["resection_cavity"]
+        resection_cavity = load_segmentation(cavity_spec["segmentation"])[0] == int(cavity_spec["label"])
+        references: list[Reference] = fit_session_references(segmentations, sessions, resection_cavity)
+        if json.dumps(spec.get("label_conventions"), sort_keys=True) != json.dumps(FIT_LABEL_CONVENTIONS, sort_keys=True):
+            print(
+                "note: the fit was scored with older reference masks (its spec.json's label_conventions differ from "
+                "FIT_LABEL_CONVENTIONS), so the Dice below differ from the fit's"
+            )
+    else:
+        references = session_references(segmentations, sessions)
     for reference in references:
         if reference.n_relabelled:
             print(f"  {reference.session}: {reference.n_relabelled} necrotic voxels counted as cavity (earlier cavities)")
 
     if args.core_threshold == "logged":
-        threshold = logged_threshold(row)
+        threshold = recorded_threshold
         threshold_source = "logged"
         if threshold is None:
-            print("qoi.csv records no core_threshold for the row; inferring it.")
+            print("the best run records no core threshold; inferring it.")
             threshold, threshold_source = infer_threshold(fields, references), "inferred"
     elif args.core_threshold == "infer":
         threshold, threshold_source = infer_threshold(fields, references), "inferred"
@@ -568,7 +710,21 @@ def main(argv: list[str] | None = None) -> int:
         float(((f >= threshold) & r.valid).sum()) * voxel_volume_ml for f, r in zip(fields, references, strict=True)
     ]
     reference_volumes = [float(r.core.sum()) * voxel_volume_ml for r in references]
-    curve_volumes = np.asarray([(frame >= threshold).sum() for frame in frames], dtype=np.float64) * voxel_volume_ml
+    curve_times: NDArray | None = None
+    curve_volumes: NDArray | None = None
+    if args.volume_curve:
+        # Each curve frame is masked as the most recent session at or before
+        # it masks its own frame (nothing before the first session), so the
+        # curve passes through the session markers.
+        session_frame_days = np.asarray(recorded_days, dtype=np.float64)
+        curve_times = times
+        curve_volumes = np.empty(times.size, dtype=np.float64)
+        for i, (day, frame) in enumerate(zip(times, frames, strict=True)):
+            core = frame >= threshold
+            earlier = np.flatnonzero(session_frame_days <= day)
+            if earlier.size:
+                core &= references[int(earlier[np.argmax(session_frame_days[earlier])])].valid
+            curve_volumes[i] = float(core.sum()) * voxel_volume_ml
     preop_core = references[0].core
     if not preop_core.any():
         raise ValueError("the pre-op reference core is empty; pass --slice-z.")
@@ -576,27 +732,27 @@ def main(argv: list[str] | None = None) -> int:
     session_moments = [float(moments[s["id"]]) for s in sessions]
     session_postop_days = postop_days(sessions)
     for session, value, mv, rv in zip(sessions, dices, model_volumes, reference_volumes, strict=True):
-        print(f"  {session['id']}: Dice core {value:.3f}, model {mv:.2f} mL, segmented {rv:.2f} mL")
+        logged = fit_logged_dice.get(session["id"])
+        fit_note = "" if logged is None else f" (fit {logged:.3f})"
+        print(f"  {session['id']}: Dice core {value:.3f}{fit_note}, model {mv:.2f} mL, segmented {rv:.2f} mL")
 
     render_segmentations(
         run_dir / "segmentations", sessions, labels, backgrounds, z, session_moments, session_postop_days,
         reference_volumes, params, stopping_time, args.columns,
     )
     render_model(
-        run_dir / "model", sessions, fields, references, backgrounds, z, threshold,
-        args.display_threshold, session_moments, session_postop_days, dices, model_volumes, reference_volumes, times,
-        curve_volumes, params, stopping_time, args.columns,
+        run_dir / "model", sessions, fields, references, labels, backgrounds, z, threshold,
+        args.display_threshold, session_moments, session_postop_days, dices, model_volumes, reference_volumes,
+        curve_times, curve_volumes, params, stopping_time, args.columns,
     )
     write_json(
         run_dir / "run_summary.json",
         {
             "run_name": run_name,
             "cli_args": jsonable(vars(args)),
-            "sweep_dir": str(sweep_dir.resolve()),
+            **origin,
             "run_config": str(config_path),
-            "best_row": row["row_name"],
-            "best_run": run_name_sweep,
-            "criterion": args.criterion,
+            "criterion": criterion,
             "criterion_value": criterion_value,
             "core_threshold": threshold,
             "core_threshold_source": threshold_source,
@@ -621,14 +777,18 @@ def main(argv: list[str] | None = None) -> int:
                     "n_necrotic_relabelled_cavity": r.n_relabelled,
                     "background": str(session_background(patient_root, patient, s)),
                     "file": snapshot_file(s["id"]),
+                    **({"fit_dice_core": fit_logged_dice[s["id"]]} if s["id"] in fit_logged_dice else {}),
                 }
                 for s, m, pd, d, v, mv, rv, r in zip(
                     sessions, session_moments, session_postop_days, recorded_days, dices, model_volumes,
                     reference_volumes, references, strict=True,
                 )
             ],
-            "curve_days": times.tolist(),
-            "curve_core_volume_ml": curve_volumes.tolist(),
+            **(
+                {"curve_days": curve_times.tolist(), "curve_core_volume_ml": curve_volumes.tolist()}
+                if curve_times is not None and curve_volumes is not None
+                else {}
+            ),
         },
     )
     print(f"saved {run_dir / 'segmentations.pdf'} and {run_dir / 'model.pdf'} (+ .png, run_summary.json)")

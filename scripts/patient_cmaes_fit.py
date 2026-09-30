@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """CMA-ES fit of the Stupp-protocol forward model, fisher_kpp_jax.StuppFKPPSolver,
-to ONE real patient of the SAILOR cohort: nine parameters are adjusted so that
-the forward run agrees with the patient's longitudinal tumour segmentations,
+to ONE real patient of the SAILOR cohort: the factors of a search-space file
+(ten with the 2026-09-27 file) are adjusted so that the forward run agrees with the patient's longitudinal tumour segmentations,
 with the covariance matrix adaptation evolution strategy (CMA-ES) of the
 glioma inverse fitting tool (GIFT,
 https://github.com/jonasw247/glioma-inverse-fitting-tool, branch dtiStuff,
@@ -16,15 +16,23 @@ and are imported from it, together with the atlas script's derivations
 (scripts/sensitivity_analysis.py); nothing of the two is copied. What the
 fit adds is below.
 
-Objective. loss = 1 - J on the unit cube [0, 1]^9. One evaluation is one
+Objective. loss = 1 - J on the unit cube [0, 1]^n, n the number of factors.
+One evaluation is one
 StuppFKPPSolver run recording one field u_s per session s (the pre-op
 session and the later sessions of the design, ``select_sessions``), and J
 is the agreement of the fields with the sessions' references
-(``session_references``: cavity-corrected masks, the session's own cavity
-voxels excluded from the model and the reference as in the SA). Per
-session and core threshold tau_c of THRESHOLD_GRID_CORE (0.30..0.85):
+(``fit_session_references``: the SA's cavity-corrected masks, the
+session's own cavity voxels excluded from the model and the reference,
+and in every later session the post-op cavity, i.e. the solver's
+resection cavity, excluded as well; FIT_LABEL_CONVENTIONS, since
+2026-09-28: fit directories set up before are refused). Per
+session and core threshold tau_c of THRESHOLD_GRID_CORE (0.50..0.85: the
+SA's grid 0.30..0.85 without the values below CORE_THRESHOLD_FLOOR = 0.5,
+since 2026-09-27; the 2026-09-25 fit profiled the core threshold to the
+old floor 0.3, which is not a defensible enhancing-tumour threshold, and
+gained only 0.02 mean Dice over the fixed pair by it):
 dice_core_s(tau_c) = dice((u_s >= tau_c) & valid_s, core_s); per edema
-threshold tau_e of THRESHOLD_GRID_EDEMA (0.10..0.60): dice_whole_s(tau_e)
+threshold tau_e of THRESHOLD_GRID_EDEMA (0.10..0.60, the SA's): dice_whole_s(tau_e)
 against the whole-tumour reference; both on the session's ``crop_box``
 (exact). The thresholds are PROFILED, one pair for all sessions:
   --loss core (default)  J = max over tau_c of the weighted mean over the
@@ -34,7 +42,7 @@ against the whole-tumour reference; both on the session's ``crop_box``
                          profiled core threshold (the pairs rule of the
                          SA); it does not enter the loss.
   --loss core+whole      J = max over the pairs (tau_c, tau_e) of
-                         ``threshold_pairs`` (tau_e < tau_c) of the mean of
+                         ``fit_threshold_pairs`` (tau_e < tau_c) of the mean of
                          the two regions' weighted means, dice_core at
                          tau_c and dice_whole at tau_e (the SA's
                          ``profiled_qois`` rule with weights).
@@ -66,19 +74,21 @@ this script's own ``read_fit_search_space``: keys starting with '_' are
 comments, an entry {"min", "max", "scale"} ("log" or "linear", mapped with
 the atlas's ``transform_factor``) is a fitted factor, any other entry is a
 fixed value: a solver parameter is written into every run config,
-seed_peak_density is consumed by the seed derivation; "solver" must be
-StuppFKPPSolver; the factor order in the file is the coordinate order of
-the unit cube). The nine factors and the derivations, per evaluation
-(``FitProblem.derive``):
+seed_peak_density is consumed by the seed derivation (it may be a range,
+fitted, or a fixed number, as in the 2026-09-25 file; ``FitSpace.seed_peak``);
+"solver" must be StuppFKPPSolver; the factor order in the file is the
+coordinate order of the unit cube). The factors and the derivations, per
+evaluation (``FitProblem.derive``):
   growth        white_matter_diffusivity = v lambda / 2 and rho = v / (2 lambda)
                 from v = front_speed_mm_per_day and lambda = front_width_mm
                 (``growth_parameters``).
   seed shape    gaussian_seed_diffusion_time = sigma^2 / 2 and
                 gaussian_seed_mass = c_peak (4 pi tau)^(3/2) from
-                sigma = seed_sigma_mm and the fixed c_peak = seed_peak_density
-                (``seed_parameters``); the peak is checked against the base
-                config's gaussian_seed_floor and the clip at 1 at start-up,
-                and gaussian_seed_scale must be 1.
+                sigma = seed_sigma_mm and c_peak = seed_peak_density (fitted
+                since 2026-09-27, 0.5-1.0; a fixed number in older files)
+                (``seed_parameters``); the peak's range (or value) is checked
+                against the base config's gaussian_seed_floor and the clip at
+                1 at start-up, and gaussian_seed_scale must be 1.
   clock         preop_time = growth_length_mm / front_speed_mm_per_day
                 (days), clamped to [preop_time_min, preop_time_max] of
                 --preop-time-range (default 7,200); preop_time_clamped
@@ -102,8 +112,8 @@ the unit cube). The nine factors and the derivations, per evaluation
                 checked for every seedable voxel at start-up).
   direct        rt_alpha and chemo_kill_rate are written as they are.
 Fixed values (the search-space file's, overriding the base config's):
-seed_peak_density 0.6, rt_alpha_beta_ratio 8 Gy and diffusivity_ratio 10,
-which the SA found inert on the agreement QoIs; chemo_decay_rate 9.24
+rt_alpha_beta_ratio 8 Gy and diffusivity_ratio 10, which the SA found
+inert on the agreement QoIs; chemo_decay_rate 9.24
 (confounded with chemo_kill_rate); gaussian_seed_scale 1. Everything else
 comes from the base config (--config, default
 fisher_kpp_jax/configs/StuppFKPPSolver.json) with the patient's tissue
@@ -151,18 +161,23 @@ evaluation; the main process appends one row to evaluations.csv per
 result.
 
 Execution (``WorkerPool``): multiprocessing "spawn", one persistent worker
-process per entry of --gpus (comma-separated CUDA device ids;
---jobs-per-gpu, default 1, starts several per device; '' starts CPU
+process per entry of --gpus (comma-separated CUDA device ids, default
+0,1,2,3; --jobs-per-gpu, default 1, starts several per device; '' starts CPU
 workers, for plumbing checks only). A worker's environment is set before
 it starts (it inherits it, so the variables are in place before jax is
 imported, which jax 0.11 needs: JAX_PLATFORMS and JAX_COMPILATION_CACHE_DIR
 are read at import): CUDA_VISIBLE_DEVICES=<id>,
-XLA_PYTHON_CLIENT_PREALLOCATE=false and
-JAX_COMPILATION_CACHE_DIR=<output-dir>/<name>/jax_cache. Each worker loads
-the references, reports its JAX backend and device (a GPU worker on the
-CPU backend is reported as a WARNING: a shell whose LD_LIBRARY_PATH breaks
-the CUDA plugin makes jax fall back to the CPU silently), then loops on
-the job queue: (eval_id, u, resolution_factor, save_dir) -> a flat result
+XLA_PYTHON_CLIENT_PREALLOCATE=false and the compilation cache
+<output-dir>/<name>/jax_cache (JAX_COMPILATION_CACHE_DIR and
+FISHER_KPP_JAX_CACHE: fisher_kpp_jax configures the cache itself at import
+and its variable wins). kill -USR1 <pid> makes a worker (or the main
+process) print its Python stack into the log. Each worker loads
+the references and reports its JAX backend and device; a worker given a
+GPU that reports another backend than "gpu" aborts the run (a shell
+whose LD_LIBRARY_PATH breaks the CUDA plugin makes jax fall back to the
+CPU silently, and a fit on the CPU would take days) unless
+--allow-cpu-fallback turns that into a warning; then it loops on the job
+queue: (eval_id, u, resolution_factor, save_dir) -> a flat result
 record on the result queue. An exception in an evaluation becomes a
 failed record (loss 1, the error string), never a hang; a worker process
 that dies is detected by the main loop (it polls is_alive while waiting
@@ -244,9 +259,12 @@ Runs are ranked by a PROXY of the objective: the qoi rows are grouped by
 run_name, per run the maximum over its rows of the weighted mean (the
 fit's weights, NaN dropped) over the objective's sessions of
 <ses>_dice_core is taken, the runs are sorted descending and the top K
-runs with DISTINCT starts are kept (runs of one Saltelli block that
-differ only in parameters the fit fixes, or in the cheap thresholds,
-convert to the same start; the later ones are skipped and recorded). The proxy is the closest quantity qoi.csv offers:
+runs with DISTINCT starts are kept: a run whose converted unit-cube
+point lies within --min-start-distance (Euclidean distance in [0, 1]^n,
+default 0.25) of a start already taken is skipped and recorded (the runs
+of one Saltelli block differ in one factor or only in parameters the fit
+fixes, so without the distance the top K would all come from the best
+block). The proxy is the closest quantity qoi.csv offers:
 in a sampled-mode sweep every row of a run carries its own sampled core
 threshold, so the maximum over the rows profiles the threshold over the
 sampled values (not the fit's grid), and the Dice are the sweep's (14-day
@@ -257,9 +275,10 @@ at generation 0. Each run's design row is converted: v, lambda, sigma
 from the row, growth_length_mm = v preop_time, the seed voxel
 seed_voxel_i/j/k mapped back into box coordinates ((v - lo) / (hi - lo)),
 rt_alpha and chemo_kill_rate; the values are clipped into the fit's
-ranges (recorded) and mapped with to_unit. The row's seed_peak_density,
-diffusivity_ratio and rt_alpha_beta_ratio are not carried (fixed in the
-fit; recorded). If the sweep directory does not exist and no
+ranges (recorded) and mapped with to_unit. The row's seed_peak_density is
+carried when the fit fits it (2026-09-27 file) and not carried when the
+file fixes it; the row's diffusivity_ratio and rt_alpha_beta_ratio are not
+carried (fixed in the fit; the not-carried values are recorded). If the sweep directory does not exist and no
 --init-values is given the script exits with an error; with
 --init-values it warns and uses the manual start. --no-sweep-init
 disables the sweep starts. --init-values name=value,... (physical units,
@@ -287,7 +306,7 @@ nothing is written outside <output-dir>/<name>/):
     evaluations.csv    one row per evaluation, appended as results arrive
                        (``evaluation_columns``: eval_id, restart,
                        generation, member, worker, resolution_factor,
-                       u_<factor> x 9, <factor> x 9,
+                       u_<factor> and <factor> per factor,
                        white_matter_diffusivity, rho, gaussian_seed_mass,
                        gaussian_seed_diffusion_time, preop_time,
                        preop_time_clamped, seed_voxel_i/j/k, seed_snapped,
@@ -349,10 +368,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import faulthandler
 import json
 import math
 import os
 import shutil
+import signal
 import sys
 import time
 import traceback
@@ -393,7 +414,7 @@ from patient_sensitivity_analysis import (  # noqa: E402
     LABEL_PREOP,
     PATIENT_VOLUME_KEYS,
     SOLVER_NAME,
-    THRESHOLD_GRID_CORE,
+    THRESHOLD_GRID_CORE as SA_THRESHOLD_GRID_CORE,
     THRESHOLD_GRID_EDEMA,
     TIMELINE_FILE,
     TIMELINE_KEYS,
@@ -410,7 +431,6 @@ from patient_sensitivity_analysis import (  # noqa: E402
     distinct_runs,
     format_timeline,
     load_segmentation,
-    load_session_references,
     parse_sessions,
     patient_files,
     patient_seed_geometry,
@@ -419,14 +439,13 @@ from patient_sensitivity_analysis import (  # noqa: E402
     read_session_labels,
     relabel_preop,
     select_sessions,
+    session_references,
     session_snapshot_days,
     snapshot_file,
-    threshold_pairs,
     threshold_qois,
 )
 from sensitivity_analysis import (  # noqa: E402
     DEFAULT_CONFIG,
-    DEFAULT_GPUS,
     GROWTH_SPEED_FACTOR,
     GROWTH_WIDTH_FACTOR,
     SEED_PEAK_FACTOR,
@@ -453,8 +472,22 @@ DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_pati
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_patient_fit")
 DEFAULT_SWEEP_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_patient/sa_sub01_2026-09-16")
 DEFAULT_SESSIONS = "01-08"  # the objective's sessions, the pre-op one included (``split_sessions``)
+# The fit's masks (``fit_session_references``, since 2026-09-28): the SA's,
+# with every later session's cavity also covering the post-op cavity (the
+# solver's resection cavity), so the region the model keeps empty is never
+# scored.
+FIT_LABEL_CONVENTIONS: dict[str, Any] = {
+    **LABEL_CONVENTIONS,
+    "postop_exclusion": (
+        f"in every later session, the post-op session's label {LABEL_CAVITY} voxels (the solver's resection cavity) "
+        f"and the session's own label {LABEL_CAVITY} voxels after the cavity correction are removed from the model "
+        "and the reference masks"
+    ),
+}
+DEFAULT_FIT_GPUS = "0,1,2,3"
 DEFAULT_JOBS_PER_GPU = 1
 DEFAULT_TOP = 5
+DEFAULT_MIN_START_DISTANCE = 0.25  # Euclidean distance in the unit cube between sweep starts
 DEFAULT_PREOP_TIME_RANGE = "7,200"  # days
 DEFAULT_STEPS_PER_DAY = 12.0
 DEFAULT_SIGMA0 = "0.1"
@@ -468,17 +501,20 @@ LOSS_MODES: tuple[str, ...] = ("core", "core+whole")
 DEFAULT_LOSS = "core"
 FULL_RESOLUTION = 1.0
 
-# The script factors (not solver parameters) and the script constant.
+# The script factors (not solver parameters): the required ones are ranges;
+# the optional one (seed_peak_density) is a range (fitted) or a fixed number
+# (a script constant, the 2026-09-25 file).
 GROWTH_LENGTH_FACTOR = "growth_length_mm"
 SEED_BBOX_FACTORS: tuple[str, ...] = ("seed_bbox_x", "seed_bbox_y", "seed_bbox_z")
-SCRIPT_FACTORS: tuple[str, ...] = (
+REQUIRED_SCRIPT_FACTORS: tuple[str, ...] = (
     GROWTH_SPEED_FACTOR,
     GROWTH_WIDTH_FACTOR,
     SEED_SIGMA_FACTOR,
     GROWTH_LENGTH_FACTOR,
     *SEED_BBOX_FACTORS,
 )
-SCRIPT_CONSTANTS: tuple[str, ...] = (SEED_PEAK_FACTOR,)
+SCRIPT_CONSTANTS: tuple[str, ...] = (SEED_PEAK_FACTOR,)  # allowed as fixed numbers
+SCRIPT_FACTORS: tuple[str, ...] = (*REQUIRED_SCRIPT_FACTORS, *SCRIPT_CONSTANTS)
 DERIVED_SOLVER_KEYS: tuple[str, ...] = (
     "white_matter_diffusivity",
     "rho",
@@ -497,6 +533,21 @@ FORBIDDEN_KEYS: tuple[str, ...] = (
 )
 # The resolved base-config values the parametrisation depends on.
 CONSTANT_KEYS: tuple[str, ...] = ("min_tissue_fraction", "gaussian_seed_floor", "gaussian_seed_scale")
+
+# The fit's core threshold grid: the SA's without the values below the floor
+# (2026-09-27, see the module docstring's Objective); the edema grid is the SA's.
+CORE_THRESHOLD_FLOOR = 0.5
+THRESHOLD_GRID_CORE: tuple[float, ...] = tuple(t for t in SA_THRESHOLD_GRID_CORE if t >= CORE_THRESHOLD_FLOOR)  # 0.50..0.85
+if not THRESHOLD_GRID_CORE:
+    raise RuntimeError(f"CORE_THRESHOLD_FLOOR {CORE_THRESHOLD_FLOOR} leaves no value of the SA's core grid {SA_THRESHOLD_GRID_CORE}.")
+
+
+def fit_threshold_pairs() -> list[tuple[float, float]]:
+    """The SA's ``threshold_pairs`` on the fit's grids: every (core, edema)
+    pair of THRESHOLD_GRID_CORE x THRESHOLD_GRID_EDEMA with edema < core,
+    in grid order."""
+    return [(core, edema) for core in THRESHOLD_GRID_CORE for edema in THRESHOLD_GRID_EDEMA if edema < core]
+
 
 # The smallest threshold any metric applies (the crop box's threshold).
 MIN_THRESHOLD = float(min(*THRESHOLD_GRID_CORE, *THRESHOLD_GRID_EDEMA, *FIXED_THRESHOLDS))
@@ -695,7 +746,8 @@ class FitSpace:
         factors: The fitted factors by name, in file order (the coordinate
             order of the unit cube).
         overrides: Fixed solver parameters written into every run config.
-        constants: Fixed script constants (seed_peak_density).
+        constants: Fixed script constants (seed_peak_density when the file
+            fixes it; empty when it is fitted).
         source: The file's entries as read, comments included.
         path: The file.
     """
@@ -718,6 +770,29 @@ class FitSpace:
     def solver_factor_names(self) -> list[str]:
         """The factors that are solver parameters, written directly."""
         return [name for name in self.factors if name not in SCRIPT_FACTORS]
+
+    @property
+    def seed_peak_fitted(self) -> bool:
+        """Whether seed_peak_density is a factor (else a constant)."""
+        return SEED_PEAK_FACTOR in self.factors
+
+    def seed_peak(self, physical: Mapping[str, float]) -> float:
+        """The seed peak density of a point: its factor value or the constant."""
+        if self.seed_peak_fitted:
+            return float(physical[SEED_PEAK_FACTOR])
+        return float(self.constants[SEED_PEAK_FACTOR])
+
+    def seed_peak_bounds(self) -> tuple[float, float]:
+        """The (min, max) the seed peak density can take."""
+        if self.seed_peak_fitted:
+            factor = self.factors[SEED_PEAK_FACTOR]
+            return float(factor.low), float(factor.high)
+        value = float(self.constants[SEED_PEAK_FACTOR])
+        return value, value
+
+    def seed_peak_record(self) -> dict[str, Any]:
+        low, high = self.seed_peak_bounds()
+        return {"fitted": self.seed_peak_fitted, "min": low, "max": high}
 
     def check_unit(self, u: NDArray | Sequence[float]) -> NDArray:
         """u as a float64 vector of the space's dimension within [0, 1]."""
@@ -787,10 +862,10 @@ def read_fit_search_space(path: str | Path) -> FitSpace:
 
     Raises:
         ValueError: The file is not a JSON object or names another solver;
-            an entry is set per evaluation (FORBIDDEN_KEYS); a script factor
-            is not a range or a script constant not a number; an unknown
-            key; a missing script factor or constant; a seed box factor not
-            linear on [0, 1].
+            an entry is set per evaluation (FORBIDDEN_KEYS); a required
+            script factor is not a range or seed_peak_density neither a
+            range nor a number; an unknown key; a missing script factor; a
+            seed box factor not linear on [0, 1].
     """
     path = Path(path)
     if not path.is_file():
@@ -811,8 +886,6 @@ def read_fit_search_space(path: str | Path) -> FitSpace:
         if key in FORBIDDEN_KEYS:
             raise ValueError(f"{where}: {key} is set per evaluation by the script and may not appear.")
         if isinstance(value, Mapping):
-            if key in SCRIPT_CONSTANTS:
-                raise ValueError(f"{where}: {key} must be a fixed number, not a range.")
             if key not in SCRIPT_FACTORS and key not in solver_keys:
                 raise ValueError(f"{where}: unknown factor {key!r}; a factor is a script factor {list(SCRIPT_FACTORS)} or a StuppFKPPSolver parameter.")
             factors[key] = _parse_parameter(key, value, where)
@@ -826,12 +899,12 @@ def read_fit_search_space(path: str | Path) -> FitSpace:
             overrides[key] = value
         else:
             raise ValueError(f"{where}: unknown key {key!r}.")
-    missing = [name for name in SCRIPT_FACTORS if name not in factors]
+    missing = [name for name in REQUIRED_SCRIPT_FACTORS if name not in factors]
     if missing:
         raise ValueError(f"{where}: the script factor(s) {missing} must be ranges.")
-    missing_constants = [name for name in SCRIPT_CONSTANTS if name not in constants]
+    missing_constants = [name for name in SCRIPT_CONSTANTS if name not in constants and name not in factors]
     if missing_constants:
-        raise ValueError(f"{where}: the constant(s) {missing_constants} must be given as fixed numbers.")
+        raise ValueError(f"{where}: {missing_constants} must be given, as a range (fitted) or a fixed number.")
     for name in SEED_BBOX_FACTORS:
         factor = factors[name]
         if factor.scale != "linear" or factor.low != 0.0 or factor.high != 1.0:
@@ -1088,7 +1161,7 @@ class Objective:
                 edema_index = _first_nanargmax(candidates)
         else:
             best = -np.inf
-            for tau_c, tau_e in threshold_pairs():
+            for tau_c, tau_e in fit_threshold_pairs():
                 i = _grid_index(THRESHOLD_GRID_CORE, tau_c)
                 j = _grid_index(THRESHOLD_GRID_EDEMA, tau_e)
                 finite = [m for m in (mean_core[i], mean_whole[j]) if np.isfinite(m)]
@@ -1231,8 +1304,13 @@ class FitProblem:
     def prefixes(self) -> list[str]:
         return [s.prefix for s in self.sessions]
 
+    def resection_cavity(self) -> NDArray:
+        """The solver's resection cavity: the cavity session's label-LABEL_CAVITY voxels."""
+        segmentation, _ = load_segmentation(self.data.segmentations[self.data.cavity_session])
+        return segmentation == LABEL_CAVITY
+
     def session_records(self) -> list[dict[str, Any]]:
-        """The records ``load_session_references`` takes, with the prefixes."""
+        """The session records ``fit_session_references`` takes, with the prefixes."""
         return [
             {**s.record(), "segmentation": str(self.data.segmentation(s)), "prefix": s.prefix}
             for s in self.sessions
@@ -1253,7 +1331,7 @@ class FitProblem:
         docstring's derivations)."""
         physical = {name: float(values[name]) for name in self.space.names}
         growth = growth_parameters(physical[GROWTH_SPEED_FACTOR], physical[GROWTH_WIDTH_FACTOR])
-        seed = seed_parameters(self.space.constants[SEED_PEAK_FACTOR], physical[SEED_SIGMA_FACTOR])
+        seed = seed_parameters(self.space.seed_peak(physical), physical[SEED_SIGMA_FACTOR])
         preop_raw = physical[GROWTH_LENGTH_FACTOR] / physical[GROWTH_SPEED_FACTOR]
         lo, hi = self.preop_time_range
         preop = float(min(max(preop_raw, lo), hi))
@@ -1369,7 +1447,7 @@ class FitProblem:
             "seed_position": self.seed_map.record(),
             "direct": self.space.solver_factor_names,
             "constants": dict(self.constants),
-            "seed_peak_density": self.space.constants[SEED_PEAK_FACTOR],
+            "seed_peak_density": self.space.seed_peak_record(),
             "steps_per_day": self.steps_per_day,
             "horizon_offset_days": self.horizon_offset,
             "n_steps": {str(factor): n for factor, n in sorted(self.n_steps.items())},
@@ -1481,6 +1559,17 @@ def problem_from_fit_dir(fit_dir: Path, spec: Mapping[str, Any]) -> FitProblem:
             raise RuntimeError(f"the rebuilt timeline differs from {fit_dir / SPEC_FILE} in {key}; the schedule constants changed?")
     if problem.space.names != list(spec["parametrisation"]["factor_names"]):
         raise RuntimeError(f"the factor order of {fit_dir / 'search_space.json'} differs from the spec's.")
+    for key, grid in (("grid_core", THRESHOLD_GRID_CORE), ("grid_edema", THRESHOLD_GRID_EDEMA)):
+        if [float(t) for t in spec["objective"][key]] != [float(t) for t in grid]:
+            raise RuntimeError(
+                f"the fit's {key} {list(grid)} differs from {fit_dir / SPEC_FILE}'s {spec['objective'][key]}; "
+                "the script's threshold grid changed since the fit was set up (CORE_THRESHOLD_FLOOR)."
+            )
+    if json.dumps(spec.get("label_conventions"), sort_keys=True) != json.dumps(FIT_LABEL_CONVENTIONS, sort_keys=True):
+        raise RuntimeError(
+            f"the label conventions of {fit_dir / SPEC_FILE} differ from the script's FIT_LABEL_CONVENTIONS; the fit was "
+            "set up with other reference masks (before 2026-09-28 the post-op cavity was not excluded from every later session)."
+        )
     return problem
 
 
@@ -1540,6 +1629,35 @@ def empty_record(problem: FitProblem, u: NDArray | Sequence[float]) -> dict[str,
         record.update({f"{prefix}{name}": float("nan") for name in SESSION_COLUMNS})
     record.update(n_steps=None, dt=None, solve_wall_time_s=None)
     return record
+
+
+def fit_session_references(
+    segmentations: Sequence[NDArray], sessions: Sequence[Mapping[str, Any]], resection_cavity: NDArray
+) -> list[Reference]:
+    """
+    The fit's reference masks (FIT_LABEL_CONVENTIONS): ``session_references``
+    of the sessions' raw label volumes with every later session's cavity
+    expanded by the resection cavity (the post-op session's label-4
+    voxels), i.e. valid = the SA's valid without the resection cavity, and
+    core and whole restricted to it. The necrotic correction is the SA's:
+    the union of earlier cavities it uses holds the post-op cavity already.
+    """
+    cavity = np.asarray(resection_cavity, dtype=bool)
+    out: list[Reference] = []
+    for reference, session in zip(session_references(segmentations, sessions), sessions, strict=True):
+        if session["label"] == LABEL_PREOP:
+            out.append(reference)
+            continue
+        if cavity.shape != reference.valid.shape:
+            raise ValueError(f"resection cavity shape {cavity.shape} differs from {session['id']}'s {reference.valid.shape}.")
+        valid = reference.valid & ~cavity
+        out.append(
+            replace(
+                reference, core=reference.core & valid, whole=reference.whole & valid, valid=valid,
+                n_cavity=int((~valid).sum()),
+            )
+        )
+    return out
 
 
 def session_frames(result: Any, snapshot_days: Mapping[str, float], dt: float) -> dict[str, NDArray]:
@@ -1749,6 +1867,10 @@ def worker_environment(gpu: str | None, cache_dir: Path) -> dict[str, str | None
         "JAX_PLATFORMS": "cpu" if gpu is None else None,
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
         "JAX_COMPILATION_CACHE_DIR": str(cache_dir),
+        # fisher_kpp_jax sets jax_compilation_cache_dir itself at import
+        # (FISHER_KPP_JAX_CACHE, default ~/.cache/fisher_kpp_jax), which
+        # overrides the JAX variable; both point at the fit's cache.
+        "FISHER_KPP_JAX_CACHE": str(cache_dir),
     }
 
 
@@ -1762,8 +1884,15 @@ def worker_main(worker_id: int, gpu: str | None, problem: FitProblem, jobs: Any,
     """
     label = f"[worker {worker_id}]"
     start = time.perf_counter()
+    # kill -USR1 <worker pid> prints the worker's Python stack (the main
+    # thread) to its stderr, i.e. the run's log: where a slow evaluation is.
+    faulthandler.register(signal.SIGUSR1, all_threads=False)
     try:
-        references = {r.session: r for r in load_session_references(problem.session_records())}
+        records = problem.session_records()
+        segmentations = [load_segmentation(record["segmentation"])[0] for record in records]
+        references = {
+            r.session: r for r in fit_session_references(segmentations, records, problem.resection_cavity())
+        }
         zooms = problem.voxel_size_mm
         backend = jax.default_backend()
         device_kind = jax.devices()[0].device_kind
@@ -1820,11 +1949,21 @@ class WorkerPool:
         gpus: One entry per GPU (None for a CPU slot).
         jobs_per_gpu: Slots per entry.
         cache_dir: The workers' JAX compilation cache directory.
+        allow_cpu_fallback: Whether a GPU worker on another backend is a
+            warning instead of an error (``_note_ready``).
     """
 
-    def __init__(self, problem: FitProblem, gpus: Sequence[str | None], jobs_per_gpu: int, cache_dir: Path) -> None:
+    def __init__(
+        self,
+        problem: FitProblem,
+        gpus: Sequence[str | None],
+        jobs_per_gpu: int,
+        cache_dir: Path,
+        allow_cpu_fallback: bool = False,
+    ) -> None:
         if jobs_per_gpu < 1:
             raise ValueError(f"--jobs-per-gpu must be at least 1, got {jobs_per_gpu}.")
+        self.allow_cpu_fallback = bool(allow_cpu_fallback)
         self.ctx = get_context("spawn")
         self.jobs = self.ctx.Queue()
         self.results = self.ctx.Queue()
@@ -1874,11 +2013,13 @@ class WorkerPool:
             flush=True,
         )
         if info["gpu"] is not None and info["backend"] != "gpu":
-            print(
-                f"WARNING: worker {wid} was given GPU {info['gpu']} but runs on the {info['backend']} backend "
-                "(a broken CUDA plugin, e.g. through LD_LIBRARY_PATH, makes JAX fall back to the CPU silently).",
-                flush=True,
+            message = (
+                f"worker {wid} was given GPU {info['gpu']} but runs on the {info['backend']} backend "
+                "(a broken CUDA plugin, e.g. through LD_LIBRARY_PATH, makes JAX fall back to the CPU silently)"
             )
+            if not self.allow_cpu_fallback:
+                raise RuntimeError(f"{message}; the run is aborted (--allow-cpu-fallback turns this into a warning).")
+            print(f"WARNING: {message}.", flush=True)
 
     def wait_ready(self) -> None:
         """Block until every worker reported readiness."""
@@ -1982,12 +2123,12 @@ def design_checks(problem: FitProblem, resolution_factors: Sequence[float]) -> d
     voxel_size = tuple(float(v) for v in params["voxel_size_mm"])
     if not np.allclose(voxel_size, problem.voxel_size_mm, rtol=1e-6, atol=0):
         raise RuntimeError(f"the solver's voxel size {voxel_size} differs from the white-matter map's {problem.voxel_size_mm}.")
-    peak = space.constants[SEED_PEAK_FACTOR]
+    peak_low, peak_high = space.seed_peak_bounds()
     floor = float(params["gaussian_seed_floor"])
-    if not peak > floor:
-        raise ValueError(f"{SEED_PEAK_FACTOR} = {peak!r} must exceed the base config's gaussian_seed_floor {floor:g}.")
-    if peak > 1:
-        raise ValueError(f"{SEED_PEAK_FACTOR} = {peak!r} must be at most 1 (the solver clips above 1).")
+    if not peak_low > floor:
+        raise ValueError(f"{SEED_PEAK_FACTOR} min {peak_low!r} must exceed the base config's gaussian_seed_floor {floor:g}.")
+    if peak_high > 1:
+        raise ValueError(f"{SEED_PEAK_FACTOR} max {peak_high!r} must be at most 1 (the solver clips above 1).")
     if float(params["gaussian_seed_scale"]) != 1.0:
         raise ValueError(f"{SEED_SIGMA_FACTOR} is in mm, which needs gaussian_seed_scale = 1, got {params['gaussian_seed_scale']!r}.")
     record: dict[str, Any] = {
@@ -1998,7 +2139,7 @@ def design_checks(problem: FitProblem, resolution_factors: Sequence[float]) -> d
             "stopping_time": float(params["stopping_time"]),
             "preop_time": centre_config["_fit"]["preop_time"],
         },
-        "seed_peak": {"value": peak, "gaussian_seed_floor": floor, "clip": 1.0},
+        "seed_peak": {**space.seed_peak_record(), "gaussian_seed_floor": floor, "clip": 1.0},
         "time_stepping": {},
     }
     corner_values = {name: factor.high for name, factor in space.factors.items()}
@@ -2299,13 +2440,15 @@ def convert_sweep_row(record: Mapping[str, str], problem: FitProblem) -> tuple[d
     values.update(dict(zip(SEED_BBOX_FACTORS, problem.seed_map.to_bbox(voxel), strict=True)))
     for name in space.solver_factor_names:
         values[name] = as_float(record[name])
+    if space.seed_peak_fitted:
+        values[SEED_PEAK_FACTOR] = as_float(record[SEED_PEAK_FACTOR])
     if any(not np.isfinite(v) for v in values.values()):
         raise ValueError(f"the sweep row {record.get('row_name')!r} lacks a value the fit needs: {values}.")
     clipped, changed = space.clip(values)
     not_carried = {
         key: as_float(record[key])
         for key in (SEED_PEAK_FACTOR, "diffusivity_ratio", "rt_alpha_beta_ratio", "core_threshold", "edema_threshold")
-        if key in record and record[key] != ""
+        if key not in space.factors and key in record and record[key] != ""
     }
     conversion = {
         "sweep_preop_time": preop_time,
@@ -2319,12 +2462,13 @@ def convert_sweep_row(record: Mapping[str, str], problem: FitProblem) -> tuple[d
     return clipped, conversion
 
 
-def sweep_starts(sweep_dir: Path, problem: FitProblem, top: int) -> tuple[list[Start], dict[str, Any]]:
+def sweep_starts(sweep_dir: Path, problem: FitProblem, top: int, min_distance: float) -> tuple[list[Start], dict[str, Any]]:
     """
     The top-K starts of a patient_sensitivity_analysis.py sweep (the
     module docstring's Starts): the runs ranked by ``sweep_proxy`` (the
     maximum over the rows sharing the run), converted with
-    ``convert_sweep_row``.
+    ``convert_sweep_row``; a run whose unit-cube point lies within
+    min_distance (Euclidean) of a start already taken is skipped.
 
     Returns:
         (starts, record of the ranking for starts.json).
@@ -2348,6 +2492,8 @@ def sweep_starts(sweep_dir: Path, problem: FitProblem, top: int) -> tuple[list[S
     runs = distinct_runs(design)
     needed = [GROWTH_SPEED_FACTOR, GROWTH_WIDTH_FACTOR, SEED_SIGMA_FACTOR, "preop_time", "seed_voxel_i", "seed_voxel_j", "seed_voxel_k"]
     needed += problem.space.solver_factor_names
+    if problem.space.seed_peak_fitted:
+        needed.append(SEED_PEAK_FACTOR)
     columns = set(design[0]) if design else set()
     lacking = [column for column in needed if column not in columns]
     if lacking:
@@ -2374,11 +2520,12 @@ def sweep_starts(sweep_dir: Path, problem: FitProblem, top: int) -> tuple[list[S
         record = runs[run]
         values, conversion = convert_sweep_row(record, problem)
         unit = problem.to_unit(values)
-        same = next((i for i, other in enumerate(taken) if np.allclose(unit, other, rtol=0, atol=1e-12)), None)
-        if same is not None:
-            # Runs of one Saltelli block that differ only in parameters the
-            # fit fixes (or in the cheap thresholds) give the same start.
-            duplicates.append({"run_name": run, "rank": rank, "proxy": proxy, "same_as": starts[same].label})
+        distances = [float(np.linalg.norm(unit - other)) for other in taken]
+        if distances and min(distances) < min_distance:
+            # The runs of one Saltelli block differ in one factor (or in
+            # none the fit sees): too close to be distinct starts.
+            nearest = int(np.argmin(distances))
+            duplicates.append({"run_name": run, "rank": rank, "proxy": proxy, "near": starts[nearest].label, "distance": distances[nearest]})
             continue
         taken.append(unit)
         starts.append(
@@ -2406,7 +2553,8 @@ def sweep_starts(sweep_dir: Path, problem: FitProblem, top: int) -> tuple[list[S
         "n_successful_rows": n_success,
         "n_ranked_runs": len(best),
         "top": int(top),
-        "distinct": "runs whose converted unit vector equals an earlier start's (they differ only in parameters the fit fixes) are skipped",
+        "min_start_distance": float(min_distance),
+        "distinct": "a run whose converted unit-cube point lies within min_start_distance (Euclidean) of a start already taken is skipped",
         "taken": [{"run_name": s.source["run_name"], "rank": s.source["rank"], "proxy": s.source["proxy"]} for s in starts],
         "skipped_duplicates": duplicates,
     }
@@ -2438,12 +2586,12 @@ def centre_start(problem: FitProblem, index: int) -> Start:
 
 
 def resolve_starts(
-    problem: FitProblem, sweep_dir: Path | None, top: int, init_values: str | None
+    problem: FitProblem, sweep_dir: Path | None, top: int, init_values: str | None, min_distance: float
 ) -> tuple[list[Start], dict[str, Any]]:
     """
     The starts of a fit (the module docstring's Starts): the sweep's
-    top-K (sweep_dir None = --no-sweep-init), then the manual start, else
-    the centre.
+    top-K at least min_distance apart (sweep_dir None = --no-sweep-init),
+    then the manual start, else the centre.
 
     Raises:
         FileNotFoundError: The sweep directory does not exist and no
@@ -2460,7 +2608,7 @@ def resolve_starts(
             print(f"WARNING: sweep directory not found: {sweep_dir}; only the manual start is used.", flush=True)
             record["sweep"] = {"sweep_dir": str(sweep_dir), "missing": True}
         else:
-            starts, ranking = sweep_starts(sweep_dir, problem, top)
+            starts, ranking = sweep_starts(sweep_dir, problem, top, min_distance)
             record["sweep"] = ranking
     if init_values:
         starts.append(manual_start(init_values, problem, len(starts)))
@@ -3067,6 +3215,7 @@ def write_fit_directory(
     sessions: str,
     gpus: Sequence[str | None],
     jobs_per_gpu: int,
+    min_start_distance: float,
 ) -> None:
     """spec.json, search_space.json, base_config.json and starts.json of a
     new fit directory (created here, never overwritten)."""
@@ -3085,7 +3234,7 @@ def write_fit_directory(
         "session_labels": str(session_labels),
         "sessions_requested": sessions,
         "sessions_simulated": [s.id for s in problem.sessions],
-        "label_conventions": LABEL_CONVENTIONS,
+        "label_conventions": FIT_LABEL_CONVENTIONS,
         "data_checks": checks,
         "protocol": problem.protocol.record(),
         "timeline": problem.timeline.record(),
@@ -3096,6 +3245,7 @@ def write_fit_directory(
         "time_stepping": design["time_stepping"],
         "design_checks": {key: value for key, value in design.items() if key != "time_stepping"},
         "n_starts": len(starts),
+        "min_start_distance": float(min_start_distance),
         "gpus": ["cpu" if gpu is None else gpu for gpu in gpus],
         "jobs_per_gpu": jobs_per_gpu,
         "n_workers": len(gpus) * jobs_per_gpu,
@@ -3164,12 +3314,12 @@ def prepare_fit(args: argparse.Namespace, fit_dir: Path, gpus: Sequence[str | No
             flush=True,
         )
     sweep_dir = None if args.no_sweep_init else Path(args.init_from_sweep)
-    starts, starts_record = resolve_starts(problem, sweep_dir, int(args.top), args.init_values)
+    starts, starts_record = resolve_starts(problem, sweep_dir, int(args.top), args.init_values, float(args.min_start_distance))
     print(format_starts(starts, problem), flush=True)
     settings = FitSettings.from_args(args, n_workers, len(starts), problem.space.dimension)
     write_fit_directory(
         fit_dir, problem, settings, starts, starts_record, checks, design, Path(args.session_labels).resolve(),
-        args.sessions, gpus, int(args.jobs_per_gpu),
+        args.sessions, gpus, int(args.jobs_per_gpu), float(args.min_start_distance),
     )
     print(f"fit directory: {fit_dir}; popsize {settings.popsize} on {n_workers} worker(s)", flush=True)
     return problem, settings, starts
@@ -3181,7 +3331,7 @@ def run_fit(args: argparse.Namespace) -> int:
     gpus = parse_gpus(args.gpus)
     problem, settings, starts = prepare_fit(args, fit_dir, gpus)
     started = time.perf_counter()
-    pool = WorkerPool(problem, gpus, int(args.jobs_per_gpu), fit_dir / CACHE_DIR)
+    pool = WorkerPool(problem, gpus, int(args.jobs_per_gpu), fit_dir / CACHE_DIR, bool(args.allow_cpu_fallback))
     try:
         pool.wait_ready()
         if args.dry_run:
@@ -3210,7 +3360,7 @@ def run_resolve(args: argparse.Namespace) -> int:
     fit_dir = Path(args.fit_dir).resolve()
     spec = read_json(fit_dir / SPEC_FILE)
     problem = problem_from_fit_dir(fit_dir, spec)
-    pool = WorkerPool(problem, [args.gpu], 1, fit_dir / CACHE_DIR)
+    pool = WorkerPool(problem, [args.gpu], 1, fit_dir / CACHE_DIR, bool(args.allow_cpu_fallback))
     try:
         pool.wait_ready()
         resolve_best(pool, problem, fit_dir, None if args.restart is None else int(args.restart))
@@ -3235,7 +3385,7 @@ def run_starts(args: argparse.Namespace) -> int:
         [FULL_RESOLUTION],
     )
     sweep_dir = None if args.no_sweep_init else Path(args.init_from_sweep)
-    starts, record = resolve_starts(problem, sweep_dir, int(args.top), args.init_values)
+    starts, record = resolve_starts(problem, sweep_dir, int(args.top), args.init_values, float(args.min_start_distance))
     if record.get("sweep") and not record["sweep"].get("missing"):
         ranking = record["sweep"]
         print(
@@ -3270,6 +3420,10 @@ def _add_problem_args(parser: argparse.ArgumentParser) -> None:
 def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--init-from-sweep", default=str(DEFAULT_SWEEP_DIR), help="a patient_sensitivity_analysis.py sweep directory")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP, help=f"starts taken from the sweep (default {DEFAULT_TOP})")
+    parser.add_argument(
+        "--min-start-distance", type=float, default=DEFAULT_MIN_START_DISTANCE,
+        help=f"a sweep run closer than this (Euclidean, unit cube) to a start already taken is skipped (default {DEFAULT_MIN_START_DISTANCE})",
+    )
     parser.add_argument("--no-sweep-init", action="store_true", help="no sweep starts")
     parser.add_argument("--init-values", default="", help="one manual start 'name=value,...' in physical units, every factor named")
 
@@ -3277,7 +3431,8 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="parent of the fit directory")
     parser.add_argument("--name", required=True, help="fit directory name")
-    parser.add_argument("--gpus", default=DEFAULT_GPUS, help="comma-separated CUDA device ids, one worker each; '' = one CPU worker")
+    parser.add_argument("--gpus", default=DEFAULT_FIT_GPUS, help=f"comma-separated CUDA device ids, one worker each; '' = one CPU worker (default {DEFAULT_FIT_GPUS})")
+    parser.add_argument("--allow-cpu-fallback", action="store_true", help="a GPU worker on another backend is a warning, not an error")
     parser.add_argument("--jobs-per-gpu", type=int, default=DEFAULT_JOBS_PER_GPU, help=f"workers per device (default {DEFAULT_JOBS_PER_GPU})")
     parser.add_argument("--popsize", default=DEFAULT_POPSIZE, help=f"'auto' = {POPSIZE_PER_WORKER} x workers, 'gift' = 4 + floor(3 ln N), or an integer (default {DEFAULT_POPSIZE})")
     parser.add_argument("--sigma0", default=DEFAULT_SIGMA0, help=f"initial step size, one value or one per start (default {DEFAULT_SIGMA0})")
@@ -3304,10 +3459,12 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--fit-dir", required=True, help="the fit directory")
     resolve.add_argument("--restart", type=int, default=None, help="resolve this restart's best instead of the overall best")
     resolve.add_argument("--gpu", required=True, help="the CUDA device id of the worker")
+    resolve.add_argument("--allow-cpu-fallback", action="store_true", help="a GPU worker on another backend is a warning, not an error")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    faulthandler.register(signal.SIGUSR1, all_threads=False)
     args = build_parser().parse_args(argv)
     if args.command == "starts":
         return run_starts(args)
