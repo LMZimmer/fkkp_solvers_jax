@@ -40,6 +40,7 @@ from .config import (
     SOLVER_KEY,
     VOLUME_IN_MEMORY,
     jsonable,
+    names_solver,
     read_config,
     register_solver,
     resolve_config_path,
@@ -676,7 +677,8 @@ class BaseFKPPSolver(ABC):
 
     A solver is constructed from its parameters, given as one mapping
     (``Solver(params)``) or as keyword arguments (``Solver(**config)``); a
-    ``"solver"`` entry naming the class is accepted and checked, so a
+    ``"solver"`` entry naming the class (by its own name or a former one,
+    see ``config.solver_class``) is accepted and checked, so a
     config written by ``Result.save`` or read by ``read_config`` can be
     passed as is. __init__ merges and validates the parameters against the
     class's _REQUIRED / _DEFAULTS key sets and loads the volumes given as
@@ -766,7 +768,7 @@ class BaseFKPPSolver(ABC):
             )
         given = dict(params) if params is not None else dict(kwargs)
         named = given.pop(SOLVER_KEY, None)
-        if named is not None and named != name:
+        if named is not None and not names_solver(named, type(self)):
             raise ValueError(f"{name}: the config names solver {named!r}.")
         merged = _merge_parameters(given, self._REQUIRED, self._DEFAULTS, name)
         # The config records the parameters as given, before the volumes

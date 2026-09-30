@@ -11,20 +11,28 @@ its ``"solver"`` entry, if present, is checked against the class (a
 mismatch raises) but never used to pick one. ``read_config`` resolves the
 class from the file's ``"solver"`` entry (or from its ``solver`` argument)
 only to check the keys and resolve the volume entries, which is what the
-solver registry (``register_solver`` / ``solver_class``) exists for.
+solver registry (``register_solver`` / ``solver_class``) exists for. The
+registry resolves a former class name through an alias table
+(``StuppFKPPSolver``, the name saved configs of treated isotropic runs
+carry, names ``FKPPSolver``), and every check of a ``"solver"`` entry
+compares the classes the names resolve to, so such configs still load; new
+configs are written with the class's own name.
 Compared with the parameters the solver validates, a config differs in
 three ways:
 
 - Volumes (tissue maps, tensors, treatment maps) are NIfTI paths, absolute
   or relative to the config file; ``read_config`` makes them absolute and
   the solver loads them at construction. A volume that was given as an
-  array is recorded as ``VOLUME_IN_MEMORY`` and cannot be reloaded. Solver
-  specific entry formats (the resection cavity of ``StuppFKPPSolver``) are
-  resolved by the solver class's ``_resolve_config_volume``.
-- Derived values (``stopping_time`` of ``StuppFKPPSolver``, a defaulted
-  ``volume_threshold``, a ``voxel_size_mm`` read from a NIfTI header) are
-  not part of it; ``Result.derived`` reports them.
-- JSON has no infinity: the strings "inf" / "-inf" stand for the floats.
+  array is recorded as ``VOLUME_IN_MEMORY`` and cannot be reloaded. The
+  resection cavity is an entry ``{"segmentation": <NIfTI path>, "label":
+  <int>}``; the solver class's ``_resolve_config_volume`` resolves the
+  volume entries.
+- Derived values (a ``stopping_time`` that was not given: the horizon
+  then follows from ``time_after_resection`` or is the default; a
+  defaulted ``volume_threshold``; a ``voxel_size_mm`` read from a NIfTI
+  header) are not part of it; ``Result.derived`` reports them.
+- JSON has no infinity: the strings "inf" / "-inf" stand for the floats
+  (``resection_time`` "inf": no resection).
 
 Keys starting with '_' are comments and are dropped on load.
 """
@@ -50,37 +58,54 @@ VOLUME_IN_MEMORY: str = "<in-memory>"
 # Solver classes by name, filled by ``BaseFKPPSolver.__init_subclass__``.
 _SOLVER_REGISTRY: dict[str, type[BaseFKPPSolver]] = {}
 
+# Former class names, each with the name of the class that took it over; a
+# saved config carrying one still loads. StuppFKPPSolver was the isotropic
+# solver with the treatments, which every solver has now.
+_SOLVER_ALIASES: dict[str, str] = {"StuppFKPPSolver": "FKPPSolver"}
+
 
 def register_solver(cls: type[BaseFKPPSolver]) -> None:
     """Register a solver class under its name for ``solver_class``."""
     name = cls.__name__
+    if name in _SOLVER_ALIASES:
+        raise ValueError(f"{name!r} is a former name of {_SOLVER_ALIASES[name]}.")
     if name in _SOLVER_REGISTRY and _SOLVER_REGISTRY[name] is not cls:
         raise ValueError(f"a solver named {name!r} is already registered.")
     _SOLVER_REGISTRY[name] = cls
 
 
 def solver_class(name: str) -> type[BaseFKPPSolver]:
-    """The solver class registered under name."""
+    """The solver class registered under name; a former class name
+    (``_SOLVER_ALIASES``) resolves to the class that took it over."""
     try:
-        return _SOLVER_REGISTRY[name]
+        return _SOLVER_REGISTRY[_SOLVER_ALIASES.get(name, name)]
     except KeyError:
         raise ValueError(
             f"unknown solver {name!r}; known: {sorted(_SOLVER_REGISTRY)}."
         ) from None
 
 
+def names_solver(named: Any, cls: type[BaseFKPPSolver]) -> bool:
+    """Whether a config's "solver" entry names the class cls: by its own
+    name or by a former one. Classes are compared, not names; an
+    unregistered name names no class."""
+    name = str(named)
+    return _SOLVER_REGISTRY.get(_SOLVER_ALIASES.get(name, name)) is cls
+
+
 def _resolve_solver(
     solver: str | type[BaseFKPPSolver] | None, config: Mapping[str, Any], where: str
 ) -> type[BaseFKPPSolver]:
     """The solver class of a config: the solver argument (a class or a name)
-    if given, else the config's "solver" entry, which must agree."""
+    if given, else the config's "solver" entry, which must name the same
+    class."""
     named = config.get(SOLVER_KEY)
     if solver is None:
         if named is None:
             raise ValueError(f"{where}: no {SOLVER_KEY!r} entry names the solver class.")
         return solver_class(str(named))
     cls = solver_class(solver) if isinstance(solver, str) else solver
-    if named is not None and named != cls.__name__:
+    if named is not None and not names_solver(named, cls):
         raise ValueError(f"{where}: names solver {named!r}, not {cls.__name__}.")
     return cls
 
@@ -119,9 +144,11 @@ def read_config(
     The file holds a JSON object keyed by solver parameter name plus the
     "solver" entry (see the module docstring). Returned are its entries
     without the '_' comment keys, every key checked to be a parameter of
-    the solver class, "inf" strings turned into floats and every volume
-    entry resolved by the class (NIfTI paths made absolute, a relative path
-    counting from the config's directory). The volumes stay paths, so the
+    the solver class, the "solver" entry set to the class's own name (a
+    file naming the class by a former name loads like any other), "inf"
+    strings turned into floats and every volume entry resolved by the
+    class (NIfTI paths made absolute, a relative path counting from the
+    config's directory). The volumes stay paths, so the
     entries can be edited, completed or written back with ``write_config``
     before the solver class loads them (``SolverClass(config)``); a missing
     volume file is reported when it is loaded.

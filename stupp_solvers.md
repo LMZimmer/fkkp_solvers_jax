@@ -2,7 +2,7 @@
 
 Written 2026-09-17, revised 2026-09-29 after review, implemented from
 2026-09-30 on in the order of section 7, which marks each step when it is
-committed: steps 0 to 3 are done. Section 10 records what the
+committed: steps 0 to 4 are done. Section 10 records what the
 implementation added to the plan or does differently. The plan records the
 design agreed for `fisher_kpp_jax` and the order in which to build it. Work
 happens on branch `stupp_all`.
@@ -507,7 +507,7 @@ arises only from an exception or from the non-finite check.
    volumes on the low-resolution grid (section 3.5), the constants
    assembly and the step selection, `TREATMENT_KEYS` on the class; remove
    the guard hook and diagnostics.
-4. `config.py`: the alias table and class-based name checks.
+4. Done 2026-09-30: `config.py`: the alias table and class-based name checks.
 5. `__init__.py`: export the alias; update the module docstring.
 6. `configs/` and `search_spaces/`: the three class configs; the rename
    to `FKPPSolver_stupp.json` and its notes; the solver entry of the four
@@ -601,3 +601,9 @@ Model-specific:
   (section 3.1).
 - `stopping_time` itself is still not validated (as before); the horizon
   rule only decides which of the two keys gives it.
+- **Step 4.** `config.names_solver(named, cls)` is the class-based check
+  the constructor and `_resolve_solver` use; an unregistered name names no
+  class, so the constructor's message for it is unchanged.
+  `register_solver` refuses a class named like an alias. `read_config`
+  returns the class's own name in the "solver" entry, also for a file that
+  names the class by its former name.
