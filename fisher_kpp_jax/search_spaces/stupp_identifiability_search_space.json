@@ -1,5 +1,5 @@
 {
-  "solver": "StuppFKPPSolver",
+  "solver": "FKPPSolver",
   "_note": "Search space of scripts/identifiability_experiments.py (2026-09-16): the truth cohort of formed-front, patient-sized tumours grown from small seeds, sampled in the front speed v, the front width lambda and the growth efolds a = rho T_r with the seed width in mm, in the format of stupp_fkpp_sigma_v2_search_space.json (factors {\"min\", \"max\", \"scale\"}, fixed overrides as plain values, derived groups with \"derives\"). The seed position is not sampled by the script (one fixed voxel), the three fraction entries are kept as the loader requires them; keys starting with '_' are comments.",
   "_growth_efolds": "growth_efolds is a factor of the script, not a solver parameter (\"script\": true): the script strips it before handing the file to the loader, samples it with the six solver factors and derives resection_time = growth_efolds / rho, rejecting candidates outside 5-1000 days. The range 1-12 e-folds spans a tumour that has barely left the linear regime to one whose front has travelled 12 front widths beyond the seed.",
   "_scales": "Rates and scales spanning a decade or more are log-uniform (front_speed_mm_per_day, front_width_mm, chemo_kill_rate, rt_alpha, seed_sigma_mm, growth_efolds); the seed peak density is uniform on its admissible band.",

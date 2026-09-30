@@ -2,7 +2,7 @@
 
 Written 2026-09-17, revised 2026-09-29 after review, implemented from
 2026-09-30 on in the order of section 7, which marks each step when it is
-committed: steps 0 to 5 are done. Section 10 records what the
+committed: steps 0 to 6 are done. Section 10 records what the
 implementation added to the plan or does differently. The plan records the
 design agreed for `fisher_kpp_jax` and the order in which to build it. Work
 happens on branch `stupp_all`.
@@ -509,7 +509,7 @@ arises only from an exception or from the non-finite check.
    the guard hook and diagnostics.
 4. Done 2026-09-30: `config.py`: the alias table and class-based name checks.
 5. Done 2026-09-30: `__init__.py`: export the alias; update the module docstring.
-6. `configs/` and `search_spaces/`: the three class configs; the rename
+6. Done 2026-09-30: `configs/` and `search_spaces/`: the three class configs; the rename
    to `FKPPSolver_stupp.json` and its notes; the solver entry of the four
    live search spaces; delete the three first versions.
 7. `scripts/`: `DEFAULT_CONFIG` and the docstrings naming the file;
@@ -607,3 +607,9 @@ Model-specific:
   `register_solver` refuses a class named like an alias. `read_config`
   returns the class's own name in the "solver" entry, also for a file that
   names the class by its former name.
+- **Step 6.** Each class config also gained a `_treatment` comment entry.
+  In the four live search spaces only the "solver" entry and the
+  "(deleted 2026-09-29)" marks changed: their comment entries still name
+  `fisher_kpp_jax/configs/StuppFKPPSolver.json` (now
+  `FKPPSolver_stupp.json`) and `StuppFKPPSolver`. Open: whether to update
+  those mentions.
