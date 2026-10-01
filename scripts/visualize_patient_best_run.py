@@ -39,7 +39,9 @@ later session.
 between the segmented core and the thresholded field over the grid
 0.05..0.95 step 0.01. A number fixes it. Masks follow the sweep
 (``session_references``): the reference core is labels 1 (necrotic) and
-3 (enhancing), the pre-op segmentation relabelled 4 -> 3; the model
+3 (enhancing) in the pre-op session, the pre-op segmentation relabelled
+4 -> 3, and label 3 (enhancing) alone in every post-op session (since
+2026-10-01); the model
 core is field >= threshold; in a post-op session a necrotic voxel that
 an earlier post-op session labelled cavity counts as cavity, and the
 session's label-4 (cavity) voxels are then removed from both masks. The
@@ -180,6 +182,8 @@ from patient_cmaes_fit import FIT_LABEL_CONVENTIONS, fit_session_references  # n
 from sensitivity_analysis import as_float, read_csv, read_json, round_field, write_json  # noqa: E402
 
 DEFAULT_CRITERION = "dice_mean_core"
+# The legend entry of the segmented core volumes (the SA's core rule).
+REFERENCE_CORE_LABEL = "segmented core (pre-op: necrotic + enhancing; post-op: enhancing)"
 THRESHOLD_COLUMN = "core_threshold"
 # A fit directory's re-solved best run (scripts/patient_cmaes_fit.py resolve).
 FIT_BEST_DIR = "best"
@@ -472,7 +476,7 @@ def render_segmentations(
         loc="upper left", fontsize=10, frameon=False,
     )
     bottom.plot(
-        moments, reference_volumes, "o-", color=REFERENCE_COLOR, markersize=6, label="segmented core"
+        moments, reference_volumes, "o-", color=REFERENCE_COLOR, markersize=6, label=REFERENCE_CORE_LABEL
     )
     for session, moment, volume in zip(sessions, moments, reference_volumes, strict=True):
         bottom.annotate(
@@ -543,7 +547,7 @@ def render_model(
     bottom.plot(moments, model_volumes, "s", color=MODEL_COLOR, markersize=6, label="model core at scan (cavity excluded)")
     bottom.plot(
         moments, reference_volumes, "o", markerfacecolor="none", markeredgecolor=REFERENCE_COLOR,
-        markersize=7, markeredgewidth=1.5, label="segmented core",
+        markersize=7, markeredgewidth=1.5, label=REFERENCE_CORE_LABEL,
     )
     _finish_curve(bottom, params, stopping_time)
     fig.savefig(str(outfile_stem) + ".png", dpi=110)
@@ -703,7 +707,7 @@ def main(argv: list[str] | None = None) -> int:
         threshold, threshold_source = infer_threshold(fields, references), "inferred"
     else:
         threshold, threshold_source = float(args.core_threshold), "given"
-    print(f"core threshold {threshold:g} ({threshold_source})")
+    print(f"core threshold {threshold:g} ({threshold_source}); reference core: necrotic + enhancing pre-op, enhancing post-op")
 
     dices = [dice((f >= threshold) & r.valid, r.core) for f, r in zip(fields, references, strict=True)]
     model_volumes = [

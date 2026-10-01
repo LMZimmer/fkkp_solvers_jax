@@ -321,6 +321,7 @@ def _treated_step(
     update: Callable[..., dict[str, jax.Array]],
     killed: tuple[str, ...],
     cleared: tuple[str, ...],
+    sink: str | None = None,
 ) -> dict[str, jax.Array]:
     """
     Perform one step of a treated run: the model's update followed by the
@@ -347,7 +348,11 @@ def _treated_step(
          field <- field exp(-E(x) n_hits), n_hits = number of rt_times in
          (t0, t1] (exact impulse map, not part of the Euler right-hand
          side). The two factors are deliberately applied one after the
-         other in this order, never combined into one;
+         other in this order, never combined into one. With a sink, the
+         killed cells of every killed field, the field before the two
+         factors minus the field after them, are added to the sink field
+         (they become necrotic in the two-compartment model); without
+         one they leave the system;
       4. for every field in cleared, the resection projection
          field <- 0 inside the cavity, for every step with post
          (idempotent), so that the cavity is empty at the end of every
@@ -367,6 +372,9 @@ def _treated_step(
             on.
         cleared: State keys the resection projection empties inside the
             cavity.
+        sink: State key that receives the killed cells of every killed
+            field, or None when they leave the system. The sink must not
+            be a killed field.
 
     Returns:
         The stepped state.
@@ -397,8 +405,12 @@ def _treated_step(
     n_hits = jnp.sum(jnp.logical_and(rt_times > t0, rt_times <= t1)).astype(dt.dtype)
     rt_survival = jnp.exp(-constants["rt_log_kill"] * n_hits)
     for key in killed:
-        new_state[key] = new_state[key] * chemo_survival
-        new_state[key] = new_state[key] * rt_survival
+        before = new_state[key]
+        after = before * chemo_survival
+        after = after * rt_survival
+        new_state[key] = after
+        if sink is not None:
+            new_state[sink] = new_state[sink] + (before - after)
 
     resected = jnp.logical_and(post, constants["cavity"])
     for key in cleared:
@@ -416,16 +428,19 @@ _treated_single_field_step = partial(
     cleared=("cell_density",),
 )
 
-# The treated step of the two-compartment model. Killed cells vanish: the
-# chemotherapy and radiotherapy impulses act on the proliferative field
-# and the killed cells leave the system, as in the single-field models.
-# The alternative, moving the killed cells into the necrotic field, was
-# rejected: the model has no necrotic clearance, so P + N would then never
-# decrease except through the resection, and every quantity built from
-# P + N (the mass and volume stopping quantities, comparisons with
-# segmentations) would be blind to chemotherapy and radiotherapy. As it
-# is, P + N drops under a kill, so the stopping quantities see it and the
-# occupancy mask frees up; the nutrient is not touched by a kill, and the
+# The treated step of the two-compartment model. Killed cells become
+# necrotic (decided 2026-10-01, reversing the earlier choice that they
+# vanish): the chemotherapy and radiotherapy impulses act on the
+# proliferative field and the killed cells, the proliferative field before
+# the two factors minus the field after them, are added to the necrotic
+# field. Consequences: the model has no necrotic clearance, so P + N is
+# conserved under a kill and decreases only through the resection; the
+# mass and volume stopping quantities and the occupancy mask (both on
+# P + N) see the resection only, and the killed tissue keeps suppressing
+# regrowth through the logistic factor (1 - P - N). Only the proliferative
+# field responds to chemotherapy and radiotherapy, which is why the
+# patient scripts score the post-op sessions against the enhancing
+# tumour alone. The nutrient is not touched by a kill, and the
 # consumption of the same step used the pre-kill proliferative field. The
 # resection projection empties all three fields inside the cavity, and the
 # post-resection tissue mask and nutrient faces block the tumor and the
@@ -436,6 +451,7 @@ _treated_two_compartment_step = partial(
     update=_two_compartment_update,
     killed=("proliferative",),
     cleared=("proliferative", "necrotic", "nutrient"),
+    sink="necrotic",
 )
 
 
@@ -676,7 +692,9 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
     the event order are those of ``FKPPSolver`` (see its docstring), the
     treatment volumes on the grid of the tissue maps. The chemotherapy
     and radiotherapy impulses act on the proliferative field and the
-    killed cells leave the system (they do not become necrotic, see
+    killed cells become necrotic: they are moved into the necrotic field,
+    so P + N is conserved under a kill and the mass and volume stopping
+    quantities see the resection only (see
     ``_treated_two_compartment_step``). From the resection on, the
     projection empties the proliferative, the necrotic and the nutrient
     field inside the cavity in every step, and the cavity is removed from

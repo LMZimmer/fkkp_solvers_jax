@@ -246,27 +246,35 @@ def test_session_parsing_and_selection():
 
 def test_relabel_preop_and_cavity_exclusion():
     seg = np.zeros((6, 6, 6), dtype=np.int64)
-    seg[1:3, 1:3, 1:3] = 4
-    seg[3:5, 1:3, 1:3] = 1
-    seg[1:5, 3:5, 1:3] = 2
+    seg[1:3, 1:3, 1:3] = 4  # cavity, 8 voxels
+    seg[3:5, 1:3, 1:3] = 1  # necrotic, 8 voxels
+    seg[1:5, 3:5, 1:3] = 2  # edema, 16 voxels
+    seg[1:5, 1:3, 3:5] = 3  # enhancing, 16 voxels
     relabelled = psa.relabel_preop(seg)
-    assert not (relabelled == 4).any() and (relabelled == 3).sum() == 8 and (seg == 4).sum() == 8
+    assert not (relabelled == 4).any() and (relabelled == 3).sum() == 24 and (seg == 4).sum() == 8
+    # Pre-op: the core is the necrotic and the enhancing tumour (4 -> 3).
     preop = psa.reference_masks(seg, preop=True)
     assert preop.n_cavity == 0 and preop.valid.all()
-    assert preop.core.sum() == 16 and preop.whole.sum() == 32
+    assert preop.core.sum() == 32 and preop.whole.sum() == 48
+    # Post-op: the cavity is excluded, the core is the enhancing tumour
+    # alone, and the necrotic block counts for the whole tumour only.
     postop = psa.reference_masks(seg, preop=False)
     assert postop.n_cavity == 8 and (~postop.valid).sum() == 8
-    assert postop.core.sum() == 8 and postop.whole.sum() == 24
-    # A model mask covering the cavity and the necrotic block: the cavity
-    # voxels count neither for the model nor for the reference.
+    assert postop.core.sum() == 16 and postop.whole.sum() == 40
+    assert not (postop.core & (seg == 1)).any() and (postop.whole & (seg == 1)).sum() == 8
+    # A model mask covering the cavity and the enhancing block: the cavity
+    # voxels count neither for the model nor for the reference, so the
+    # post-op core Dice is 1; the pre-op core also holds the cavity (as
+    # enhancing) and the necrotic block, which the model mask misses.
     density = np.zeros(seg.shape)
-    density[1:5, 1:3, 1:3] = 1.0
+    density[1:3, 1:3, 1:3] = 1.0
+    density[1:5, 1:3, 3:5] = 1.0
     qois = psa.threshold_qois(density, postop, (1.0, 1.0, 1.0), 0.6, 0.3, distances=False)
     assert qois["dice_core"] == pytest.approx(1.0)
-    assert qois["log10_V_core"] == pytest.approx(np.log10(8 + 1))
+    assert qois["log10_V_core"] == pytest.approx(np.log10(16 + 1))
     assert qois["log_vol_ratio_core"] == pytest.approx(0.0)
     qois_pre = psa.threshold_qois(density, preop, (1.0, 1.0, 1.0), 0.6, 0.3, distances=False)
-    assert qois_pre["dice_core"] == pytest.approx(1.0) and qois_pre["log10_V_core"] == pytest.approx(np.log10(17))
+    assert qois_pre["dice_core"] == pytest.approx(2 * 24 / (24 + 32)) and qois_pre["log10_V_core"] == pytest.approx(np.log10(25))
 
 
 # --- (3) Dice and surface distances ---

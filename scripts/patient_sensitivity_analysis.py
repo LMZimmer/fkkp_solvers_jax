@@ -27,7 +27,12 @@ later sessions analysed are --sessions (which must hold the post-op
 session, the source of the resection cavity) and must all be after the
 pre-op scan. Labels of every tumour segmentation: 1 necrotic, 2 edema,
 3 enhancing, 4 cavity; the pre-op segmentation is relabelled 4 -> 3
-before use. In a later session a necrotic voxel that any earlier later
+before use. The reference core is labels 1 and 3 in the pre-op session
+and label 3 alone in every later session (since 2026-10-01: the
+two-compartment solver turns the cells killed by chemotherapy and
+radiotherapy necrotic, so after the resection only the enhancing tumour
+is comparable with a model's viable cells; the isotropic model is
+scored by the same convention). In a later session a necrotic voxel that any earlier later
 session of the design labelled cavity counts as cavity
 (``correct_cavity_labels``: the segmentation algorithm sometimes labels
 the resection cavity necrotic in one session and cavity again in the
@@ -164,7 +169,8 @@ volume (mm^3) and, in the post-op sessions, every label-4 voxel of THAT
 session's segmentation, after the cavity correction above, excluded
 from the model and the reference masks (``session_references``; the
 pre-op session excludes nothing):
-  model core  = u >= core_threshold;  reference core  = labels {1, 3}
+  model core  = u >= core_threshold;  reference core  = labels {1, 3} in
+                                      the pre-op session, {3} afterwards
   model whole = u >= edema_threshold; reference whole = labels {1, 2, 3}
   dice_<r>           Dice of the row thresholds; NaN when both masks are
                      empty (counted), 0 when one is (``dice``)
@@ -193,7 +199,7 @@ pre-op session excludes nothing):
                      (``compute_qois`` with the patient's white-matter
                      map and the projected seed voxel)
 and per run dice_mean_core, the mean of the finite dice_core over the
-post-op sessions. Every Dice / volume / distance is computed on the
+post-op sessions (the enhancing-tumour Dice, by the core rule above). Every Dice / volume / distance is computed on the
 bounding box of the reference whole mask and the field at or above the
 smallest threshold in use (exact: every mask lies inside it).
 
@@ -353,13 +359,23 @@ LABEL_PREOP, LABEL_POSTOP, LABEL_FOLLOWUP = "preop", "postop", "followup"
 # Segmentation labels (all tumour segmentations) and the compartments.
 LABEL_NECROTIC, LABEL_EDEMA, LABEL_ENHANCING, LABEL_CAVITY = 1, 2, 3, 4
 KNOWN_LABELS: tuple[int, ...] = (0, LABEL_NECROTIC, LABEL_EDEMA, LABEL_ENHANCING, LABEL_CAVITY)
+# The core of the pre-op session (the seedable region as well) is the
+# necrotic and the enhancing tumour; the core of every later session is
+# the enhancing tumour alone (since 2026-10-01, see the module docstring).
 CORE_LABELS: tuple[int, ...] = (LABEL_NECROTIC, LABEL_ENHANCING)
+POSTOP_CORE_LABELS: tuple[int, ...] = (LABEL_ENHANCING,)
 WHOLE_LABELS: tuple[int, ...] = (LABEL_NECROTIC, LABEL_EDEMA, LABEL_ENHANCING)
 PREOP_RELABEL: dict[int, int] = {LABEL_CAVITY: LABEL_ENHANCING}
 LABEL_CONVENTIONS: dict[str, Any] = {
     "labels": {"1": "necrotic", "2": "edema", "3": "enhancing", "4": "cavity"},
-    "reference_core": list(CORE_LABELS),
+    "reference_core_preop": list(CORE_LABELS),
+    "reference_core_postop": list(POSTOP_CORE_LABELS),
     "reference_whole": list(WHOLE_LABELS),
+    "postop_core": (
+        f"in every later session the reference core is label {LABEL_ENHANCING} alone (since 2026-10-01): the "
+        "two-compartment solver turns the cells killed by chemotherapy and radiotherapy necrotic, so after the "
+        "resection only the enhancing tumour is comparable with a model's viable cells"
+    ),
     "preop_relabel": {str(k): v for k, v in PREOP_RELABEL.items()},
     "postop_exclusion": f"label {LABEL_CAVITY} voxels of the session's own segmentation, after the cavity correction, are removed from the model and the reference masks",
     "cavity_correction": (
@@ -1857,7 +1873,8 @@ class Reference:
 
     Attributes:
         session: The session id.
-        core: Labels CORE_LABELS, the cavity excluded.
+        core: Labels CORE_LABELS (pre-op session) or POSTOP_CORE_LABELS
+            (later sessions), the cavity excluded.
         whole: Labels WHOLE_LABELS, the cavity excluded.
         valid: The voxels kept: all but the session's label-4 voxels
             after the cavity correction (all voxels for the pre-op
@@ -1904,22 +1921,27 @@ def reference_masks(
 ) -> Reference:
     """
     The reference masks of a segmentation: the pre-op one relabelled
-    4 -> 3 and nothing excluded; a post-op one corrected with the
-    earlier sessions' cavity (``correct_cavity_labels``; None for the
-    first later session) and its label-4 voxels then excluded from the
-    masks (and, through ``valid``, from the model).
+    4 -> 3 and nothing excluded, its core the labels CORE_LABELS; a
+    post-op one corrected with the earlier sessions' cavity
+    (``correct_cavity_labels``; None for the first later session) and its
+    label-4 voxels then excluded from the masks (and, through ``valid``,
+    from the model), its core the labels POSTOP_CORE_LABELS (the
+    enhancing tumour alone). The whole-tumour labels are the same for
+    every session.
     """
     segmentation = np.asarray(segmentation)
     n_relabelled = 0
     if preop:
         segmentation = relabel_preop(segmentation)
         valid = np.ones(segmentation.shape, dtype=bool)
+        core_labels = CORE_LABELS
     else:
         segmentation, n_relabelled = correct_cavity_labels(segmentation, earlier_cavity)
         valid = segmentation != LABEL_CAVITY
+        core_labels = POSTOP_CORE_LABELS
     return Reference(
         session=session,
-        core=np.isin(segmentation, CORE_LABELS) & valid,
+        core=np.isin(segmentation, core_labels) & valid,
         whole=np.isin(segmentation, WHOLE_LABELS) & valid,
         valid=valid,
         n_cavity=int((~valid).sum()),

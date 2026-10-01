@@ -25,7 +25,12 @@ is the agreement of the fields with the sessions' references
 session's own cavity voxels excluded from the model and the reference,
 and in every later session the post-op cavity, i.e. the solver's
 resection cavity, excluded as well; FIT_LABEL_CONVENTIONS, since
-2026-09-28: fit directories set up before are refused). Per
+2026-09-28: fit directories set up before are refused). The reference
+core core_s is the SA's: the necrotic and the enhancing tumour (labels 1
+and 3, 4 -> 3) in the pre-op session and the enhancing tumour alone
+(label 3) in every later session (since 2026-10-01, with the
+two-compartment solver's killed cells turning necrotic; fit directories
+set up before are refused as well). Per
 session and core threshold tau_c of THRESHOLD_GRID_CORE (0.50..0.85: the
 SA's grid 0.30..0.85 without the values below CORE_THRESHOLD_FLOOR = 0.5,
 since 2026-09-27; the 2026-09-25 fit profiled the core threshold to the
@@ -269,9 +274,10 @@ block). The proxy is the closest quantity qoi.csv offers:
 in a sampled-mode sweep every row of a run carries its own sampled core
 threshold, so the maximum over the rows profiles the threshold over the
 sampled values (not the fit's grid), and the Dice are the sweep's (14-day
-adjuvant cycles before 2026-09-17, recorded in the sweep's spec.json; the
-fit's timeline uses the SA's current constants), so the proxy is not the
-fit's objective at that point; the start is evaluated with the objective
+adjuvant cycles before 2026-09-17, and the necrotic and the enhancing
+tumour as the post-op core before 2026-10-01, both recorded in the sweep's
+spec.json; the fit's timeline and masks use the SA's current constants),
+so the proxy is not the fit's objective at that point; the start is evaluated with the objective
 at generation 0. Each run's design row is converted: v, lambda, sigma
 from the row, growth_length_mm = v preop_time, the seed voxel
 seed_voxel_i/j/k mapped back into box coordinates ((v - lo) / (hi - lo)),
@@ -1571,7 +1577,9 @@ def problem_from_fit_dir(fit_dir: Path, spec: Mapping[str, Any]) -> FitProblem:
     if json.dumps(spec.get("label_conventions"), sort_keys=True) != json.dumps(FIT_LABEL_CONVENTIONS, sort_keys=True):
         raise RuntimeError(
             f"the label conventions of {fit_dir / SPEC_FILE} differ from the script's FIT_LABEL_CONVENTIONS; the fit was "
-            "set up with other reference masks (before 2026-09-28 the post-op cavity was not excluded from every later session)."
+            "set up with other reference masks (before 2026-09-28 the post-op cavity was not excluded from every later "
+            "session; before 2026-10-01 the post-op reference core was the necrotic and the enhancing tumour, not the "
+            "enhancing tumour alone)."
         )
     return problem
 
@@ -2548,9 +2556,13 @@ def sweep_starts(sweep_dir: Path, problem: FitProblem, top: int, min_distance: f
         "sweep_threshold_mode": spec.get("threshold_mode"),
         "sweep_adjuvant_cycle_days": spec.get("protocol", {}).get("adjuvant_cycle_days"),
         "fit_adjuvant_cycle_days": ADJUVANT_CYCLE_DAYS,
+        "sweep_label_conventions": spec.get("label_conventions"),
+        "fit_label_conventions": FIT_LABEL_CONVENTIONS,
         "proxy": (
             "per run the maximum over its qoi rows of the weighted mean over the objective's sessions of <ses>_dice_core "
-            "(NaN dropped with its weight); in a sampled-mode sweep the rows of a run differ in their sampled thresholds"
+            "(NaN dropped with its weight); in a sampled-mode sweep the rows of a run differ in their sampled thresholds; "
+            "the sweep's dice_core follows the sweep's label conventions (in sweeps before 2026-10-01 the post-op core "
+            "was the necrotic and the enhancing tumour, the fit's is the enhancing tumour alone)"
         ),
         "n_qoi_rows": n_rows,
         "n_successful_rows": n_success,
