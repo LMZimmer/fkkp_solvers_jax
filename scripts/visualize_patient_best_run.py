@@ -561,6 +561,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.fit_dir is not None:
         fit_dir = Path(args.fit_dir)
         spec = read_json(fit_dir / "spec.json")
+        solver_mode = spec.get("solver", {}).get("mode", "standard")
+        if solver_mode != "standard":
+            raise NotImplementedError(
+                f"the fit {fit_dir} was run with --solver {solver_mode}; this script renders the cell_density frames "
+                "of the isotropic solver only."
+            )
+        scope = spec.get("objective", {}).get("scope", "full")
+        if scope != "full":
+            raise NotImplementedError(
+                f"the fit {fit_dir} was run with --objective {scope}; this script renders the treated timeline "
+                "(resection, fractions, chemotherapy) of a full-series fit only."
+            )
         config_path, fit, objective = fit_best_run(fit_dir)
         resolved = objective["resolved"]
         criterion, criterion_value = FIT_CRITERION, float(resolved[FIT_CRITERION])

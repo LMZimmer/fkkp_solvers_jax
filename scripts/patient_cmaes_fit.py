@@ -1,7 +1,11 @@
 #!/usr/bin/env python
-"""CMA-ES fit of the Stupp-protocol forward model, fisher_kpp_jax.StuppFKPPSolver,
+"""CMA-ES fit of a Stupp-protocol forward model of fisher_kpp_jax (--solver:
+standard = FKPPSolver, the isotropic model; twospecies =
+TwoCompartmentWithNutrientFKPPSolver, the proliferative / necrotic /
+nutrient model; see Solver below)
 to ONE real patient of the SAILOR cohort: the factors of a search-space file
-(ten with the 2026-09-27 file) are adjusted so that the forward run agrees with the patient's longitudinal tumour segmentations,
+(ten with the 2026-09-27 isotropic file, fourteen with the two-species
+file) are adjusted so that the forward run agrees with the patient's longitudinal tumour segmentations,
 with the covariance matrix adaptation evolution strategy (CMA-ES) of the
 glioma inverse fitting tool (GIFT,
 https://github.com/jonasw247/glioma-inverse-fitting-tool, branch dtiStuff,
@@ -16,10 +20,61 @@ and are imported from it, together with the atlas script's derivations
 (scripts/sensitivity_analysis.py); nothing of the two is copied. What the
 fit adds is below.
 
+Solver (--solver, SOLVER_MODES, default standard). standard runs
+FKPPSolver and scores its cell density u_s; twospecies runs
+TwoCompartmentWithNutrientFKPPSolver and scores, per session, the
+densities of ``region_densities``: P + N (proliferative + necrotic) for
+the pre-op core and for the whole tumour of every session, P alone for the
+core of every later session, matching the references below (the cells
+killed by chemotherapy and radiotherapy become necrotic in that model, so
+after the surgery only the viable cells are comparable with the
+enhancing tumour). The nutrient is not scored. With twospecies the
+default base config is fisher_kpp_jax/configs/TwoCompartmentWithNutrientFKPPSolver_stupp.json,
+the default search space
+fisher_kpp_jax/search_spaces/sailor_patient_twospecies_fit_search_space.json
+(the isotropic factors plus necrosis_rate, nutrient_threshold,
+nutrient_diffusivity and nutrient_consumption_rate as direct factors),
+only --loss core is accepted (the whole-tumour Dice is recorded, not
+optimised), and the sweep starts fill the four factors the isotropic
+sweep lacks with SWEEP_FILL_VALUES, a well-fed tumour (necrosis rate
+0.02, threshold 0.15, nutrient diffusivity 0.5, consumption 0.02; recorded
+as filled in starts.json; the midpoint of the ranges is a starved tumour
+whose post-op core is empty, see SWEEP_FILL_VALUES). The
+recorded frames are P and N per session (MODEL_FIELDS); the resolve
+writes <ses>_proliferative, <ses>_necrotic and <ses>_nutrient.nii.gz.
+spec.json records the solver; a fit directory is resumed and resolved
+with its own solver.
+
+Objective scope (--objective, OBJECTIVE_SCOPES, default full). full fits
+the whole exam series: the pre-op session and the later sessions of
+--sessions are simulated by the treated forward run (resection,
+radiotherapy, chemotherapy at the patient's timeline) and scored. preop
+fits the pre-op exam alone: the forward run is the UNTREATED growth from
+the seed to the pre-op scan (stopping_time = preop_time, resection_time
+inf, no resection cavity, no dose map, no fractions, no chemotherapy
+sessions; the horizon offset is 0, so n_steps = ceil(steps_per_day
+preop_time_max) = 2400 at the defaults), the pre-op session is the only
+one simulated, recorded and scored (the objective's sessions are
+(ses-01,); --session-weights may name it alone), and the treatment
+factors TREATMENT_FACTORS (rt_alpha, chemo_kill_rate) are NOT fitted (no
+event fires before the scan, so they have no effect; they are removed
+from the search space, ``FitSpace.dropped``, recorded in spec.json, and
+the base config's values stand in the run config). --sessions still
+names the later sessions the patient data is assembled from (the post-op
+session is the cavity's source, the CRT start session the dose map's;
+the timeline is recorded in spec.json for reference), but none of them
+is simulated. spec.json objective.scope records the scope; a fit
+directory is resumed and resolved with its own scope (old specs are
+full). visualize_patient_best_run.py refuses preop fits (it renders the
+treated timeline).
+
 Objective. loss = 1 - J on the unit cube [0, 1]^n, n the number of factors.
 One evaluation is one
-StuppFKPPSolver run recording one field u_s per session s (the pre-op
-session and the later sessions of the design, ``select_sessions``), and J
+solver run recording one field u_s per session s (the pre-op
+session and the later sessions of the design, ``select_sessions``; the
+pre-op session alone with --objective preop; with
+--solver twospecies u_s stands for the region's density of
+``region_densities``), and J
 is the agreement of the fields with the sessions' references
 (``fit_session_references``: the SA's cavity-corrected masks, the
 session's own cavity voxels excluded from the model and the reference,
@@ -54,8 +109,8 @@ against the whole-tumour reference; both on the session's ``crop_box``
 The objective's sessions are --sessions (default 01-08: the pre-op session
 ses-01 and the later sessions; the pre-op session and every requested
 later session are simulated and recorded, and only the requested ones
-enter the sums), weighted by --session-weights (ses-01=1,ses-02=1,...;
-default 1 each). A session whose Dice is NaN at a threshold (the model and
+enter the sums; with --objective preop the pre-op session alone), weighted
+by --session-weights (ses-01=1,ses-02=1,...; default 1 each). A session whose Dice is NaN at a threshold (the model and
 the reference both empty, the SA's ``dice`` convention) is dropped from
 that threshold's mean with its weight (the mean is renormalised over the
 sessions with a finite Dice); a region whose mean is NaN at every
@@ -81,8 +136,9 @@ the atlas's ``transform_factor``) is a fitted factor, any other entry is a
 fixed value: a solver parameter is written into every run config,
 seed_peak_density is consumed by the seed derivation (it may be a range,
 fitted, or a fixed number, as in the 2026-09-25 file; ``FitSpace.seed_peak``);
-"solver" must name FKPPSolver (StuppFKPPSolver, its former name, is
-accepted); the factor order in the file is the coordinate order of the
+"solver" must name the class of --solver (FKPPSolver, or StuppFKPPSolver,
+its former name, for standard; TwoCompartmentWithNutrientFKPPSolver for
+twospecies); the factor order in the file is the coordinate order of the
 unit cube). The factors and the derivations, per
 evaluation (``FitProblem.derive``):
   growth        white_matter_diffusivity = v lambda / 2 and rho = v / (2 lambda)
@@ -121,8 +177,9 @@ Fixed values (the search-space file's, overriding the base config's):
 rt_alpha_beta_ratio 8 Gy and diffusivity_ratio 10, which the SA found
 inert on the agreement QoIs; chemo_decay_rate 9.24
 (confounded with chemo_kill_rate); gaussian_seed_scale 1. Everything else
-comes from the base config (--config, default
-fisher_kpp_jax/configs/FKPPSolver_stupp.json) with the patient's tissue
+comes from the base config (--config, default per --solver:
+fisher_kpp_jax/configs/FKPPSolver_stupp.json or
+TwoCompartmentWithNutrientFKPPSolver_stupp.json) with the patient's tissue
 maps, resection_cavity (the post-op session's label 4) and rt_dose set as
 the SA's ``run_config`` sets them (its signature takes a SearchSpace, so
 the assembly is repeated here with the same keys, ``FitProblem.config_of``).
@@ -144,7 +201,7 @@ slots are jit-static arguments of the solver's time scan
 (fisher_kpp_jax.operators._run_time_scan), so a fixed n_steps means one
 compilation per worker and resolution factor instead of one per distinct
 horizon; the price is that dt differs slightly between evaluations and
-from the sweeps' 1/12 day. The design-time check builds a StuppFKPPSolver
+from the sweeps' 1/12 day. The design-time check builds a solver
 at the stiffest corner (largest diffusivity, longest horizon) per factor
 and confirms with ``resolve_time_stepping`` that the solver keeps n_steps
 (it raises the count only where its stability estimate is stricter); if
@@ -285,7 +342,8 @@ rt_alpha and chemo_kill_rate; the values are clipped into the fit's
 ranges (recorded) and mapped with to_unit. The row's seed_peak_density is
 carried when the fit fits it (2026-09-27 file) and not carried when the
 file fixes it; the row's diffusivity_ratio and rt_alpha_beta_ratio are not
-carried (fixed in the fit; the not-carried values are recorded). If the sweep directory does not exist and no
+carried (fixed in the fit), nor rt_alpha and chemo_kill_rate with
+--objective preop (dropped; the not-carried values are recorded). If the sweep directory does not exist and no
 --init-values is given the script exits with an error; with
 --init-values it warns and uses the manual start. --no-sweep-init
 disables the sweep starts. --init-values name=value,... (physical units,
@@ -297,11 +355,13 @@ the resolved starts and exits (no GPU).
 
 Output layout (--output-dir, default DEFAULT_OUTPUT_DIR; --name required;
 nothing is written outside <output-dir>/<name>/):
-  spec.json            patient, sessions, timeline (the SA's record), label
+  spec.json            patient, sessions (requested and simulated), solver,
+                       timeline (the SA's record), label
                        conventions, data_checks, protocol, the search space
-                       (source, factors, fixed values), the objective
-                       settings, the parametrisation (clamp range, seed box,
-                       formulas), the CMA-ES settings, time_stepping
+                       (source, factors, fixed values, dropped factors), the
+                       objective settings (mode, scope, sessions, weights,
+                       grids), the parametrisation (clamp range, seed box,
+                       formulas, objective_scope), the CMA-ES settings, time_stepping
                        (n_steps, dt range and the design-time check per
                        resolution factor), workers, argv, created
   search_space.json    copy of the file used
@@ -337,7 +397,9 @@ nothing is written outside <output-dir>/<name>/):
                        (restart, eval_id), the workers, the resolve record
   best/                written by resolve only: config.json (with the
                        evaluation's _fit record), result.json,
-                       <ses>_cell_density.nii.gz, final_cell_density.nii.gz
+                       <ses>_<field>.nii.gz and final_<field>.nii.gz per
+                       recorded field (cell_density; or proliferative,
+                       necrotic and nutrient with --solver twospecies)
                        as the SA's run-one writes them (``Result.save`` and
                        ``_save_session_snapshots``), timeline.json, and
                        objective.json with the objective recomputed at full
@@ -356,6 +418,7 @@ project root, e.g.:
   python scripts/patient_cmaes_fit.py fit --name fit_sub01 --gpus 0,1,2,3 --top 5 --dry-run
   python scripts/patient_cmaes_fit.py fit --name fit_sub01 --gpus 0,1,2,3 --top 5 --resume
   python scripts/patient_cmaes_fit.py fit --name fit_sub01 --gpus 0,1,2,3 --top 5
+  python scripts/patient_cmaes_fit.py fit --objective preop --name fit_sub01_preop --gpus 0 --top 5
   python scripts/patient_cmaes_fit.py resolve --fit-dir /mnt/Drive4/lucas/stupp_patient_fit/fit_sub01 --gpu 0
 
 Adaptations of the imported code, without changing it: ``parse_sessions``
@@ -386,7 +449,7 @@ import time
 import traceback
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from multiprocessing import get_context
 from multiprocessing.context import BaseContext
@@ -408,7 +471,7 @@ import numpy as np  # noqa: E402
 from numpy.typing import NDArray  # noqa: E402
 from scipy.spatial import cKDTree  # noqa: E402
 
-from fisher_kpp_jax import StuppFKPPSolver, read_config, write_config  # noqa: E402
+from fisher_kpp_jax import FKPPSolver, TwoCompartmentWithNutrientFKPPSolver, read_config, write_config  # noqa: E402
 from patient_sensitivity_analysis import (  # noqa: E402
     ADJUVANT_CYCLE_DAYS,
     CORE_LABELS,
@@ -420,7 +483,6 @@ from patient_sensitivity_analysis import (  # noqa: E402
     LABEL_CONVENTIONS,
     LABEL_PREOP,
     PATIENT_VOLUME_KEYS,
-    SOLVER_NAME,
     THRESHOLD_GRID_CORE as SA_THRESHOLD_GRID_CORE,
     THRESHOLD_GRID_EDEMA,
     TIMELINE_FILE,
@@ -476,7 +538,26 @@ from sensitivity_analysis import (  # noqa: E402
     write_json,
 )
 
-DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_fit_search_space.json"
+# The solver (--solver): the class, its treated base config and its search
+# space, and the state fields the objective reads (``region_densities``).
+SOLVER_MODES: dict[str, type[FKPPSolver] | type[TwoCompartmentWithNutrientFKPPSolver]] = {
+    "standard": FKPPSolver,
+    "twospecies": TwoCompartmentWithNutrientFKPPSolver,
+}
+DEFAULT_SOLVER_MODE = "standard"
+DEFAULT_CONFIGS: dict[str, Path] = {
+    "standard": Path(DEFAULT_CONFIG),
+    "twospecies": _ROOT / "fisher_kpp_jax" / "configs" / "TwoCompartmentWithNutrientFKPPSolver_stupp.json",
+}
+DEFAULT_SEARCH_SPACES: dict[str, Path] = {
+    "standard": _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_fit_search_space.json",
+    "twospecies": _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_twospecies_fit_search_space.json",
+}
+MODEL_FIELDS: dict[str, tuple[str, ...]] = {
+    "standard": ("cell_density",),
+    "twospecies": ("proliferative", "necrotic"),
+}
+DEFAULT_SEARCH_SPACE = DEFAULT_SEARCH_SPACES[DEFAULT_SOLVER_MODE]
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_patient_fit")
 DEFAULT_SWEEP_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_patient/sa_sub01_2026-09-16")
 DEFAULT_SESSIONS = "01-08"  # the objective's sessions, the pre-op one included (``split_sessions``)
@@ -507,6 +588,12 @@ DEFAULT_POPSIZE = "auto"
 POPSIZE_PER_WORKER = 4  # "auto": this many members per worker
 LOSS_MODES: tuple[str, ...] = ("core", "core+whole")
 DEFAULT_LOSS = "core"
+# The objective's scope (--objective, the module docstring's Objective
+# scope): full = the pre-op session and the later sessions of --sessions
+# under the treated forward run; preop = the pre-op session alone under
+# the untreated growth to the pre-op scan, TREATMENT_FACTORS not fitted.
+OBJECTIVE_SCOPES: tuple[str, ...] = ("full", "preop")
+DEFAULT_OBJECTIVE_SCOPE = "full"
 FULL_RESOLUTION = 1.0
 
 # The script factors (not solver parameters): the required ones are ranges;
@@ -523,6 +610,30 @@ REQUIRED_SCRIPT_FACTORS: tuple[str, ...] = (
 )
 SCRIPT_CONSTANTS: tuple[str, ...] = (SEED_PEAK_FACTOR,)  # allowed as fixed numbers
 SCRIPT_FACTORS: tuple[str, ...] = (*REQUIRED_SCRIPT_FACTORS, *SCRIPT_CONSTANTS)
+# The treatment factors: no effect before the pre-op scan, so --objective
+# preop removes them from the search space (``read_fit_search_space``).
+TREATMENT_FACTORS: tuple[str, ...] = ("rt_alpha", "chemo_kill_rate")
+# The solver factors every sweep varies; a sweep start must carry them
+# (when the fit fits them).
+STANDARD_SOLVER_FACTORS: tuple[str, ...] = TREATMENT_FACTORS
+# A solver factor the sweep has no column for starts here (clipped into
+# the fit's range; a factor not listed starts at the unit-cube centre).
+# The two-species values are a WELL-FED tumour (2026-10-01): at the
+# midpoint of the ranges (necrosis 0.1 /day, threshold 0.5, nutrient
+# diffusivity 0.1 mm^2/day, consumption 0.1 /day, a depletion length of
+# 1 mm) the nutrient is gone everywhere but a thin rim, the viable cells
+# turn necrotic throughout, and P reaches the core threshold nowhere after
+# the surgery: every post-op core Dice of the first generation of
+# fit_sub01_twospecies_2026-10-01_starved_start was 0, a flat start the
+# optimizer had to walk out of. Here the depletion length is 5 mm and the
+# necrosis time scale 50 days, a little inside the range ends (unit-cube
+# coordinates 0.06 to 0.85) so that the first proposals are not clipped.
+SWEEP_FILL_VALUES: dict[str, float] = {
+    "necrosis_rate": 0.02,
+    "nutrient_threshold": 0.15,
+    "nutrient_diffusivity": 0.5,
+    "nutrient_consumption_rate": 0.02,
+}
 DERIVED_SOLVER_KEYS: tuple[str, ...] = (
     "white_matter_diffusivity",
     "rho",
@@ -533,6 +644,7 @@ SEED_FRACTION_KEYS: tuple[str, ...] = tuple(f"gaussian_seed_{axis}_fraction" for
 # Config entries the script sets per evaluation; a search space may not hold them.
 FORBIDDEN_KEYS: tuple[str, ...] = (
     *TIMELINE_KEYS,
+    "stopping_time",
     *PATIENT_VOLUME_KEYS,
     *TIME_STEP_KEYS,
     "resolution_factor",
@@ -758,6 +870,9 @@ class FitSpace:
             fixes it; empty when it is fitted).
         source: The file's entries as read, comments included.
         path: The file.
+        dropped: The file's factors the objective scope removed from the
+            fit (TREATMENT_FACTORS with --objective preop), by name;
+            neither fitted nor written (the base config's values stand).
     """
 
     factors: dict[str, SearchSpaceParameter]
@@ -765,6 +880,7 @@ class FitSpace:
     constants: dict[str, float]
     source: dict[str, Any]
     path: Path
+    dropped: dict[str, SearchSpaceParameter] = field(default_factory=dict)
 
     @property
     def names(self) -> list[str]:
@@ -860,13 +976,20 @@ class FitSpace:
             "factors": {name: {"min": f.low, "max": f.high, "scale": f.scale} for name, f in self.factors.items()},
             "overrides": dict(self.overrides),
             "constants": dict(self.constants),
+            "dropped_factors": {name: {"min": f.low, "max": f.high, "scale": f.scale} for name, f in self.dropped.items()},
             "source": dict(self.source),
         }
 
 
-def read_fit_search_space(path: str | Path) -> FitSpace:
+def read_fit_search_space(
+    path: str | Path, solver_mode: str = DEFAULT_SOLVER_MODE, objective_scope: str = DEFAULT_OBJECTIVE_SCOPE
+) -> FitSpace:
     """
-    Read the fit's search-space file (the module docstring's format).
+    Read the fit's search-space file (the module docstring's format) for
+    the solver of ``solver_mode`` (SOLVER_MODES): the file must name that
+    class, and a factor or fixed value that is not a script factor must be
+    one of its parameters. With the objective scope "preop" the file's
+    TREATMENT_FACTORS are removed from the fitted factors (``dropped``).
 
     Raises:
         ValueError: The file is not a JSON object or names another solver;
@@ -882,9 +1005,10 @@ def read_fit_search_space(path: str | Path) -> FitSpace:
     where = f"search space {path}"
     if not isinstance(entries, Mapping):
         raise ValueError(f"{where}: must be a JSON object.")
-    if not names_solver(entries.get(SOLVER_KEY), SOLVER_NAME):
-        raise ValueError(f"{where}: {SOLVER_KEY!r} must be {SOLVER_NAME!r}, got {entries.get(SOLVER_KEY)!r}.")
-    solver_keys = StuppFKPPSolver.config_keys()
+    cls = SOLVER_MODES[solver_mode]
+    if not names_solver(entries.get(SOLVER_KEY), cls.__name__):
+        raise ValueError(f"{where}: {SOLVER_KEY!r} must be {cls.__name__!r} (--solver {solver_mode}), got {entries.get(SOLVER_KEY)!r}.")
+    solver_keys = cls.config_keys()
     factors: dict[str, SearchSpaceParameter] = {}
     overrides: dict[str, Any] = {}
     constants: dict[str, float] = {}
@@ -895,7 +1019,7 @@ def read_fit_search_space(path: str | Path) -> FitSpace:
             raise ValueError(f"{where}: {key} is set per evaluation by the script and may not appear.")
         if isinstance(value, Mapping):
             if key not in SCRIPT_FACTORS and key not in solver_keys:
-                raise ValueError(f"{where}: unknown factor {key!r}; a factor is a script factor {list(SCRIPT_FACTORS)} or a StuppFKPPSolver parameter.")
+                raise ValueError(f"{where}: unknown factor {key!r}; a factor is a script factor {list(SCRIPT_FACTORS)} or a {cls.__name__} parameter.")
             factors[key] = _parse_parameter(key, value, where)
         elif key in SCRIPT_CONSTANTS:
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not np.isfinite(value):
@@ -917,7 +1041,14 @@ def read_fit_search_space(path: str | Path) -> FitSpace:
         factor = factors[name]
         if factor.scale != "linear" or factor.low != 0.0 or factor.high != 1.0:
             raise ValueError(f"{where}: {name} must be linear on [0, 1], got {factor}.")
-    return FitSpace(factors=factors, overrides=overrides, constants=constants, source=dict(entries), path=path)
+    if objective_scope not in OBJECTIVE_SCOPES:
+        raise ValueError(f"the objective scope must be one of {OBJECTIVE_SCOPES}, got {objective_scope!r}.")
+    dropped: dict[str, SearchSpaceParameter] = {}
+    if objective_scope == "preop":
+        # No event fires before the pre-op scan: the treatment factors
+        # have no effect on the objective and are not fitted.
+        dropped = {name: factors.pop(name) for name in TREATMENT_FACTORS if name in factors}
+    return FitSpace(factors=factors, overrides=overrides, constants=constants, source=dict(entries), path=path, dropped=dropped)
 
 
 @dataclass(frozen=True)
@@ -1119,15 +1250,19 @@ class Objective:
         mode: "core" or "core+whole" (LOSS_MODES).
         session_ids: The sessions of the sums, in simulation order.
         weights: Their weights.
+        scope: "full" or "preop" (OBJECTIVE_SCOPES, --objective).
     """
 
     mode: str
     session_ids: tuple[str, ...]
     weights: dict[str, float]
+    scope: str = DEFAULT_OBJECTIVE_SCOPE
 
     def __post_init__(self) -> None:
         if self.mode not in LOSS_MODES:
             raise ValueError(f"the loss must be one of {LOSS_MODES}, got {self.mode!r}.")
+        if self.scope not in OBJECTIVE_SCOPES:
+            raise ValueError(f"the objective scope must be one of {OBJECTIVE_SCOPES}, got {self.scope!r}.")
         if not self.session_ids:
             raise ValueError("the objective needs at least one session.")
 
@@ -1195,6 +1330,7 @@ class Objective:
     def record(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
+            "scope": self.scope,
             "loss": "1 - J",
             "sessions": list(self.session_ids),
             "weights": dict(self.weights),
@@ -1214,6 +1350,26 @@ class Objective:
 
 
 # --- the fit problem: patient, timeline, parametrisation, configs ---
+
+
+def region_densities(fields: Mapping[str, NDArray], preop: bool, solver_mode: str) -> tuple[NDArray, NDArray]:
+    """
+    The model densities the two regions are thresholded on (the module
+    docstring's Objective), (core, whole): the standard solver's cell
+    density for both; for the two-species solver P + N for the pre-op
+    core and the whole tumour and P alone for the core of every later
+    session, matching the references (necrotic + enhancing before the
+    surgery, enhancing alone afterwards). The whole density is pointwise
+    at least the core density, so a crop box of the whole density holds
+    every mask.
+    """
+    if solver_mode == "standard":
+        density = np.asarray(fields["cell_density"])
+        return density, density
+    if solver_mode == "twospecies":
+        total = np.asarray(fields["proliferative"]) + np.asarray(fields["necrotic"])
+        return (total if preop else np.asarray(fields["proliferative"])), total
+    raise ValueError(f"unknown solver mode {solver_mode!r}; known: {list(SOLVER_MODES)}.")
 
 
 def split_sessions(sessions: Sequence[Session], requested_ids: Sequence[str]) -> tuple[str, list[str]]:
@@ -1238,12 +1394,11 @@ def n_steps_count(steps_per_day: float, preop_time_max: float, horizon_offset: f
     return int(math.ceil(float(steps_per_day) * (float(preop_time_max) + float(horizon_offset)) - 1e-9))
 
 
-def resolved_constants(base: Mapping[str, Any], space: FitSpace) -> dict[str, float]:
-    """The CONSTANT_KEYS as the solver resolves them: the treated default
-    config (``DEFAULT_CONFIG``, read by path), the base config, the search
-    space's overrides (no solver is built; the design-time check confirms
-    the values)."""
-    merged = {**read_config(DEFAULT_CONFIG), **base, **space.overrides}
+def resolved_constants(base: Mapping[str, Any], space: FitSpace, cls: type = FKPPSolver) -> dict[str, float]:
+    """The CONSTANT_KEYS as the solver resolves them: the class's default
+    config, the base config, the search space's overrides (no solver is
+    built; the design-time check confirms the values)."""
+    merged = {**cls.get_default_config(), **base, **space.overrides}
     missing = [key for key in CONSTANT_KEYS if merged.get(key) is None]
     if missing:
         raise ValueError(f"the base config resolves no value for {missing}.")
@@ -1289,6 +1444,10 @@ class FitProblem:
         constants: The resolved CONSTANT_KEYS.
         voxel_size_mm: The segmentation grid's voxel size.
         protocol: The protocol doses the timeline was built with.
+        solver_mode: The solver, a key of SOLVER_MODES (--solver).
+        objective_scope: The objective's scope, one of OBJECTIVE_SCOPES
+            (--objective): "preop" simulates the pre-op session alone by
+            the untreated growth to the pre-op scan.
     """
 
     base: dict[str, Any]
@@ -1303,11 +1462,29 @@ class FitProblem:
     constants: dict[str, float]
     voxel_size_mm: tuple[float, float, float]
     protocol: Protocol
+    solver_mode: str = DEFAULT_SOLVER_MODE
+    objective_scope: str = DEFAULT_OBJECTIVE_SCOPE
+
+    @property
+    def preop_only(self) -> bool:
+        """Whether the objective scope is "preop"."""
+        return self.objective_scope == "preop"
+
+    @property
+    def solver_class(self) -> type:
+        """The solver class of ``solver_mode``."""
+        return SOLVER_MODES[self.solver_mode]
+
+    @property
+    def model_fields(self) -> tuple[str, ...]:
+        """The state fields the objective reads (MODEL_FIELDS)."""
+        return MODEL_FIELDS[self.solver_mode]
 
     @property
     def sessions(self) -> tuple[Session, ...]:
-        """The simulated sessions, the pre-op one first."""
-        return self.data.sessions
+        """The simulated sessions, the pre-op one first (the pre-op one
+        alone with the objective scope "preop")."""
+        return self.data.sessions[:1] if self.preop_only else self.data.sessions
 
     @property
     def prefixes(self) -> list[str]:
@@ -1327,7 +1504,9 @@ class FitProblem:
 
     @property
     def horizon_offset(self) -> int:
-        return int(self.timeline.horizon_offset)
+        """The days simulated after the pre-op scan: the timeline's horizon,
+        0 with the objective scope "preop" (the run ends at the scan)."""
+        return 0 if self.preop_only else int(self.timeline.horizon_offset)
 
     def to_physical(self, u: NDArray | Sequence[float]) -> dict[str, float]:
         return self.space.to_physical(u)
@@ -1376,20 +1555,44 @@ class FitProblem:
         timeline at the point's preop_time, the fixed n_steps of the
         resolution factor and the session snapshot days; the "_fit" entry
         records the point (stripped before the solver sees the config,
-        ``read_config_from_mapping``).
+        ``read_config_from_mapping``). With the objective scope "preop"
+        the run is the untreated growth to the pre-op scan: stopping_time
+        = preop_time, resection_time inf, no cavity, no dose map, no
+        fractions, no chemotherapy sessions, the pre-op snapshot alone.
         """
         factor = float(resolution_factor)
         if factor not in self.n_steps:
             raise ValueError(f"no fixed n_steps for the resolution factor {factor!r}; known: {sorted(self.n_steps)}.")
         n_steps = int(self.n_steps[factor])
-        days = self.timeline.model_days(point.preop_time)
-        stopping_time = float(days["stopping_time"])
+        if self.preop_only:
+            stopping_time = float(point.preop_time)
+            days: dict[str, Any] = {"snapshots": {self.data.preop.id: stopping_time}, "stopping_time": stopping_time}
+            schedule: dict[str, Any] = {
+                "resection_time": float("inf"),
+                "time_after_resection": None,
+                "stopping_time": stopping_time,
+                "rt_times": [],
+                "chemo_times": [],
+                "chemo_doses": [],
+            }
+            volumes: dict[str, Any] = {"resection_cavity": None, "rt_dose": None}
+        else:
+            days = self.timeline.model_days(point.preop_time)
+            stopping_time = float(days["stopping_time"])
+            schedule = {key: days[key] for key in ("resection_time", "time_after_resection", "rt_times", "chemo_times", "chemo_doses")}
+            volumes = {
+                "resection_cavity": {
+                    "segmentation": str(self.data.segmentations[self.data.cavity_session]),
+                    "label": LABEL_CAVITY,
+                },
+                "rt_dose": str(self.data.dose),
+            }
         dt = stopping_time / n_steps
         snapshot_days = session_snapshot_days(days["snapshots"], dt)
         if len(set(snapshot_days.values())) != len(snapshot_days):
             raise RuntimeError(f"two sessions share a snapshot step at dt={dt:g}: {snapshot_days}.")
         config: dict[str, Any] = {
-            SOLVER_KEY: self.base.get(SOLVER_KEY, SOLVER_NAME),
+            SOLVER_KEY: self.solver_class.__name__,
             "_fit": {
                 "script": "scripts/patient_cmaes_fit.py",
                 "unit": {name: float(point.unit[i]) for i, name in enumerate(self.space.names)},
@@ -1401,6 +1604,7 @@ class FitProblem:
                 "preop_time_range": list(self.preop_time_range),
                 "seed_voxel": list(point.seed_voxel),
                 "seed_snapped": point.seed_snapped,
+                "objective_scope": self.objective_scope,
                 "resolution_factor": factor,
                 "n_steps": n_steps,
                 "dt": dt,
@@ -1420,19 +1624,23 @@ class FitProblem:
         config.update({name: point.physical[name] for name in self.space.solver_factor_names})
         config.update(dict(zip(SEED_FRACTION_KEYS, point.seed_fractions, strict=True)))
         config.update({key: str(path) for key, path in self.data.tissue.items()})
-        config["resection_cavity"] = {
-            "segmentation": str(self.data.segmentations[self.data.cavity_session]),
-            "label": LABEL_CAVITY,
-        }
-        config["rt_dose"] = str(self.data.dose)
-        for key in ("resection_time", "time_after_resection", "rt_times", "chemo_times", "chemo_doses"):
-            config[key] = days[key]
+        config.update(volumes)
+        config.update(schedule)
         config["resolution_factor"] = factor
         config["n_steps"] = n_steps
         config["dt"] = None
         config["steps_per_day"] = None
         config["snapshot_times"] = sorted(set(snapshot_days.values()))
         return config
+
+    def solver_record(self) -> dict[str, Any]:
+        """The spec.json solver record: the mode, the class, the fields
+        read and the densities the regions are thresholded on."""
+        densities = {
+            "standard": "core and whole: cell_density",
+            "twospecies": "pre-op core and whole (every session): proliferative + necrotic; core of every later session: proliferative",
+        }[self.solver_mode]
+        return {"mode": self.solver_mode, "class": self.solver_class.__name__, "fields": list(self.model_fields), "densities": densities}
 
     def evaluation_config(self, u: NDArray | Sequence[float], resolution_factor: float) -> dict[str, Any]:
         """The run config of a unit-cube point (``derive`` and ``config_of``)."""
@@ -1442,6 +1650,9 @@ class FitProblem:
     def record(self) -> dict[str, Any]:
         """The spec.json parametrisation record."""
         return {
+            "solver": self.solver_record(),
+            "objective_scope": self.objective_scope,
+            "treatment_factors_dropped": list(self.space.dropped),
             "factor_names": self.space.names,
             "preop_time_range": list(self.preop_time_range),
             "preop_time": f"{GROWTH_LENGTH_FACTOR} / {GROWTH_SPEED_FACTOR}, clamped to preop_time_range (preop_time_clamped records the clamp)",
@@ -1460,7 +1671,10 @@ class FitProblem:
             "steps_per_day": self.steps_per_day,
             "horizon_offset_days": self.horizon_offset,
             "n_steps": {str(factor): n for factor, n in sorted(self.n_steps.items())},
-            "n_steps_rule": "ceil(steps_per_day (preop_time_max + horizon_offset)), fixed per resolution factor; dt = stopping_time / n_steps",
+            "n_steps_rule": (
+                "ceil(steps_per_day (preop_time_max + horizon_offset)), fixed per resolution factor; dt = stopping_time / n_steps; "
+                "horizon_offset is 0 with objective_scope preop (the run ends at the pre-op scan)"
+            ),
             "dt_range": {str(factor): list(self.dt_range(factor)) for factor in sorted(self.n_steps)},
             "voxel_size_mm": list(self.voxel_size_mm),
         }
@@ -1480,32 +1694,50 @@ def build_problem(
     resolution_factors: Sequence[float],
     n_steps: Mapping[float, int] | None = None,
     protocol: Protocol | None = None,
+    solver_mode: str = DEFAULT_SOLVER_MODE,
+    objective_scope: str = DEFAULT_OBJECTIVE_SCOPE,
 ) -> FitProblem:
     """
-    Assemble the fit problem: the base config, the search space, the
-    patient's sessions and files (``read_session_labels``,
-    ``split_sessions``, ``select_sessions``, ``patient_files``), the
-    objective, the timeline (the base config's protocol doses unless a
-    Protocol is given), the seed map and the fixed step counts (the
-    formula unless given). No solve, no JAX operation.
+    Assemble the fit problem: the solver (SOLVER_MODES), the base config,
+    the search space (its treatment factors dropped with the objective
+    scope "preop"), the patient's sessions and files
+    (``read_session_labels``, ``split_sessions``, ``select_sessions``,
+    ``patient_files``), the objective (the pre-op session alone with the
+    scope "preop"), the timeline (the base config's
+    protocol doses unless a Protocol is given), the seed map and the fixed
+    step counts (the formula unless given). No solve, no JAX operation.
     """
-    base = read_config(config_path, solver=StuppFKPPSolver)
-    space = read_fit_search_space(search_space_path)
+    if solver_mode not in SOLVER_MODES:
+        raise ValueError(f"unknown solver mode {solver_mode!r}; known: {list(SOLVER_MODES)}.")
+    if objective_scope not in OBJECTIVE_SCOPES:
+        raise ValueError(f"unknown objective scope {objective_scope!r}; known: {list(OBJECTIVE_SCOPES)}.")
+    if solver_mode == "twospecies" and loss != "core":
+        raise ValueError(
+            f"--loss {loss} is not available with --solver twospecies: the whole-tumour Dice (P + N against labels 1, 2, 3) "
+            "is recorded but not part of the objective; use --loss core."
+        )
+    cls = SOLVER_MODES[solver_mode]
+    base = read_config(config_path, solver=cls)
+    space = read_fit_search_space(search_space_path, solver_mode, objective_scope)
     all_sessions = read_session_labels(session_labels, patient)
     requested = parse_sessions(sessions)
-    _, later_ids = split_sessions(all_sessions, requested)
+    preop_id, later_ids = split_sessions(all_sessions, requested)
     selected = select_sessions(all_sessions, later_ids)
     data = patient_files(patient_root, patient, selected)
-    objective_ids = tuple(s.id for s in selected if s.id in set(requested))
+    if objective_scope == "preop":
+        objective_ids: tuple[str, ...] = (preop_id,)
+    else:
+        objective_ids = tuple(s.id for s in selected if s.id in set(requested))
     weights = parse_session_weights(session_weights, objective_ids)
-    objective = Objective(loss, objective_ids, weights)
+    objective = Objective(loss, objective_ids, weights, objective_scope)
     doses = protocol if protocol is not None else protocol_from_config(base)
     timeline = build_timeline(data.sessions, doses)
-    constants = resolved_constants(base, space)
+    horizon_offset = 0 if objective_scope == "preop" else timeline.horizon_offset
+    constants = resolved_constants(base, space, cls)
     seed_map, zooms, _ = build_seed_map(data, constants["min_tissue_fraction"])
     factors = sorted({float(f) for f in resolution_factors} | {FULL_RESOLUTION})
     if n_steps is None:
-        counts = {factor: n_steps_count(steps_per_day, preop_time_range[1], timeline.horizon_offset) for factor in factors}
+        counts = {factor: n_steps_count(steps_per_day, preop_time_range[1], horizon_offset) for factor in factors}
     else:
         counts = {float(k): int(v) for k, v in n_steps.items()}
         missing = [factor for factor in factors if factor not in counts]
@@ -1524,6 +1756,8 @@ def build_problem(
         constants=constants,
         voxel_size_mm=zooms,
         protocol=doses,
+        solver_mode=solver_mode,
+        objective_scope=objective_scope,
     )
 
 
@@ -1561,6 +1795,8 @@ def problem_from_fit_dir(fit_dir: Path, spec: Mapping[str, Any]) -> FitProblem:
         [float(f) for f in parametrisation["n_steps"]],
         {float(f): int(n) for f, n in parametrisation["n_steps"].items()},
         protocol_from_spec(spec),
+        spec.get("solver", {}).get("mode", DEFAULT_SOLVER_MODE),
+        spec["objective"].get("scope", DEFAULT_OBJECTIVE_SCOPE),
     )
     rebuilt = problem.timeline.record()
     for key in ("snapshot_offsets", "chemo_offsets", "chemo_doses", "resection", "rt_fractions"):
@@ -1671,11 +1907,14 @@ def fit_session_references(
     return out
 
 
-def session_frames(result: Any, snapshot_days: Mapping[str, float], dt: float) -> dict[str, NDArray]:
+def session_frames(
+    result: Any, snapshot_days: Mapping[str, float], dt: float, fields: Sequence[str] = MODEL_FIELDS[DEFAULT_SOLVER_MODE]
+) -> dict[str, dict[str, NDArray]]:
     """
-    The recorded frame of every session (``Result.time_series`` matched to
-    the session's requested day, the nearest recorded day within half a
-    step), rounded for storage (``round_field``).
+    The recorded frames of every session, per field in ``fields``
+    (``Result.time_series`` matched to the session's requested day, the
+    nearest recorded day within half a step), rounded for storage
+    (``round_field``).
 
     Raises:
         RuntimeError: No frames, a session without a frame, a non-finite
@@ -1684,8 +1923,7 @@ def session_frames(result: Any, snapshot_days: Mapping[str, float], dt: float) -
     if result.time_series is None or result.snapshot_times is None:
         raise RuntimeError("the solve recorded no snapshots.")
     recorded = np.asarray(result.snapshot_times, dtype=np.float64)
-    frames = result.time_series["cell_density"]
-    out: dict[str, NDArray] = {}
+    out: dict[str, dict[str, NDArray]] = {}
     for session_id, day in snapshot_days.items():
         if recorded.size == 0:
             raise RuntimeError(f"no frame recorded for {session_id} (day {day:g}).")
@@ -1694,10 +1932,12 @@ def session_frames(result: Any, snapshot_days: Mapping[str, float], dt: float) -
             raise RuntimeError(
                 f"no frame recorded for {session_id} at day {day:g} (nearest recorded day {recorded[index]:g}, dt {dt:g})."
             )
-        frame = np.asarray(frames[index])
-        if not np.all(np.isfinite(frame)):
-            raise RuntimeError(f"the frame of {session_id} is not finite.")
-        out[session_id] = round_field(frame)
+        out[session_id] = {}
+        for field in fields:
+            frame = np.asarray(result.time_series[field][index])
+            if not np.all(np.isfinite(frame)):
+                raise RuntimeError(f"the {field} frame of {session_id} is not finite.")
+            out[session_id][field] = round_field(frame)
     return out
 
 
@@ -1705,29 +1945,31 @@ def objective_metrics(
     problem: FitProblem,
     references: Mapping[str, Reference],
     zooms: Sequence[float],
-    frames: Mapping[str, NDArray],
+    frames: Mapping[str, Mapping[str, NDArray]],
 ) -> dict[str, Any]:
     """
     The objective and the per-session metrics of the session fields (the
-    module docstring's Objective): per session the Dice of both regions
-    over the grids on the crop box, the profiled pair, J, loss, and per
-    session the Dice at the pair, log_vol_ratio_core at the pair and the
-    Dice at the fixed pair.
+    module docstring's Objective): per session the densities of the two
+    regions (``region_densities``), the Dice of both regions over the
+    grids on the crop box of the whole density, the profiled pair, J,
+    loss, and per session the Dice at the pair, log_vol_ratio_core at the
+    pair and the Dice at the fixed pair.
     """
     dice_core: dict[str, NDArray] = {}
     dice_whole: dict[str, NDArray] = {}
     cropped: dict[str, tuple[NDArray, Reference]] = {}
     for session in problem.sessions:
         reference = references[session.id]
-        density = np.asarray(frames[session.id])
-        box = crop_box(density, reference, MIN_THRESHOLD)
-        field = density[box]
+        core_density, whole_density = region_densities(frames[session.id], session.label == LABEL_PREOP, problem.solver_mode)
+        box = crop_box(whole_density, reference, MIN_THRESHOLD)
+        field = core_density[box]
+        whole_field = whole_density[box]
         local = Reference(
             reference.session, reference.core[box], reference.whole[box], reference.valid[box],
             reference.n_cavity, reference.n_relabelled,
         )
         dice_core[session.id] = np.array([dice((field >= t) & local.valid, local.core) for t in THRESHOLD_GRID_CORE])
-        dice_whole[session.id] = np.array([dice((field >= t) & local.valid, local.whole) for t in THRESHOLD_GRID_EDEMA])
+        dice_whole[session.id] = np.array([dice((whole_field >= t) & local.valid, local.whole) for t in THRESHOLD_GRID_EDEMA])
         cropped[session.id] = (field, local)
     profiled = problem.objective.profile(dice_core, dice_whole)
     record: dict[str, Any] = {
@@ -1758,10 +2000,14 @@ def objective_metrics(
 def save_resolve(run_dir: Path, result: Any, config: Mapping[str, Any], fit: Mapping[str, Any]) -> dict[str, float]:
     """
     Write the re-solved best run as the SA's run-one does: the session
-    frames (``_save_session_snapshots``), ``Result.save`` without the
-    initial state and with the final field rounded (config.json,
-    result.json, final_cell_density.nii.gz), the config with its "_fit"
-    record over Result.save's config.json, and timeline.json.
+    frames of every recorded field (``_save_session_snapshots``;
+    <ses>_cell_density.nii.gz for the standard solver, <ses>_proliferative,
+    <ses>_necrotic and <ses>_nutrient.nii.gz for the two-species one),
+    ``Result.save`` without the initial state and with the final fields
+    rounded (config.json, result.json, final_<field>.nii.gz), the config
+    with its "_fit" record over Result.save's config.json, and
+    timeline.json (per session the first field's file under "file", every
+    field's under "files").
 
     Returns:
         The recorded day by session id.
@@ -1771,7 +2017,11 @@ def save_resolve(run_dir: Path, result: Any, config: Mapping[str, Any], fit: Map
     result.initial_state = {}
     result.final_state = {key: round_field(value) for key, value in result.final_state.items()}
     affine = np.eye(4) if result.affine is None else np.asarray(result.affine, dtype=np.float64)
-    recorded = {} if result.snapshot_times is None else _save_session_snapshots(run_dir, result, days, affine)
+    fields = [] if result.time_series is None else list(result.time_series)
+    recorded: dict[str, float] = {}
+    if result.snapshot_times is not None:
+        for field in fields:
+            recorded = _save_session_snapshots(run_dir, result, days, affine, field)
     result.time_series = None
     result.save(run_dir)
     write_config(config, run_dir / "config.json")
@@ -1781,14 +2031,15 @@ def save_resolve(run_dir: Path, result: Any, config: Mapping[str, Any], fit: Map
             "dt": result.dt,
             "n_steps": result.n_steps,
             "dt_planned": fit["dt"],
-            "resection_time": float(config["resection_time"]),
-            "stopping_time": float(config["resection_time"]) + float(config["time_after_resection"]),
+            "resection_time": float(config["resection_time"]),  # inf (no resection, objective scope preop) is written as null
+            "stopping_time": float(fit["stopping_time"]),
             "snapshots": {
                 sid: {
                     "moment": float(fit["snapshot_moments"][sid]),
                     "requested_day": days[sid],
                     "recorded_day": recorded.get(sid),
-                    "file": snapshot_file(sid) if sid in recorded else None,
+                    "file": snapshot_file(sid, fields[0]) if sid in recorded and fields else None,
+                    "files": {field: snapshot_file(sid, field) for field in fields} if sid in recorded else {},
                 }
                 for sid in days
             },
@@ -1807,7 +2058,7 @@ def evaluate_point(
 ) -> dict[str, Any]:
     """
     One forward evaluation (the module docstring's Forward evaluation):
-    the config of the point, one StuppFKPPSolver solve, the session
+    the config of the point, one solve of the problem's solver, the session
     frames, the metrics; with save_dir the run is written there as well
     (the resolve). Every failure is a record with success False, loss 1
     and the error string.
@@ -1819,7 +2070,7 @@ def evaluate_point(
         record.update(point.record(problem.space.names))
         config = problem.config_of(point, resolution_factor)
         fit = config["_fit"]
-        solver = StuppFKPPSolver(read_config_from_mapping(config))
+        solver = problem.solver_class(read_config_from_mapping(config))
         result = solver.solve()
         record.update(n_steps=result.n_steps, dt=result.dt, solve_wall_time_s=result.wall_time_s)
         if not result.success:
@@ -1828,7 +2079,7 @@ def evaluate_point(
         if result.n_steps != fit["n_steps"]:
             record["error"] = f"the solver used n_steps={result.n_steps}, not the fixed {fit['n_steps']}"
             return record
-        frames = session_frames(result, fit["snapshot_days"], float(result.dt))
+        frames = session_frames(result, fit["snapshot_days"], float(result.dt), problem.model_fields)
         record.update(objective_metrics(problem, references, zooms, frames))
         if save_dir is not None:
             recorded = save_resolve(save_dir, result, config, fit)
@@ -2110,7 +2361,7 @@ class WorkerPool:
 
 def design_checks(problem: FitProblem, resolution_factors: Sequence[float]) -> dict[str, Any]:
     """
-    The design-time checks (no solve): a StuppFKPPSolver of the unit-cube
+    The design-time checks (no solve): a solver of the unit-cube
     centre config confirms the resolved constants (CONSTANT_KEYS) and the
     voxel size; the fixed seed peak is checked against gaussian_seed_floor
     and the clip at 1 and gaussian_seed_scale must be 1; per resolution
@@ -2126,7 +2377,7 @@ def design_checks(problem: FitProblem, resolution_factors: Sequence[float]) -> d
     """
     space = problem.space
     centre_config = problem.evaluation_config(np.full(space.dimension, 0.5), FULL_RESOLUTION)
-    solver = StuppFKPPSolver(read_config_from_mapping(centre_config))
+    solver = problem.solver_class(read_config_from_mapping(centre_config))
     params = solver.params
     for key in CONSTANT_KEYS:
         if float(params[key]) != problem.constants[key]:
@@ -2158,7 +2409,7 @@ def design_checks(problem: FitProblem, resolution_factors: Sequence[float]) -> d
     corner = replace(problem.derive(corner_values), preop_time=problem.preop_time_range[1], preop_time_clamped=True)
     for factor in sorted({float(f) for f in resolution_factors} | {FULL_RESOLUTION}):
         config = problem.config_of(corner, factor)
-        probe = StuppFKPPSolver(read_config_from_mapping(config))
+        probe = problem.solver_class(read_config_from_mapping(config))
         n_resolved, dt_resolved = probe.resolve_time_stepping()
         requested = int(config["n_steps"])
         record["time_stepping"][str(factor)] = {
@@ -2449,8 +2700,16 @@ def convert_sweep_row(record: Mapping[str, str], problem: FitProblem) -> tuple[d
         GROWTH_LENGTH_FACTOR: speed * preop_time,
     }
     values.update(dict(zip(SEED_BBOX_FACTORS, problem.seed_map.to_bbox(voxel), strict=True)))
+    centre = space.to_physical(np.full(space.dimension, 0.5))
+    filled = {
+        name: float(SWEEP_FILL_VALUES.get(name, centre[name]))
+        for name in space.solver_factor_names if name not in record
+    }
     for name in space.solver_factor_names:
-        values[name] = as_float(record[name])
+        # A solver factor the sweep did not vary (the two-species
+        # parameters in an isotropic sweep) starts at its SWEEP_FILL_VALUES
+        # entry, or at the unit-cube centre without one.
+        values[name] = filled[name] if name in filled else as_float(record[name])
     if space.seed_peak_fitted:
         values[SEED_PEAK_FACTOR] = as_float(record[SEED_PEAK_FACTOR])
     if any(not np.isfinite(v) for v in values.values()):
@@ -2458,7 +2717,7 @@ def convert_sweep_row(record: Mapping[str, str], problem: FitProblem) -> tuple[d
     clipped, changed = space.clip(values)
     not_carried = {
         key: as_float(record[key])
-        for key in (SEED_PEAK_FACTOR, "diffusivity_ratio", "rt_alpha_beta_ratio", "core_threshold", "edema_threshold")
+        for key in (SEED_PEAK_FACTOR, "diffusivity_ratio", "rt_alpha_beta_ratio", "core_threshold", "edema_threshold", *space.dropped)
         if key not in space.factors and key in record and record[key] != ""
     }
     conversion = {
@@ -2468,6 +2727,7 @@ def convert_sweep_row(record: Mapping[str, str], problem: FitProblem) -> tuple[d
         "seed_voxel_seedable_in_fit": bool(problem.seed_map.geometry.mask[voxel]),
         "fit_seed_voxel": list(problem.seed_map.voxel([clipped[name] for name in SEED_BBOX_FACTORS])[0]),
         "not_carried": not_carried,
+        "filled": filled,
         "clipped": changed,
     }
     return clipped, conversion
@@ -2502,10 +2762,12 @@ def sweep_starts(sweep_dir: Path, problem: FitProblem, top: int, min_distance: f
     design = read_csv(sweep_dir / "design.csv")
     runs = distinct_runs(design)
     needed = [GROWTH_SPEED_FACTOR, GROWTH_WIDTH_FACTOR, SEED_SIGMA_FACTOR, "preop_time", "seed_voxel_i", "seed_voxel_j", "seed_voxel_k"]
-    needed += problem.space.solver_factor_names
+    columns = set(design[0]) if design else set()
+    # A solver factor the sweep has no column for is centre-filled
+    # (``convert_sweep_row``), the others must be there.
+    needed += [name for name in problem.space.solver_factor_names if name in columns or name in STANDARD_SOLVER_FACTORS]
     if problem.space.seed_peak_fitted:
         needed.append(SEED_PEAK_FACTOR)
-    columns = set(design[0]) if design else set()
     lacking = [column for column in needed if column not in columns]
     if lacking:
         raise ValueError(f"{sweep_dir / 'design.csv'} lacks the column(s) {lacking} the fit's parametrisation needs.")
@@ -2556,6 +2818,8 @@ def sweep_starts(sweep_dir: Path, problem: FitProblem, top: int, min_distance: f
         "sweep_threshold_mode": spec.get("threshold_mode"),
         "sweep_adjuvant_cycle_days": spec.get("protocol", {}).get("adjuvant_cycle_days"),
         "fit_adjuvant_cycle_days": ADJUVANT_CYCLE_DAYS,
+        "filled_factors": {name: value for s in starts for name, value in s.source.get("filled", {}).items()},
+        "fill_rule": "a solver factor the sweep has no column for starts at SWEEP_FILL_VALUES (clipped into the range) or, unlisted, at the unit-cube centre",
         "sweep_label_conventions": spec.get("label_conventions"),
         "fit_label_conventions": FIT_LABEL_CONVENTIONS,
         "proxy": (
@@ -3249,6 +3513,7 @@ def write_fit_directory(
         "session_labels": str(session_labels),
         "sessions_requested": sessions,
         "sessions_simulated": [s.id for s in problem.sessions],
+        "solver": problem.solver_record(),
         "label_conventions": FIT_LABEL_CONVENTIONS,
         "data_checks": checks,
         "protocol": problem.protocol.record(),
@@ -3291,8 +3556,8 @@ def prepare_fit(args: argparse.Namespace, fit_dir: Path, gpus: Sequence[str | No
     if fit_dir.exists():
         raise FileExistsError(f"{fit_dir} exists; a fit directory is never overwritten (continue it with --resume).")
     problem = build_problem(
-        args.config,
-        args.search_space,
+        resolve_default(args.config, DEFAULT_CONFIGS, args.solver),
+        resolve_default(args.search_space, DEFAULT_SEARCH_SPACES, args.solver),
         args.patient,
         args.patient_root,
         args.session_labels,
@@ -3302,12 +3567,22 @@ def prepare_fit(args: argparse.Namespace, fit_dir: Path, gpus: Sequence[str | No
         parse_preop_time_range(args.preop_time_range),
         float(args.steps_per_day),
         schedule.factors,
+        solver_mode=args.solver,
+        objective_scope=args.objective,
     )
+    print(f"solver: {problem.solver_class.__name__} (--solver {args.solver}); base config {problem.base.get(SOLVER_KEY)!s}", flush=True)
     checks = check_patient_data(problem.data)
-    print(format_timeline(problem.timeline), flush=True)
+    if problem.preop_only:
+        print(
+            f"objective scope preop: the untreated growth to the pre-op scan {problem.data.preop.id} is simulated; "
+            f"the treatment factors {list(problem.space.dropped)} are not fitted",
+            flush=True,
+        )
+    else:
+        print(format_timeline(problem.timeline), flush=True)
     print(
-        f"objective: loss {problem.objective.mode} over {list(problem.objective.session_ids)} with weights "
-        f"{problem.objective.weights}; simulated sessions {[s.id for s in problem.sessions]}",
+        f"objective: loss {problem.objective.mode} (scope {problem.objective.scope}) over {list(problem.objective.session_ids)} "
+        f"with weights {problem.objective.weights}; simulated sessions {[s.id for s in problem.sessions]}",
         flush=True,
     )
     print(
@@ -3387,8 +3662,8 @@ def run_resolve(args: argparse.Namespace) -> int:
 def run_starts(args: argparse.Namespace) -> int:
     """The starts subcommand: the resolved starts, printed (no GPU)."""
     problem = build_problem(
-        args.config,
-        args.search_space,
+        resolve_default(args.config, DEFAULT_CONFIGS, args.solver),
+        resolve_default(args.search_space, DEFAULT_SEARCH_SPACES, args.solver),
         args.patient,
         args.patient_root,
         args.session_labels,
@@ -3398,6 +3673,8 @@ def run_starts(args: argparse.Namespace) -> int:
         parse_preop_time_range(args.preop_time_range),
         float(args.steps_per_day),
         [FULL_RESOLUTION],
+        solver_mode=args.solver,
+        objective_scope=args.objective,
     )
     sweep_dir = None if args.no_sweep_init else Path(args.init_from_sweep)
     starts, record = resolve_starts(problem, sweep_dir, int(args.top), args.init_values, float(args.min_start_distance))
@@ -3416,18 +3693,43 @@ def run_starts(args: argparse.Namespace) -> int:
 # --- command line ---
 
 
+def resolve_default(given: str | None, defaults: Mapping[str, Path], solver_mode: str) -> Path:
+    """A path argument: the given one, or the solver mode's default."""
+    return Path(given) if given else defaults[solver_mode]
+
+
 def _add_problem_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--search-space", default=str(DEFAULT_SEARCH_SPACE), help=f"search-space JSON (default {DEFAULT_SEARCH_SPACE.name})")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="base config JSON")
+    parser.add_argument(
+        "--solver", choices=list(SOLVER_MODES), default=DEFAULT_SOLVER_MODE,
+        help=f"the forward model: standard = {SOLVER_MODES['standard'].__name__}, twospecies = {SOLVER_MODES['twospecies'].__name__} (default {DEFAULT_SOLVER_MODE})",
+    )
+    parser.add_argument(
+        "--search-space", default=None,
+        help="search-space JSON (default per --solver: " + ", ".join(f"{m} {p.name}" for m, p in DEFAULT_SEARCH_SPACES.items()) + ")",
+    )
+    parser.add_argument(
+        "--config", default=None,
+        help="base config JSON (default per --solver: " + ", ".join(f"{m} {p.name}" for m, p in DEFAULT_CONFIGS.items()) + ")",
+    )
     parser.add_argument("--patient", default=DEFAULT_PATIENT, help="subject id")
     parser.add_argument("--patient-root", default=str(DEFAULT_PATIENT_ROOT), help="processed data root")
     parser.add_argument("--session-labels", default=str(DEFAULT_SESSION_LABELS), help="session labels tsv")
     parser.add_argument(
         "--sessions", default=DEFAULT_SESSIONS,
-        help=f"the objective's sessions: a range '01-08' or a list 'ses-01,ses-03'; the later ones must hold the post-op session (default {DEFAULT_SESSIONS})",
+        help=(
+            f"the objective's sessions: a range '01-08' or a list 'ses-01,ses-03'; the later ones must hold the post-op session "
+            f"(default {DEFAULT_SESSIONS}); with --objective preop they only assemble the patient data, the pre-op session alone is scored"
+        ),
     )
     parser.add_argument("--session-weights", default="", help="weights 'ses-01=1,ses-02=1,...' (default 1 each)")
     parser.add_argument("--loss", choices=LOSS_MODES, default=DEFAULT_LOSS, help=f"the profiled objective (default {DEFAULT_LOSS})")
+    parser.add_argument(
+        "--objective", choices=list(OBJECTIVE_SCOPES), default=DEFAULT_OBJECTIVE_SCOPE,
+        help=(
+            "the objective's scope: full = the pre-op and the later sessions under the treated forward run, preop = the pre-op "
+            f"session alone under the untreated growth to the pre-op scan, rt_alpha and chemo_kill_rate not fitted (default {DEFAULT_OBJECTIVE_SCOPE})"
+        ),
+    )
     parser.add_argument("--preop-time-range", default=DEFAULT_PREOP_TIME_RANGE, help=f"clamp of preop_time in days 'lo,hi' (default {DEFAULT_PREOP_TIME_RANGE})")
     parser.add_argument("--steps-per-day", type=float, default=DEFAULT_STEPS_PER_DAY, help=f"the fixed n_steps is ceil(steps_per_day (preop_time_max + horizon)) (default {DEFAULT_STEPS_PER_DAY:g})")
 

@@ -424,7 +424,8 @@ THRESHOLD_GRID_CORE: tuple[float, ...] = tuple(round(0.30 + 0.05 * i, 2) for i i
 THRESHOLD_GRID_EDEMA: tuple[float, ...] = tuple(round(0.10 + 0.05 * i, 2) for i in range(11))  # 0.10..0.60
 
 # Run directory files besides Result.save's.
-SNAPSHOT_SUFFIX = "_cell_density.nii.gz"
+SNAPSHOT_FIELD = "cell_density"  # the field the run-one snapshots hold
+SNAPSHOT_SUFFIX = f"_{SNAPSHOT_FIELD}.nii.gz"
 TIMELINE_FILE = "timeline.json"
 
 REGIONS: tuple[str, ...] = ("core", "whole")
@@ -1624,9 +1625,10 @@ def session_snapshot_days(moments: Mapping[str, float], dt: float) -> dict[str, 
     return snapshot_days(0.0, {name: float(t) - 1.0 for name, t in moments.items()}, dt)
 
 
-def snapshot_file(session_id: str) -> str:
-    """runs/<run>/<session>_cell_density.nii.gz ("ses-03" -> "ses03_cell_density.nii.gz")."""
-    return session_id.replace("-", "") + SNAPSHOT_SUFFIX
+def snapshot_file(session_id: str, field: str = SNAPSHOT_FIELD) -> str:
+    """runs/<run>/<session>_<field>.nii.gz ("ses-03" -> "ses03_cell_density.nii.gz";
+    the fit script passes the field names of a two-compartment run)."""
+    return f"{session_id.replace('-', '')}_{field}.nii.gz"
 
 
 def format_snapshots(moments: Mapping[str, float]) -> str:
@@ -1650,18 +1652,21 @@ def parse_snapshots(text: str) -> dict[str, float]:
     return moments
 
 
-def _save_session_snapshots(run_dir: Path, result: Any, days: Mapping[str, float], affine: NDArray) -> dict[str, float]:
+def _save_session_snapshots(
+    run_dir: Path, result: Any, days: Mapping[str, float], affine: NDArray, field: str = SNAPSHOT_FIELD
+) -> dict[str, float]:
     """
     Save the recorded session frames (the atlas's ``_save_snapshots``
     with the session file names): for every session whose requested day
-    the solver recorded, the frame as run_dir/<session>_cell_density.nii.gz
-    (float32, rounded for storage, the given affine).
+    the solver recorded, the frame of ``field`` as
+    run_dir/<session>_<field>.nii.gz (float32, rounded for storage, the
+    given affine).
 
     Returns:
         The recorded day by session id, for the ones saved.
     """
     recorded_days = np.asarray(result.snapshot_times, dtype=np.float64)
-    frames = result.time_series["cell_density"]
+    frames = result.time_series[field]
     recorded: dict[str, float] = {}
     for name, day in days.items():
         matches = np.flatnonzero(np.isclose(recorded_days, day, rtol=1e-9, atol=1e-9))
@@ -1669,7 +1674,7 @@ def _save_session_snapshots(run_dir: Path, result: Any, days: Mapping[str, float
             continue
         image = nib.Nifti1Image(round_field(frames[int(matches[0])]), affine)
         image.set_data_dtype(np.float32)
-        nib.save(image, str(run_dir / snapshot_file(name)))
+        nib.save(image, str(run_dir / snapshot_file(name, field)))
         recorded[name] = float(recorded_days[int(matches[0])])
     return recorded
 
