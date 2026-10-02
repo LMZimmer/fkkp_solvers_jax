@@ -16,7 +16,7 @@ overview montage (seed, before/after resection, radiotherapy block, end):
     logs/<config>.log          stdout/stderr of the forward run
     <config>/                  output folder of run_stupp_forward.py
 
-Swept parameters and default ranges (uniform):
+Swept parameters and default ranges (uniform; the file is fisher_kpp_jax/search_spaces/parameter_range.txt):
   rho                      0.0089228 - 0.3449   1/day      (parameter_range.txt)
   white_matter_diffusivity 0.0071209 - 2.1329   mm^2/day   (parameter_range.txt)
   diffusivity_ratio        10.051    - 743.02              (parameter_range.txt, 10^log10 range)
@@ -88,7 +88,7 @@ sys.path.insert(0, str(_ROOT))
 
 from fisher_kpp_jax import read_config, write_config  # noqa: E402
 
-DEFAULT_CONFIG = _ROOT / "scripts" / "stupp_config_example.json"
+DEFAULT_CONFIG = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_config_example.json"
 FORWARD_SCRIPT = _ROOT / "scripts" / "run_stupp_forward.py"
 T1C_RELATIVE = Path("skull_stripped") / "t1c_skullstripped.nii.gz"
 

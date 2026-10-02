@@ -49,7 +49,7 @@ SHIPPED_SEARCH_SPACE = (
     Path(__file__).resolve().parent.parent
     / "fisher_kpp_jax"
     / "search_spaces"
-    / "stupp_fkpp_sigma_v2_search_space.json"
+    / "atlas_SA_v2_search_space.json"
 )
 
 
@@ -624,7 +624,7 @@ def test_seed_sigma_guard():
         validate(factors, {**params, "gaussian_seed_scale": 2.0}, width(3.0))
 
 
-def test_design_of_sigma_v2_search_space(phantom_base):
+def test_design_of_atlas_SA_v2_search_space(phantom_base):
     """The shipped sigma search space (2026-09-15): chemo_kill_rate
     1e-3-3.5e-2, rt_alpha 0.001-0.2, front_width_mm 1-4 mm and
     seed_sigma_mm 5-16 mm, log-scaled; its seed floor lies below 2 x the
@@ -1500,7 +1500,7 @@ def test_chemo_log_kill_range():
     total log kill kill * D_tot / decay range of the factor bounds at the
     fixed decay rate; an override or a fixed value stands in for a factor
     range, and the sum runs over the sessions within the horizon."""
-    example = read_config(SCRIPT.parent / "stupp_config_example.json", solver=StuppFKPPSolver)
+    example = read_config(SCRIPT.parent.parent / "fisher_kpp_jax" / "search_spaces" / "stupp_config_example.json", solver=StuppFKPPSolver)
     space = sa.load_search_space(SHIPPED_SEARCH_SPACE, CONFIG_KEYS)
     total_dose, (low, high) = sa.chemo_log_kill_range(example, space)
     assert total_dose == 4900.0 and 0 < low < high

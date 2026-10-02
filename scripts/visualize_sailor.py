@@ -29,10 +29,10 @@ few follow-ups). All volumes must share the grid of the first one
 loaded and the LAS axis orientation of the processed data (checked from
 the headers).
 
-Slices. The tumour core is labels 1 (necrotic) and 3 (enhancing), a
-pre-op segmentation relabelled 4 -> 3 as the patient sensitivity
-analysis does (``relabel_preop``); the cavity (label 4) of a later
-session is not core. --center session (the default) takes the session's
+Slices. The tumour core is labels 1 (necrotic) and 3 (enhancing); label
+4 (cavity) is never core, in a pre-op segmentation included (the patient
+sensitivity analysis refuses such a pre-op segmentation; the overview
+shows it as it is). --center session (the default) takes the session's
 own core centre of mass, rounded to a voxel; a session without core
 voxels falls back to its whole tumour (labels 1-3), then to any labelled
 voxel, then to the subject's reference centre (the first session with
@@ -119,7 +119,6 @@ from patient_sensitivity_analysis import (  # noqa: E402
     WHOLE_LABELS,
     load_segmentation,
     normalise_label,
-    relabel_preop,
 )
 from visualize_patient_best_run import (  # noqa: E402
     LABEL_COLORS,
@@ -308,14 +307,14 @@ def check_orientation(image: nib.Nifti1Image, path: Path) -> None:
 def tumor_center(segmentation: NDArray, preop: bool) -> tuple[tuple[int, int, int] | None, str | None]:
     """
     The voxel centre of mass of the session's tumour core (labels
-    CORE_LABELS, a pre-op segmentation relabelled 4 -> 3), falling back
-    to the whole tumour (WHOLE_LABELS) and then to any labelled voxel.
+    CORE_LABELS), falling back to the whole tumour (WHOLE_LABELS) and
+    then to any labelled voxel.
 
     Returns:
         (centre, source) with source in "core", "whole", "any", or
         (None, None) for an empty segmentation.
     """
-    labels = relabel_preop(segmentation) if preop else np.asarray(segmentation)
+    labels = np.asarray(segmentation)
     for source, mask in (
         ("core", np.isin(labels, CORE_LABELS)),
         ("whole", np.isin(labels, WHOLE_LABELS)),
@@ -412,7 +411,7 @@ def load_session(
         loaded.error = f"{type(exc).__name__}: {exc}"
         return loaded
     voxel_ml = grid["voxel_ml"]
-    labels = (relabel_preop(segmentation) if session.preop else segmentation).astype(np.uint8)
+    labels = np.asarray(segmentation).astype(np.uint8)
     loaded.t1c = t1c
     loaded.labels = labels
     loaded.vmax = display_window(t1c, window_percentile)

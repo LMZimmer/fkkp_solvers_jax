@@ -23,18 +23,23 @@ fit adds is below.
 Solver (--solver, SOLVER_MODES, default standard). standard runs
 FKPPSolver and scores its cell density u_s; twospecies runs
 TwoCompartmentWithNutrientFKPPSolver and scores, per session, the
-densities of ``region_densities``: P + N (proliferative + necrotic) for
-the pre-op core and for the whole tumour of every session, P alone for the
-core of every later session, matching the references below (the cells
+densities of ``region_densities``, which depend on the loss: with
+--loss core+necrotic (the two-species default since 2026-10-02) P
+(proliferative) is the core density, N (necrotic) the necrotic density
+and P + N the whole-tumour density, and the pre-op core is scored as the
+union of the thresholded P and the thresholded N (the Objective below);
+with --loss core (the rule until 2026-10-02) P + N is the core density
+of the pre-op session and the whole-tumour density of every session and
+P alone the core density of every later session (the cells
 killed by chemotherapy and radiotherapy become necrotic in that model, so
 after the surgery only the viable cells are comparable with the
 enhancing tumour). The nutrient is not scored. With twospecies the
 default base config is fisher_kpp_jax/configs/TwoCompartmentWithNutrientFKPPSolver_stupp.json,
 the default search space
-fisher_kpp_jax/search_spaces/sailor_patient_twospecies_fit_search_space.json
+fisher_kpp_jax/search_spaces/patient_fit_search_space_twospecies.json
 (the isotropic factors plus necrosis_rate, nutrient_threshold,
 nutrient_diffusivity and nutrient_consumption_rate as direct factors),
-only --loss core is accepted (the whole-tumour Dice is recorded, not
+--loss core+whole is refused (the whole-tumour Dice is recorded, not
 optimised), and the sweep starts fill the four factors the isotropic
 sweep lacks with SWEEP_FILL_VALUES, a well-fed tumour (necrosis rate
 0.02, threshold 0.15, nutrient diffusivity 0.5, consumption 0.02; recorded
@@ -82,7 +87,8 @@ and in every later session the post-op cavity, i.e. the solver's
 resection cavity, excluded as well; FIT_LABEL_CONVENTIONS, since
 2026-09-28: fit directories set up before are refused). The reference
 core core_s is the SA's: the necrotic and the enhancing tumour (labels 1
-and 3, 4 -> 3) in the pre-op session and the enhancing tumour alone
+and 3; a pre-op segmentation with label 4 is refused, since 2026-10-02)
+in the pre-op session and the enhancing tumour alone
 (label 3) in every later session (since 2026-10-01, with the
 two-compartment solver's killed cells turning necrotic; fit directories
 set up before are refused as well). Per
@@ -106,6 +112,37 @@ against the whole-tumour reference; both on the session's ``crop_box``
                          the two regions' weighted means, dice_core at
                          tau_c and dice_whole at tau_e (the SA's
                          ``profiled_qois`` rule with weights).
+  --loss core+necrotic   (--solver twospecies only, its default; 2026-10-02)
+                         a third region, the NECROTIC tumour: per session
+                         the reference necrotic_s is label 1 after the
+                         cavity correction, the excluded cavity removed
+                         (``fit_session_references``, ``FitReference``);
+                         per necrotic threshold tau_n of
+                         THRESHOLD_GRID_NECROTIC (0.10..0.85, the edema
+                         and the SA's core grids joined, lower than the
+                         core grid because N stays below the core
+                         densities): dice_necrotic_s(tau_n) =
+                         dice((N_s >= tau_n) & valid_s, necrotic_s), NaN
+                         (the session DROPPED from the necrotic mean with
+                         its weight) when necrotic_s is empty, i.e. the
+                         session has no necrotic label. The core region
+                         scores P: dice_core_s(tau_c, tau_n) =
+                         dice(((P_s >= tau_c) | (N_s >= tau_n)) & valid_s,
+                         core_s) in the pre-op session (the thresholded P
+                         or the thresholded N against labels 1 and 3) and
+                         dice((P_s >= tau_c) & valid_s, core_s) in every
+                         later session (P against the enhancing tumour).
+                         J = max over the pairs (tau_c, tau_n) of the
+                         EQUAL-WEIGHT mean of the two regions' weighted
+                         session means, mean_core(tau_c, tau_n) and
+                         mean_necrotic(tau_n); a region whose mean is NaN
+                         at a pair (no session with a finite Dice) is left
+                         out of that pair's mean, so with no necrotic
+                         label in any session the loss is the core term
+                         alone. The edema threshold is profiled for
+                         reporting as in --loss core. The fixed-pair
+                         columns use FIXED_NECROTIC_THRESHOLD (0.3) for
+                         tau_n.
 The objective's sessions are --sessions (default 01-08: the pre-op session
 ses-01 and the later sessions; the pre-op session and every requested
 later session are simulated and recorded, and only the requested ones
@@ -116,20 +153,28 @@ that threshold's mean with its weight (the mean is renormalised over the
 sessions with a finite Dice); a region whose mean is NaN at every
 threshold is left out of the core+whole objective; the number of
 objective sessions with a NaN Dice at the profiled pair is recorded
-(n_nan_sessions). Ties in the argmax go to the first grid value (grid
-order: core ascending, then edema ascending). A failed solve
+(n_nan_sessions; a session dropped from the necrotic mean is not
+counted). Ties in the argmax go to the first grid value (grid
+order: core ascending, then edema or necrotic ascending). A failed solve
 (Result.success False, an exception, a non-finite field, a missing
 snapshot) gets loss = 1 and its error string, GIFT's convention; an
 objective that is NaN (every session's Dice NaN everywhere) gets loss = 1
 as well and an error string. Per evaluation the record holds the profiled
-pair, J, loss, per session the Dice of both regions at the pair
-(<ses>_dice_core_star, <ses>_dice_whole_star), log_vol_ratio_core at the
-pair (the SA's ``threshold_qois`` without distances) and the Dice at the
-SA's fixed pair 0.6 / 0.3 (<ses>_dice_core_fixed, <ses>_dice_whole_fixed)
-for comparability with the sweeps.
+thresholds (core_threshold_star, edema_threshold_star,
+necrotic_threshold_star; NaN where the region is not scored), J, loss,
+per session the Dice of the regions at them (<ses>_dice_core_star,
+<ses>_dice_whole_star, <ses>_dice_necrotic_star; NaN where not scored or
+dropped), log_vol_ratio_core at them (the SA's ``threshold_qois``
+without distances; with core+necrotic the pre-op model core is the
+union above) and the Dice at the SA's fixed pair 0.6 / 0.3 and the fixed
+necrotic threshold 0.3 (<ses>_dice_core_fixed, <ses>_dice_whole_fixed,
+<ses>_dice_necrotic_fixed) for comparability with the sweeps. --loss
+defaults per solver (DEFAULT_LOSSES: standard core, twospecies
+core+necrotic); core+necrotic is refused for the standard solver (no
+necrotic compartment) and core+whole for the two-species one.
 
 Parametrisation (--search-space, default
-fisher_kpp_jax/search_spaces/sailor_patient_fit_search_space.json, read by
+fisher_kpp_jax/search_spaces/patient_fit_search_space.json, read by
 this script's own ``read_fit_search_space``: keys starting with '_' are
 comments, an entry {"min", "max", "scale"} ("log" or "linear", mapped with
 the atlas's ``transform_factor``) is a fitted factor, any other entry is a
@@ -160,8 +205,8 @@ evaluation (``FitProblem.derive``):
                 chemo_times, chemo_doses and the session moments
                 t_pre + offset_s).
   seed position seed_bbox_x/y/z in [0, 1] map onto the seedable voxels of
-                ``patient_seed_geometry`` (pre-op core, labels 1 and 3 after
-                4 -> 3, with wm + gm >= min_tissue_fraction): with lo, hi
+                ``patient_seed_geometry`` (pre-op core, labels 1 and 3,
+                with wm + gm >= min_tissue_fraction): with lo, hi
                 the inclusive index bounds of the seedable voxels per axis,
                 the point p = lo + u (hi - lo) is rounded to the nearest
                 voxel (numpy rounding, half to even); a voxel that is not
@@ -378,10 +423,12 @@ nothing is written outside <output-dir>/<name>/):
                        gaussian_seed_diffusion_time, preop_time,
                        preop_time_clamped, seed_voxel_i/j/k, seed_snapped,
                        success, error, loss, J, core_threshold_star,
-                       edema_threshold_star, n_nan_sessions, per session
+                       edema_threshold_star, necrotic_threshold_star,
+                       n_nan_sessions, per session
                        <ses>_dice_core_star, <ses>_dice_whole_star,
-                       <ses>_log_vol_ratio_core, <ses>_dice_core_fixed,
-                       <ses>_dice_whole_fixed, n_steps, dt,
+                       <ses>_dice_necrotic_star, <ses>_log_vol_ratio_core,
+                       <ses>_dice_core_fixed, <ses>_dice_whole_fixed,
+                       <ses>_dice_necrotic_fixed, n_steps, dt,
                        solve_wall_time_s, wall_time_s, first_on_worker,
                        tag; tag is empty, start, incumbent_reeval or
                        dry_run; member is -1 for the start and the
@@ -481,6 +528,7 @@ from patient_sensitivity_analysis import (  # noqa: E402
     FIXED_THRESHOLDS,
     LABEL_CAVITY,
     LABEL_CONVENTIONS,
+    LABEL_NECROTIC,
     LABEL_PREOP,
     PATIENT_VOLUME_KEYS,
     THRESHOLD_GRID_CORE as SA_THRESHOLD_GRID_CORE,
@@ -495,6 +543,8 @@ from patient_sensitivity_analysis import (  # noqa: E402
     _save_session_snapshots,
     build_timeline,
     check_patient_data,
+    check_preop_labels,
+    comparable_label_conventions,
     crop_box,
     dice,
     distinct_runs,
@@ -506,12 +556,10 @@ from patient_sensitivity_analysis import (  # noqa: E402
     protocol_from_config,
     read_config_from_mapping,
     read_session_labels,
-    relabel_preop,
     select_sessions,
     session_references,
     session_snapshot_days,
     snapshot_file,
-    threshold_qois,
 )
 from sensitivity_analysis import (  # noqa: E402
     DEFAULT_CONFIG,
@@ -550,8 +598,8 @@ DEFAULT_CONFIGS: dict[str, Path] = {
     "twospecies": _ROOT / "fisher_kpp_jax" / "configs" / "TwoCompartmentWithNutrientFKPPSolver_stupp.json",
 }
 DEFAULT_SEARCH_SPACES: dict[str, Path] = {
-    "standard": _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_fit_search_space.json",
-    "twospecies": _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_twospecies_fit_search_space.json",
+    "standard": _ROOT / "fisher_kpp_jax" / "search_spaces" / "patient_fit_search_space.json",
+    "twospecies": _ROOT / "fisher_kpp_jax" / "search_spaces" / "patient_fit_search_space_twospecies.json",
 }
 MODEL_FIELDS: dict[str, tuple[str, ...]] = {
     "standard": ("cell_density",),
@@ -573,6 +621,17 @@ FIT_LABEL_CONVENTIONS: dict[str, Any] = {
         "and the reference masks"
     ),
 }
+
+
+def same_label_conventions(recorded: Mapping[str, Any] | None) -> bool:
+    """Whether a fit's recorded label_conventions are the script's
+    FIT_LABEL_CONVENTIONS (``comparable_label_conventions`` of both, so
+    the legacy pre-op relabel key does not count)."""
+    return json.dumps(comparable_label_conventions(recorded), sort_keys=True) == json.dumps(
+        comparable_label_conventions(FIT_LABEL_CONVENTIONS), sort_keys=True
+    )
+
+
 DEFAULT_FIT_GPUS = "0,1,2,3"
 DEFAULT_JOBS_PER_GPU = 1
 DEFAULT_TOP = 5
@@ -586,8 +645,14 @@ DEFAULT_SEED = 0
 DEFAULT_RESOLUTION_SCHEDULE = "0:1.0"
 DEFAULT_POPSIZE = "auto"
 POPSIZE_PER_WORKER = 4  # "auto": this many members per worker
-LOSS_MODES: tuple[str, ...] = ("core", "core+whole")
+LOSS_MODES: tuple[str, ...] = ("core", "core+whole", "core+necrotic")
 DEFAULT_LOSS = "core"
+# --loss unset: the loss per solver. The two-species solver fits its
+# necrotic compartment to the necrotic label (core+necrotic, 2026-10-02):
+# under --loss core the fit switched necrosis off (fit_sub01_twospecies_2026-10-01:
+# the necrosis factors on their floors, N below 0.6 everywhere), because
+# that loss cannot reward necrotic cells.
+DEFAULT_LOSSES: dict[str, str] = {"standard": DEFAULT_LOSS, "twospecies": "core+necrotic"}
 # The objective's scope (--objective, the module docstring's Objective
 # scope): full = the pre-op session and the later sessions of --sessions
 # under the treated forward run; preop = the pre-op session alone under
@@ -662,6 +727,13 @@ if not THRESHOLD_GRID_CORE:
     raise RuntimeError(f"CORE_THRESHOLD_FLOOR {CORE_THRESHOLD_FLOOR} leaves no value of the SA's core grid {SA_THRESHOLD_GRID_CORE}.")
 
 
+# The necrotic threshold grid (--loss core+necrotic): the edema and the SA's
+# core grids joined, 0.10..0.85 (2026-10-02; the necrotic density stays
+# below the core densities, so its grid starts lower than the core grid).
+THRESHOLD_GRID_NECROTIC: tuple[float, ...] = tuple(sorted(set(THRESHOLD_GRID_EDEMA) | set(SA_THRESHOLD_GRID_CORE)))
+FIXED_NECROTIC_THRESHOLD = FIXED_THRESHOLDS[1]  # 0.3: the fixed-pair column of the necrotic region
+
+
 def fit_threshold_pairs() -> list[tuple[float, float]]:
     """The SA's ``threshold_pairs`` on the fit's grids: every (core, edema)
     pair of THRESHOLD_GRID_CORE x THRESHOLD_GRID_EDEMA with edema < core,
@@ -670,7 +742,7 @@ def fit_threshold_pairs() -> list[tuple[float, float]]:
 
 
 # The smallest threshold any metric applies (the crop box's threshold).
-MIN_THRESHOLD = float(min(*THRESHOLD_GRID_CORE, *THRESHOLD_GRID_EDEMA, *FIXED_THRESHOLDS))
+MIN_THRESHOLD = float(min(*THRESHOLD_GRID_CORE, *THRESHOLD_GRID_EDEMA, *THRESHOLD_GRID_NECROTIC, *FIXED_THRESHOLDS))
 
 # evaluations.csv columns besides the factor and session columns.
 BOOKKEEPING_COLUMNS: list[str] = ["eval_id", "restart", "generation", "member", "worker", "resolution_factor"]
@@ -690,14 +762,17 @@ OUTCOME_COLUMNS: list[str] = [
     "J",
     "core_threshold_star",
     "edema_threshold_star",
+    "necrotic_threshold_star",
     "n_nan_sessions",
 ]
 SESSION_COLUMNS: list[str] = [
     "dice_core_star",
     "dice_whole_star",
+    "dice_necrotic_star",
     "log_vol_ratio_core",
     "dice_core_fixed",
     "dice_whole_fixed",
+    "dice_necrotic_fixed",
 ]
 TAIL_COLUMNS: list[str] = ["n_steps", "dt", "solve_wall_time_s", "wall_time_s", "first_on_worker", "tag"]
 INT_COLUMNS: frozenset[str] = frozenset(
@@ -1200,6 +1275,7 @@ def _grid_index(grid: Sequence[float], value: float) -> int:
 
 FIXED_CORE_INDEX = _grid_index(THRESHOLD_GRID_CORE, FIXED_THRESHOLDS[0])
 FIXED_EDEMA_INDEX = _grid_index(THRESHOLD_GRID_EDEMA, FIXED_THRESHOLDS[1])
+FIXED_NECROTIC_INDEX = _grid_index(THRESHOLD_GRID_NECROTIC, FIXED_NECROTIC_THRESHOLD)
 
 
 def _first_nanargmax(values: NDArray) -> int | None:
@@ -1221,8 +1297,11 @@ class ProfiledObjective:
         loss: 1 - J, 1 when J is NaN.
         core_index, edema_index: The grid indices of the profiled pair,
             None where undefined.
-        n_nan_sessions: The objective sessions with a NaN Dice at the pair.
+        n_nan_sessions: The objective sessions with a NaN Dice at the pair
+            (a session dropped from the necrotic mean is not counted).
         error: Why the objective is undefined, else "".
+        necrotic_index: The grid index of the profiled necrotic threshold
+            (core+necrotic), None otherwise.
     """
 
     J: float
@@ -1231,6 +1310,7 @@ class ProfiledObjective:
     edema_index: int | None
     n_nan_sessions: int
     error: str = ""
+    necrotic_index: int | None = None
 
     @property
     def core_threshold(self) -> float:
@@ -1240,6 +1320,10 @@ class ProfiledObjective:
     def edema_threshold(self) -> float:
         return float("nan") if self.edema_index is None else float(THRESHOLD_GRID_EDEMA[self.edema_index])
 
+    @property
+    def necrotic_threshold(self) -> float:
+        return float("nan") if self.necrotic_index is None else float(THRESHOLD_GRID_NECROTIC[self.necrotic_index])
+
 
 @dataclass(frozen=True)
 class Objective:
@@ -1247,7 +1331,7 @@ class Objective:
     The loss of the module docstring.
 
     Attributes:
-        mode: "core" or "core+whole" (LOSS_MODES).
+        mode: "core", "core+whole" or "core+necrotic" (LOSS_MODES).
         session_ids: The sessions of the sums, in simulation order.
         weights: Their weights.
         scope: "full" or "preop" (OBJECTIVE_SCOPES, --objective).
@@ -1268,40 +1352,72 @@ class Objective:
 
     def weighted_means(self, dice_by_session: Mapping[str, NDArray]) -> NDArray:
         """
-        The weighted mean over the objective's sessions per grid value, a
+        The weighted mean over the objective's sessions per grid value (a
+        1-D grid, or the 2-D core x necrotic grid of core+necrotic), a
         session with a NaN Dice dropped from that value's mean with its
         weight; NaN where no session has a finite Dice.
         """
         stack = np.asarray([np.asarray(dice_by_session[sid], dtype=np.float64) for sid in self.session_ids])
-        weights = np.asarray([self.weights[sid] for sid in self.session_ids], dtype=np.float64)[:, None]
+        weights = np.asarray([self.weights[sid] for sid in self.session_ids], dtype=np.float64)
+        weights = weights.reshape((-1,) + (1,) * (stack.ndim - 1))
         finite = np.isfinite(stack)
         numerator = np.where(finite, stack * weights, 0.0).sum(axis=0)
         denominator = (finite * weights).sum(axis=0)
         with np.errstate(invalid="ignore", divide="ignore"):
             return np.where(denominator > 0, numerator / np.where(denominator > 0, denominator, 1.0), np.nan)
 
-    def profile(self, dice_core: Mapping[str, NDArray], dice_whole: Mapping[str, NDArray]) -> ProfiledObjective:
+    def profile(
+        self,
+        dice_core: Mapping[str, NDArray],
+        dice_whole: Mapping[str, NDArray],
+        dice_necrotic: Mapping[str, NDArray] | None = None,
+    ) -> ProfiledObjective:
         """
         The profiled thresholds and J of one evaluation.
 
         Args:
             dice_core: Per session (at least the objective's) the Dice of
-                the core over THRESHOLD_GRID_CORE.
+                the core over THRESHOLD_GRID_CORE; with core+necrotic over
+                THRESHOLD_GRID_CORE x THRESHOLD_GRID_NECROTIC (2-D).
             dice_whole: Likewise over THRESHOLD_GRID_EDEMA.
+            dice_necrotic: core+necrotic only: per session the Dice of the
+                necrotic region over THRESHOLD_GRID_NECROTIC (all NaN for
+                a session without a necrotic reference).
         """
         mean_core = self.weighted_means(dice_core)
         mean_whole = self.weighted_means(dice_whole)
         core_index: int | None = None
         edema_index: int | None = None
+        necrotic_index: int | None = None
         J = float("nan")
+
+        def edema_below(tau_c: float) -> int | None:
+            below = np.array([np.isfinite(m) and t < tau_c for t, m in zip(THRESHOLD_GRID_EDEMA, mean_whole)])
+            return _first_nanargmax(np.where(below, mean_whole, np.nan))
+
         if self.mode == "core":
             core_index = _first_nanargmax(mean_core)
             if core_index is not None:
                 J = float(mean_core[core_index])
-                tau_c = THRESHOLD_GRID_CORE[core_index]
-                below = np.array([np.isfinite(m) and t < tau_c for t, m in zip(THRESHOLD_GRID_EDEMA, mean_whole)])
-                candidates = np.where(below, mean_whole, np.nan)
-                edema_index = _first_nanargmax(candidates)
+                edema_index = edema_below(THRESHOLD_GRID_CORE[core_index])
+        elif self.mode == "core+necrotic":
+            if dice_necrotic is None or mean_core.ndim != 2:
+                raise ValueError("core+necrotic needs the necrotic Dice and a 2-D core Dice (core x necrotic grid).")
+            mean_necrotic = self.weighted_means(dice_necrotic)
+            if mean_core.shape != (len(THRESHOLD_GRID_CORE), len(THRESHOLD_GRID_NECROTIC)) or mean_necrotic.shape != (len(THRESHOLD_GRID_NECROTIC),):
+                raise ValueError(f"unexpected Dice grid shapes {mean_core.shape} / {mean_necrotic.shape}.")
+            # The equal-weight mean of the two regions' means per pair, a
+            # region with a NaN mean left out of that pair.
+            necrotic_grid = np.broadcast_to(mean_necrotic[None, :], mean_core.shape)
+            finite_core, finite_necrotic = np.isfinite(mean_core), np.isfinite(necrotic_grid)
+            numerator = np.where(finite_core, mean_core, 0.0) + np.where(finite_necrotic, necrotic_grid, 0.0)
+            denominator = finite_core.astype(np.float64) + finite_necrotic.astype(np.float64)
+            value = np.where(denominator > 0, numerator / np.maximum(denominator, 1.0), np.nan)
+            flat = _first_nanargmax(value.ravel())
+            if flat is not None:
+                core_index, necrotic_index = divmod(flat, value.shape[1])
+                J = float(value[core_index, necrotic_index])
+                edema_index = edema_below(THRESHOLD_GRID_CORE[core_index])
         else:
             best = -np.inf
             for tau_c, tau_e in fit_threshold_pairs():
@@ -1317,15 +1433,20 @@ class Objective:
                 J = best
         n_nan = 0
         for sid in self.session_ids:
-            nan_core = core_index is not None and not np.isfinite(dice_core[sid][core_index])
-            nan_whole = self.mode != "core" and edema_index is not None and not np.isfinite(dice_whole[sid][edema_index])
+            if core_index is None:
+                nan_core = False
+            elif self.mode == "core+necrotic":
+                nan_core = not np.isfinite(dice_core[sid][core_index, necrotic_index])
+            else:
+                nan_core = not np.isfinite(dice_core[sid][core_index])
+            nan_whole = self.mode == "core+whole" and edema_index is not None and not np.isfinite(dice_whole[sid][edema_index])
             n_nan += int(nan_core or nan_whole)
         if not np.isfinite(J):
             return ProfiledObjective(
                 float("nan"), 1.0, None, None, len(self.session_ids),
                 "objective undefined: the Dice of every objective session is NaN at every threshold (model and reference empty)",
             )
-        return ProfiledObjective(J, 1.0 - J, core_index, edema_index, n_nan)
+        return ProfiledObjective(J, 1.0 - J, core_index, edema_index, n_nan, necrotic_index=necrotic_index)
 
     def record(self) -> dict[str, Any]:
         return {
@@ -1336,15 +1457,24 @@ class Objective:
             "weights": dict(self.weights),
             "grid_core": list(THRESHOLD_GRID_CORE),
             "grid_edema": list(THRESHOLD_GRID_EDEMA),
+            "grid_necrotic": list(THRESHOLD_GRID_NECROTIC),
             "fixed_pair": {"core": FIXED_THRESHOLDS[0], "edema": FIXED_THRESHOLDS[1]},
+            "fixed_necrotic": FIXED_NECROTIC_THRESHOLD,
             "min_threshold": MIN_THRESHOLD,
+            "necrotic_reference": (
+                f"label {LABEL_NECROTIC} after the cavity correction, the session's excluded cavity removed; scored by "
+                "core+necrotic only; a session with an empty necrotic reference is dropped from the necrotic mean"
+            ),
             "rule": (
                 "core: J = max over the core grid of the weighted mean over the objective sessions of dice_core; the edema "
                 "threshold is profiled for reporting over the grid values below the profiled core threshold. core+whole: "
-                "J = max over the pairs (edema < core) of the mean of the two regions' weighted means. A session whose "
-                "Dice is NaN at a threshold (model and reference both empty) is dropped from that threshold's mean with "
-                "its weight; a region with a NaN mean at every threshold is left out of core+whole; ties go to the first "
-                "grid value; a failed solve or an undefined objective gets loss 1"
+                "J = max over the pairs (edema < core) of the mean of the two regions' weighted means. core+necrotic: "
+                "J = max over the pairs (core, necrotic) of the equal-weight mean of the core mean (pre-op: thresholded P "
+                "or thresholded N against labels 1 + 3; later: thresholded P against label 3) and the necrotic mean "
+                "(thresholded N against label 1), the edema threshold profiled for reporting as in core. A session whose "
+                "Dice is NaN at a threshold (model and reference both empty, or no necrotic reference) is dropped from that "
+                "threshold's mean with its weight; a region with a NaN mean at every threshold is left out of core+whole "
+                "and core+necrotic; ties go to the first grid value; a failed solve or an undefined objective gets loss 1"
             ),
         }
 
@@ -1352,23 +1482,31 @@ class Objective:
 # --- the fit problem: patient, timeline, parametrisation, configs ---
 
 
-def region_densities(fields: Mapping[str, NDArray], preop: bool, solver_mode: str) -> tuple[NDArray, NDArray]:
+def region_densities(
+    fields: Mapping[str, NDArray], preop: bool, solver_mode: str, loss: str = DEFAULT_LOSS
+) -> dict[str, NDArray | None]:
     """
-    The model densities the two regions are thresholded on (the module
-    docstring's Objective), (core, whole): the standard solver's cell
-    density for both; for the two-species solver P + N for the pre-op
-    core and the whole tumour and P alone for the core of every later
-    session, matching the references (necrotic + enhancing before the
-    surgery, enhancing alone afterwards). The whole density is pointwise
-    at least the core density, so a crop box of the whole density holds
-    every mask.
+    The model densities the regions are thresholded on (the module
+    docstring's Objective and Solver), by region "core", "whole" and
+    "necrotic" (None unless the loss scores it): the standard solver's
+    cell density for core and whole; for the two-species solver under
+    core+necrotic P for the core, N for the necrotic region and P + N for
+    the whole tumour (the pre-op core mask is the union of the thresholded
+    P and N, ``objective_metrics``), under the other losses P + N for the
+    pre-op core and the whole tumour and P alone for the core of every
+    later session. The whole density is pointwise at least every other
+    density, so a crop box of the whole density holds every mask.
     """
     if solver_mode == "standard":
         density = np.asarray(fields["cell_density"])
-        return density, density
+        return {"core": density, "whole": density, "necrotic": None}
     if solver_mode == "twospecies":
-        total = np.asarray(fields["proliferative"]) + np.asarray(fields["necrotic"])
-        return (total if preop else np.asarray(fields["proliferative"])), total
+        proliferative = np.asarray(fields["proliferative"])
+        necrotic = np.asarray(fields["necrotic"])
+        total = proliferative + necrotic
+        if loss == "core+necrotic":
+            return {"core": proliferative, "whole": total, "necrotic": necrotic}
+        return {"core": total if preop else proliferative, "whole": total, "necrotic": None}
     raise ValueError(f"unknown solver mode {solver_mode!r}; known: {list(SOLVER_MODES)}.")
 
 
@@ -1415,7 +1553,7 @@ def build_seed_map(data: PatientData, min_tissue_fraction: float) -> tuple[SeedM
     wm = np.asarray(wm_image.get_fdata(), dtype=np.float64)
     gm = np.asarray(nib.load(str(data.tissue["gray_matter_pbmap"])).get_fdata(), dtype=np.float64)
     segmentation, _ = load_segmentation(data.preop_segmentation)
-    core = np.isin(relabel_preop(segmentation), CORE_LABELS)
+    core = np.isin(check_preop_labels(segmentation, str(data.preop_segmentation)), CORE_LABELS)
     geometry = patient_seed_geometry(wm, gm, core, min_tissue_fraction)
     seed_map = SeedMap.build(geometry)
     seed_map.check_fractions()
@@ -1638,7 +1776,12 @@ class FitProblem:
         read and the densities the regions are thresholded on."""
         densities = {
             "standard": "core and whole: cell_density",
-            "twospecies": "pre-op core and whole (every session): proliferative + necrotic; core of every later session: proliferative",
+            "twospecies": (
+                "core: proliferative (pre-op: thresholded proliferative or thresholded necrotic); necrotic: necrotic; "
+                "whole: proliferative + necrotic"
+                if self.objective.mode == "core+necrotic"
+                else "pre-op core and whole (every session): proliferative + necrotic; core of every later session: proliferative"
+            ),
         }[self.solver_mode]
         return {"mode": self.solver_mode, "class": self.solver_class.__name__, "fields": list(self.model_fields), "densities": densities}
 
@@ -1711,11 +1854,13 @@ def build_problem(
         raise ValueError(f"unknown solver mode {solver_mode!r}; known: {list(SOLVER_MODES)}.")
     if objective_scope not in OBJECTIVE_SCOPES:
         raise ValueError(f"unknown objective scope {objective_scope!r}; known: {list(OBJECTIVE_SCOPES)}.")
-    if solver_mode == "twospecies" and loss != "core":
+    if solver_mode == "twospecies" and loss == "core+whole":
         raise ValueError(
             f"--loss {loss} is not available with --solver twospecies: the whole-tumour Dice (P + N against labels 1, 2, 3) "
-            "is recorded but not part of the objective; use --loss core."
+            "is recorded but not part of the objective; use --loss core+necrotic or core."
         )
+    if solver_mode == "standard" and loss == "core+necrotic":
+        raise ValueError(f"--loss {loss} needs --solver twospecies: {FKPPSolver.__name__} has no necrotic compartment.")
     cls = SOLVER_MODES[solver_mode]
     base = read_config(config_path, solver=cls)
     space = read_fit_search_space(search_space_path, solver_mode, objective_scope)
@@ -1804,13 +1949,16 @@ def problem_from_fit_dir(fit_dir: Path, spec: Mapping[str, Any]) -> FitProblem:
             raise RuntimeError(f"the rebuilt timeline differs from {fit_dir / SPEC_FILE} in {key}; the schedule constants changed?")
     if problem.space.names != list(spec["parametrisation"]["factor_names"]):
         raise RuntimeError(f"the factor order of {fit_dir / 'search_space.json'} differs from the spec's.")
-    for key, grid in (("grid_core", THRESHOLD_GRID_CORE), ("grid_edema", THRESHOLD_GRID_EDEMA)):
+    grids = [("grid_core", THRESHOLD_GRID_CORE), ("grid_edema", THRESHOLD_GRID_EDEMA)]
+    if "grid_necrotic" in spec["objective"]:  # specs before 2026-10-02 have no necrotic grid (their loss never used one)
+        grids.append(("grid_necrotic", THRESHOLD_GRID_NECROTIC))
+    for key, grid in grids:
         if [float(t) for t in spec["objective"][key]] != [float(t) for t in grid]:
             raise RuntimeError(
                 f"the fit's {key} {list(grid)} differs from {fit_dir / SPEC_FILE}'s {spec['objective'][key]}; "
                 "the script's threshold grid changed since the fit was set up (CORE_THRESHOLD_FLOOR)."
             )
-    if json.dumps(spec.get("label_conventions"), sort_keys=True) != json.dumps(FIT_LABEL_CONVENTIONS, sort_keys=True):
+    if not same_label_conventions(spec.get("label_conventions")):
         raise RuntimeError(
             f"the label conventions of {fit_dir / SPEC_FILE} differ from the script's FIT_LABEL_CONVENTIONS; the fit was "
             "set up with other reference masks (before 2026-09-28 the post-op cavity was not excluded from every later "
@@ -1871,37 +2019,58 @@ def empty_record(problem: FitProblem, u: NDArray | Sequence[float]) -> dict[str,
     vector = np.asarray(u, dtype=np.float64).ravel()
     record: dict[str, Any] = {f"u_{name}": float(vector[i]) for i, name in enumerate(problem.space.names)}
     record.update(success=False, error="", loss=1.0, J=float("nan"))
-    record.update(core_threshold_star=float("nan"), edema_threshold_star=float("nan"), n_nan_sessions=None)
+    record.update(
+        core_threshold_star=float("nan"), edema_threshold_star=float("nan"), necrotic_threshold_star=float("nan"),
+        n_nan_sessions=None,
+    )
     for prefix in problem.prefixes:
         record.update({f"{prefix}{name}": float("nan") for name in SESSION_COLUMNS})
     record.update(n_steps=None, dt=None, solve_wall_time_s=None)
     return record
 
 
+@dataclass(frozen=True)
+class FitReference(Reference):
+    """
+    The SA's ``Reference`` with the fit's third region.
+
+    Attributes:
+        necrotic: The necrotic reference: label LABEL_NECROTIC after the
+            cavity correction (the relabelled voxels are cavity, hence
+            not valid), restricted to valid; scored by --loss
+            core+necrotic only.
+    """
+
+    necrotic: NDArray | None = None
+
+
 def fit_session_references(
     segmentations: Sequence[NDArray], sessions: Sequence[Mapping[str, Any]], resection_cavity: NDArray
-) -> list[Reference]:
+) -> list[FitReference]:
     """
     The fit's reference masks (FIT_LABEL_CONVENTIONS): ``session_references``
     of the sessions' raw label volumes with every later session's cavity
     expanded by the resection cavity (the post-op session's label-4
     voxels), i.e. valid = the SA's valid without the resection cavity, and
-    core and whole restricted to it. The necrotic correction is the SA's:
+    core and whole restricted to it, plus the necrotic reference
+    (``FitReference``). The necrotic correction is the SA's:
     the union of earlier cavities it uses holds the post-op cavity already.
     """
     cavity = np.asarray(resection_cavity, dtype=bool)
-    out: list[Reference] = []
-    for reference, session in zip(session_references(segmentations, sessions), sessions, strict=True):
-        if session["label"] == LABEL_PREOP:
-            out.append(reference)
-            continue
-        if cavity.shape != reference.valid.shape:
-            raise ValueError(f"resection cavity shape {cavity.shape} differs from {session['id']}'s {reference.valid.shape}.")
-        valid = reference.valid & ~cavity
+    out: list[FitReference] = []
+    for reference, segmentation, session in zip(session_references(segmentations, sessions), segmentations, sessions, strict=True):
+        valid = reference.valid
+        core, whole, n_cavity = reference.core, reference.whole, reference.n_cavity
+        if session["label"] != LABEL_PREOP:
+            if cavity.shape != valid.shape:
+                raise ValueError(f"resection cavity shape {cavity.shape} differs from {session['id']}'s {valid.shape}.")
+            valid = valid & ~cavity
+            core, whole, n_cavity = core & valid, whole & valid, int((~valid).sum())
         out.append(
-            replace(
-                reference, core=reference.core & valid, whole=reference.whole & valid, valid=valid,
-                n_cavity=int((~valid).sum()),
+            FitReference(
+                session=reference.session, core=core, whole=whole, valid=valid, n_cavity=n_cavity,
+                n_relabelled=reference.n_relabelled,
+                necrotic=(np.asarray(segmentation) == LABEL_NECROTIC) & valid,
             )
         )
     return out
@@ -1941,6 +2110,32 @@ def session_frames(
     return out
 
 
+def model_core_mask(
+    core_field: NDArray, necrotic_field: NDArray | None, preop: bool, core_threshold: float, necrotic_threshold: float
+) -> NDArray:
+    """
+    The model core at a threshold pair (before the valid mask): the core
+    density at or above core_threshold, joined in the pre-op session with
+    the necrotic density at or above necrotic_threshold when the necrotic
+    region is scored (core+necrotic: the thresholded P or the thresholded
+    N against the pre-op labels 1 and 3).
+    """
+    mask = np.asarray(core_field) >= float(core_threshold)
+    if necrotic_field is not None and preop:
+        mask = mask | (np.asarray(necrotic_field) >= float(necrotic_threshold))
+    return mask
+
+
+def log_vol_ratio(n_model: int, n_reference: int, zooms: Sequence[float]) -> float:
+    """The SA's log_vol_ratio (``threshold_qois``): log10 of the model
+    volume over the reference volume, each plus one voxel; NaN for an
+    empty reference."""
+    voxel_volume = float(np.prod(np.asarray(zooms, dtype=np.float64)))
+    if not n_reference:
+        return float("nan")
+    return float(np.log10(voxel_volume * (n_model + 1)) - np.log10(voxel_volume * (n_reference + 1)))
+
+
 def objective_metrics(
     problem: FitProblem,
     references: Mapping[str, Reference],
@@ -1949,29 +2144,52 @@ def objective_metrics(
 ) -> dict[str, Any]:
     """
     The objective and the per-session metrics of the session fields (the
-    module docstring's Objective): per session the densities of the two
-    regions (``region_densities``), the Dice of both regions over the
-    grids on the crop box of the whole density, the profiled pair, J,
-    loss, and per session the Dice at the pair, log_vol_ratio_core at the
-    pair and the Dice at the fixed pair.
+    module docstring's Objective): per session the densities of the
+    regions (``region_densities``), the Dice of the regions over the
+    grids on the crop box of the whole density (with core+necrotic the
+    core Dice over the core x necrotic grid, ``model_core_mask``, and the
+    necrotic Dice over the necrotic grid, all NaN for a session without a
+    necrotic reference), the profiled thresholds, J, loss, and per
+    session the Dice at them, log_vol_ratio_core at them and the Dice at
+    the fixed thresholds.
     """
+    necrotic_scored = problem.objective.mode == "core+necrotic"
     dice_core: dict[str, NDArray] = {}
     dice_whole: dict[str, NDArray] = {}
-    cropped: dict[str, tuple[NDArray, Reference]] = {}
+    dice_necrotic: dict[str, NDArray] = {}
+    cropped: dict[str, tuple[NDArray, NDArray | None, Reference]] = {}
     for session in problem.sessions:
         reference = references[session.id]
-        core_density, whole_density = region_densities(frames[session.id], session.label == LABEL_PREOP, problem.solver_mode)
-        box = crop_box(whole_density, reference, MIN_THRESHOLD)
-        field = core_density[box]
-        whole_field = whole_density[box]
-        local = Reference(
-            reference.session, reference.core[box], reference.whole[box], reference.valid[box],
-            reference.n_cavity, reference.n_relabelled,
-        )
-        dice_core[session.id] = np.array([dice((field >= t) & local.valid, local.core) for t in THRESHOLD_GRID_CORE])
-        dice_whole[session.id] = np.array([dice((whole_field >= t) & local.valid, local.whole) for t in THRESHOLD_GRID_EDEMA])
-        cropped[session.id] = (field, local)
-    profiled = problem.objective.profile(dice_core, dice_whole)
+        preop = session.label == LABEL_PREOP
+        densities = region_densities(frames[session.id], preop, problem.solver_mode, problem.objective.mode)
+        box = crop_box(densities["whole"], reference, MIN_THRESHOLD)
+        field = densities["core"][box]
+        whole_field = densities["whole"][box]
+        valid = reference.valid[box]
+        local = Reference(reference.session, reference.core[box], reference.whole[box], valid, reference.n_cavity, reference.n_relabelled)
+        dice_whole[session.id] = np.array([dice((whole_field >= t) & valid, local.whole) for t in THRESHOLD_GRID_EDEMA])
+        necrotic_field: NDArray | None = None
+        if necrotic_scored:
+            necrotic_field = densities["necrotic"][box]
+            necrotic_reference = getattr(reference, "necrotic", None)
+            if necrotic_reference is None:
+                raise ValueError(f"{session.id}: core+necrotic needs the necrotic reference (``fit_session_references``).")
+            necrotic_reference = necrotic_reference[box]
+            dice_core[session.id] = np.array(
+                [
+                    [dice(model_core_mask(field, necrotic_field, preop, tc, tn) & valid, local.core) for tn in THRESHOLD_GRID_NECROTIC]
+                    for tc in THRESHOLD_GRID_CORE
+                ]
+            )
+            if necrotic_reference.any():
+                dice_necrotic[session.id] = np.array([dice((necrotic_field >= t) & valid, necrotic_reference) for t in THRESHOLD_GRID_NECROTIC])
+            else:
+                # No necrotic label in the session: dropped from the necrotic mean.
+                dice_necrotic[session.id] = np.full(len(THRESHOLD_GRID_NECROTIC), np.nan)
+        else:
+            dice_core[session.id] = np.array([dice((field >= t) & valid, local.core) for t in THRESHOLD_GRID_CORE])
+        cropped[session.id] = (field, necrotic_field, local)
+    profiled = problem.objective.profile(dice_core, dice_whole, dice_necrotic if necrotic_scored else None)
     record: dict[str, Any] = {
         "success": True,
         "error": profiled.error,
@@ -1979,21 +2197,34 @@ def objective_metrics(
         "J": profiled.J,
         "core_threshold_star": profiled.core_threshold,
         "edema_threshold_star": profiled.edema_threshold,
+        "necrotic_threshold_star": profiled.necrotic_threshold,
         "n_nan_sessions": profiled.n_nan_sessions,
     }
+    nan = float("nan")
     for session in problem.sessions:
         prefix = session.prefix
         core, whole = dice_core[session.id], dice_whole[session.id]
-        record[f"{prefix}dice_core_star"] = float(core[profiled.core_index]) if profiled.core_index is not None else float("nan")
-        record[f"{prefix}dice_whole_star"] = float(whole[profiled.edema_index]) if profiled.edema_index is not None else float("nan")
-        if profiled.core_index is not None and profiled.edema_index is not None:
-            field, local = cropped[session.id]
-            qois = threshold_qois(field, local, zooms, profiled.core_threshold, profiled.edema_threshold, distances=False)
-            record[f"{prefix}log_vol_ratio_core"] = float(qois["log_vol_ratio_core"])
+        field, necrotic_field, local = cropped[session.id]
+        if necrotic_scored:
+            star = (profiled.core_index, profiled.necrotic_index)
+            record[f"{prefix}dice_core_star"] = float(core[star]) if profiled.core_index is not None else nan
+            record[f"{prefix}dice_core_fixed"] = float(core[FIXED_CORE_INDEX, FIXED_NECROTIC_INDEX])
+            necrotic = dice_necrotic[session.id]
+            record[f"{prefix}dice_necrotic_star"] = float(necrotic[profiled.necrotic_index]) if profiled.necrotic_index is not None else nan
+            record[f"{prefix}dice_necrotic_fixed"] = float(necrotic[FIXED_NECROTIC_INDEX])
         else:
-            record[f"{prefix}log_vol_ratio_core"] = float("nan")
-        record[f"{prefix}dice_core_fixed"] = float(core[FIXED_CORE_INDEX])
+            record[f"{prefix}dice_core_star"] = float(core[profiled.core_index]) if profiled.core_index is not None else nan
+            record[f"{prefix}dice_core_fixed"] = float(core[FIXED_CORE_INDEX])
+            record[f"{prefix}dice_necrotic_star"] = nan
+            record[f"{prefix}dice_necrotic_fixed"] = nan
+        record[f"{prefix}dice_whole_star"] = float(whole[profiled.edema_index]) if profiled.edema_index is not None else nan
         record[f"{prefix}dice_whole_fixed"] = float(whole[FIXED_EDEMA_INDEX])
+        if profiled.core_index is not None:
+            preop = session.label == LABEL_PREOP
+            model = model_core_mask(field, necrotic_field, preop, profiled.core_threshold, profiled.necrotic_threshold) & local.valid
+            record[f"{prefix}log_vol_ratio_core"] = log_vol_ratio(int(model.sum()), int(local.core.sum()), zooms)
+        else:
+            record[f"{prefix}log_vol_ratio_core"] = nan
     return record
 
 
@@ -3115,6 +3346,7 @@ def best_summary(record: Mapping[str, Any], problem: FitProblem) -> dict[str, An
         "J": row["J"],
         "core_threshold_star": row["core_threshold_star"],
         "edema_threshold_star": row["edema_threshold_star"],
+        "necrotic_threshold_star": row.get("necrotic_threshold_star"),
         "n_nan_sessions": row["n_nan_sessions"],
         "unit": {name: row[f"u_{name}"] for name in names},
         "physical": {name: row.get(name) for name in names},
@@ -3563,7 +3795,7 @@ def prepare_fit(args: argparse.Namespace, fit_dir: Path, gpus: Sequence[str | No
         args.session_labels,
         args.sessions,
         args.session_weights,
-        args.loss,
+        resolve_loss(args.loss, args.solver),
         parse_preop_time_range(args.preop_time_range),
         float(args.steps_per_day),
         schedule.factors,
@@ -3669,7 +3901,7 @@ def run_starts(args: argparse.Namespace) -> int:
         args.session_labels,
         args.sessions,
         args.session_weights,
-        args.loss,
+        resolve_loss(args.loss, args.solver),
         parse_preop_time_range(args.preop_time_range),
         float(args.steps_per_day),
         [FULL_RESOLUTION],
@@ -3698,6 +3930,11 @@ def resolve_default(given: str | None, defaults: Mapping[str, Path], solver_mode
     return Path(given) if given else defaults[solver_mode]
 
 
+def resolve_loss(given: str | None, solver_mode: str) -> str:
+    """--loss: the given one, or the solver mode's default (DEFAULT_LOSSES)."""
+    return given if given else DEFAULT_LOSSES[solver_mode]
+
+
 def _add_problem_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--solver", choices=list(SOLVER_MODES), default=DEFAULT_SOLVER_MODE,
@@ -3722,7 +3959,10 @@ def _add_problem_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--session-weights", default="", help="weights 'ses-01=1,ses-02=1,...' (default 1 each)")
-    parser.add_argument("--loss", choices=LOSS_MODES, default=DEFAULT_LOSS, help=f"the profiled objective (default {DEFAULT_LOSS})")
+    parser.add_argument(
+        "--loss", choices=LOSS_MODES, default=None,
+        help="the profiled objective (default per --solver: " + ", ".join(f"{m} {l}" for m, l in DEFAULT_LOSSES.items()) + ")",
+    )
     parser.add_argument(
         "--objective", choices=list(OBJECTIVE_SCOPES), default=DEFAULT_OBJECTIVE_SCOPE,
         help=(

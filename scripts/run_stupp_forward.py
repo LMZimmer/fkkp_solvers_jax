@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Forward-solve one treated tumor growth with fisher_kpp_jax.StuppFKPPSolver.
 
-Reads a JSON config (scripts/stupp_config_example.json by default; see
+Reads a JSON config (fisher_kpp_jax/search_spaces/stupp_config_example.json by default; see
 fisher_kpp_jax.read_config: the StuppFKPPSolver parameters by name, the
 tissue probability maps, the labelled segmentation of the resection cavity
 and the TOTAL-dose map as NIfTI paths, the time step as steps_per_day, dt
@@ -65,7 +65,7 @@ from scipy.ndimage import center_of_mass  # noqa: E402
 from fisher_kpp_jax import StuppFKPPSolver, read_config  # noqa: E402
 from fisher_kpp_jax.util import montage_days, render, select_panels  # noqa: E402
 
-DEFAULT_CONFIG = str(_ROOT / "scripts" / "stupp_config_example.json")
+DEFAULT_CONFIG = str(_ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_config_example.json")
 DEFAULT_THRESHOLD = 0.01  # overlay transparency threshold (cell density)
 
 

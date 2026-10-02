@@ -94,7 +94,7 @@ recorded. It is meant for a cheaper identifiability sweep over the
 growth factors (with --second-order).
 
 Search-space file (JSON, --search-space; default
-fisher_kpp_jax/search_spaces/stupp_fkpp_sigma_v2_search_space.json). It reads like
+fisher_kpp_jax/search_spaces/atlas_SA_v2_search_space.json). It reads like
 a config: "solver" names FKPPSolver (resolved through the solver registry
 and checked against the class the script uses, so a file that names it
 StuppFKPPSolver, the class's former name, still loads), keys starting
@@ -546,7 +546,7 @@ SOLVER_NAME = FKPPSolver.__name__
 # The solver of the growth stage (seed to resection_time, no treatment).
 GROWTH_SOLVER_NAME = "FKPPSolver"
 SOLVER_KEY = "solver"
-DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_fkpp_sigma_v2_search_space.json"
+DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "atlas_SA_v2_search_space.json"
 # The treated config of the isotropic model, the base config of the sweep,
 # identifiability and patient scripts.
 DEFAULT_CONFIG = _ROOT / "fisher_kpp_jax" / "configs" / "FKPPSolver_stupp.json"

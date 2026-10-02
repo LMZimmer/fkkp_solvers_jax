@@ -3,7 +3,7 @@
 the treatment course as a figure.
 
 One solve of fisher_kpp_jax.StuppFKPPSolver with the config's parameters
-(scripts/stupp_config_example.json by default; it must name the tissue
+(fisher_kpp_jax/search_spaces/stupp_config_example.json by default; it must name the tissue
 maps, the cavity segmentation, the dose map and the time step), recording
 the state at the eight montage days below plus --n-snapshots evenly spaced
 days that sample the mass curve.
@@ -54,7 +54,7 @@ from fisher_kpp_jax import StuppFKPPSolver, read_config  # noqa: E402
 from fisher_kpp_jax.config import jsonable  # noqa: E402
 from fisher_kpp_jax.util import montage_days, render, select_panels  # noqa: E402
 
-DEFAULT_CONFIG = str(_ROOT / "scripts" / "stupp_config_example.json")
+DEFAULT_CONFIG = str(_ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_config_example.json")
 # Background image: <session dir of the wm pbmap>/skull_stripped/t1c_skullstripped.nii.gz
 # unless --background-image is given (the SAILOR layout, so a patient change in the
 # config's tissue maps carries over).

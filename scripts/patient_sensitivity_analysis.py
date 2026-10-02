@@ -1,8 +1,11 @@
 #!/usr/bin/env python
-"""Variance-based (Sobol') sensitivity analysis of the Stupp-protocol forward
-model, fisher_kpp_jax.StuppFKPPSolver, on ONE real patient of the SAILOR
-cohort, with quantities of interest (QoIs) measuring the agreement of the
-forward run with the patient's longitudinal tumour segmentations.
+"""Variance-based (Sobol') sensitivity analysis of a Stupp-protocol forward
+model of fisher_kpp_jax (--solver: standard = FKPPSolver, the isotropic
+model; twospecies = TwoCompartmentWithNutrientFKPPSolver, the
+proliferative / necrotic / nutrient model; see Solver below) on ONE real
+patient of the SAILOR cohort, with quantities of interest (QoIs) measuring
+the agreement of the forward run with the patient's longitudinal tumour
+segmentations.
 
 The machinery is that of scripts/sensitivity_analysis.py (the atlas
 analysis) and is imported from it: the Saltelli design on a scrambled
@@ -10,6 +13,35 @@ Sobol' sequence, the search-space files with their derived factor groups,
 the nested-range seed projection, the run bookkeeping, SALib's Sobol'
 estimators with bootstrap confidence intervals and the half-sample check,
 the run/block accounting, the figures. What differs is below.
+
+Solver (--solver, SOLVER_MODES, default standard; design and all only: the
+run, qoi and analyze steps read the solver from spec.json, and a design
+without the record, from before 2026-10-02, is standard). Per solver
+(``solver_record`` in spec.json): the class, its default base config
+(DEFAULT_CONFIGS: fisher_kpp_jax/configs/FKPPSolver_stupp.json or
+TwoCompartmentWithNutrientFKPPSolver_stupp.json; the config must name the
+class) and default search space (DEFAULT_SEARCH_SPACES:
+fisher_kpp_jax/search_spaces/patient_SA_v2_search_space.json or
+patient_SA_v2_search_space_twospecies.json), the state fields a run saves
+per session (MODEL_FIELDS: cell_density; proliferative, necrotic and
+nutrient), the fields the QoI step loads (QOI_FIELDS: the nutrient enters
+no QoI), the regions scored (SOLVER_REGIONS: core and whole; core, whole
+and necrotic) and the densities the regions are thresholded on
+(``region_densities``, REGION_DENSITY_RULE): the isotropic model's cell
+density for the core and the whole tumour; for the two-species model P
+(proliferative) for the core, P + N for the whole tumour and N (necrotic)
+for the necrotic region. The reference core of the two-species scoring is
+the ENHANCING tumour (label 3) in every session, the pre-op one included
+(PREOP_CORE_LABELS; the necrotic label is scored by the necrotic region),
+whereas the isotropic model keeps the labels 1 and 3 before the surgery;
+the necrotic reference is label 1 after the cavity correction
+(NECROTIC_LABELS), and its Dice is NaN in a session without a necrotic
+label (``region_dice``). The seedable voxels are the pre-op labels 1 and
+3 for both solvers. The moment QoIs (mass, centroid drift, ...) are
+computed on MOMENT_FIELD: the cell density, or P. The two-species design
+adds the four two-compartment factors and a third cheap threshold factor
+(Threshold modes below): k = 19 with the shipped search space, 21 504 rows
+and 18 432 distinct solves at the default N = 1024.
 
 Patient data (--patient, --patient-root, --session-labels, --sessions;
 defaults sub-01 of /mnt/Drive4/lucas/SAILOR/processed and
@@ -26,8 +58,10 @@ labelled postop, the CRT start session the first follow-up after it; the
 later sessions analysed are --sessions (which must hold the post-op
 session, the source of the resection cavity) and must all be after the
 pre-op scan. Labels of every tumour segmentation: 1 necrotic, 2 edema,
-3 enhancing, 4 cavity; the pre-op segmentation is relabelled 4 -> 3
-before use. The reference core is labels 1 and 3 in the pre-op session
+3 enhancing, 4 cavity; a pre-op segmentation must not contain label 4
+(``check_preop_labels`` raises: a cavity before the resection is a prior
+surgery's, not tumour; until 2026-10-02 such voxels were relabelled 3).
+The reference core is labels 1 and 3 in the pre-op session
 and label 3 alone in every later session (since 2026-10-01: the
 two-compartment solver turns the cells killed by chemotherapy and
 radiotherapy necrotic, so after the resection only the enhancing tumour
@@ -36,8 +70,8 @@ scored by the same convention). In a later session a necrotic voxel that any ear
 session of the design labelled cavity counts as cavity
 (``correct_cavity_labels``: the segmentation algorithm sometimes labels
 the resection cavity necrotic in one session and cavity again in the
-next; the correction uses the union of the earlier sessions' label 4,
-the pre-op's label 4 not among them); the files on disk are not
+next; the correction uses the union of the earlier later sessions' label 4);
+the files on disk are not
 changed. The design step reads the tsv, loads every segmentation,
 prints the label counts per session and the relabelled voxel counts,
 the dose map's range and nonzero volume and checks the shapes and
@@ -92,19 +126,24 @@ fisher_kpp_jax/configs/FKPPSolver_stupp.json: steps_per_day 12 among
 it; the design step refuses a config without a time-step entry as the
 atlas script does). Snapshots: the session snapshot is the state at the
 start of the scan day, before any event of that day fires: run-one
-resolves the run's time step dt (``StuppFKPPSolver.resolve_time_stepping``
-of the run config) and requests the last step end at least half a step
-before the moment t_pre + offset, m dt = floor((t_pre + offset) / dt - 1/2) dt
+resolves the run's time step dt (``resolve_time_stepping`` of the run
+config, with the solver the config names; the two-species solver's
+stability rule may raise the step count of a run, which timeline.json and
+the dt column of qoi.csv record) and requests the last step end at least
+half a step before the moment t_pre + offset,
+m dt = floor((t_pre + offset) / dt - 1/2) dt
 (``session_snapshot_days``, the atlas's ``snapshot_days`` rule applied to
 the moment itself instead of the end of the day), which the solver's
 snapshot_times mechanism records exactly; both the moment and the
 recorded day go into runs/<run>/timeline.json and the run's config.json
 holds the requested days as snapshot_times, so a re-solve reproduces
-the frames. The frames are saved as runs/<run>/<session>_cell_density.nii.gz
-(e.g. ses03_cell_density.nii.gz; float32, rounded for storage as the
-atlas fields are, ``round_field``) next to Result.save's
-final_cell_density.nii.gz (the state at the horizon). One solve per run,
-no growth stage: the cavity and the dose map are the patient's.
+the frames. The frames are saved per field of MODEL_FIELDS as
+runs/<run>/<session>_<field>.nii.gz (e.g. ses03_cell_density.nii.gz;
+ses03_proliferative, ses03_necrotic and ses03_nutrient.nii.gz with the
+two-species solver; float32, rounded for storage as the atlas fields
+are, ``round_field``) next to Result.save's final_<field>.nii.gz (the
+state at the horizon). One solve per run, no growth stage: the cavity
+and the dose map are the patient's.
 
 Seeding: the seedable voxels are the pre-op core (labels 1 and 3 after
 the relabelling) carrying tissue (wm + gm >= min_tissue_fraction, the
@@ -114,42 +153,57 @@ ranges exactly as the atlas script maps them onto the atlas tissue
 (``patient_seed_geometry`` builds the SeedGeometry of that mask,
 ``project_seeds`` does the mapping).
 
-Search space (--search-space, default
-fisher_kpp_jax/search_spaces/sailor_patient_v2_search_space.json), read as
-the atlas script reads its files (``load_search_space``) with three
-script factors that are not solver parameters: preop_time and the two
-threshold factors core_threshold and edema_threshold_ratio, which carry
-"cheap": true (the solve does not depend on them; the flag is stripped
-before the file is handed to ``load_search_space``). Its ranges follow
-fisher_kpp_jax/search_spaces/stupp_fkpp_sigma_v2_search_space.json
+Search space (--search-space, default per solver, DEFAULT_SEARCH_SPACES:
+fisher_kpp_jax/search_spaces/patient_SA_v2_search_space.json or
+patient_SA_v2_search_space_twospecies.json), read as the atlas script
+reads its files (``load_search_space``, with the solver's parameters and
+its class as the admissible "solver" entry) with script factors that are
+not solver parameters (``script_factors``): preop_time and the solver's
+cheap threshold factors (SOLVER_THRESHOLD_FACTORS: core_threshold and
+edema_threshold_ratio; the two-species solver adds necrotic_threshold),
+which carry "cheap": true (the solve does not depend on them; the flag
+is stripped before the file is handed to ``load_search_space``). The
+isotropic ranges follow
+fisher_kpp_jax/search_spaces/atlas_SA_v2_search_space.json
 (2026-09-15): with front_width_mm up to 4 mm and seed_sigma_mm from
 5 mm the atlas loader warns that the seed width floor is below twice the
 front width cap, which is expected (a seed diffusion flattens shows as
-an empty model mask, counted per session in qoi_summary.json). The
+an empty model mask, counted per session in qoi_summary.json); the
+two-species file keeps them and adds the four two-compartment factors
+(necrosis_rate, nutrient_threshold, nutrient_diffusivity,
+nutrient_consumption_rate) with the ranges of the CMA-ES fit. The
 default design is --log2-n DEFAULT_LOG2_N (10, N = 1024). The timeline
 entries (resection_time, time_after_resection, chemo_times,
 chemo_doses, rt_times, snapshot_times), the tissue maps,
 resection_cavity and rt_dose may not appear in it. The derived groups'
-design-time checks run against the resolved parameters of a
-StuppFKPPSolver built from the base config with the patient's volumes
-and the timeline at the midpoint of preop_time (no solve).
+design-time checks run against the resolved parameters of the solver
+built from the base config with the patient's volumes and the timeline
+at the midpoint of preop_time (no solve).
 
 Threshold modes (--threshold-mode, THRESHOLD_MODES, default sampled,
 DEFAULT_THRESHOLD_MODE):
   profiled  the cheap factors are dropped from the design (k = 12 with
-            the shipped search space). Per session and region the Dice
-            is evaluated on the fixed grid THRESHOLD_GRID_CORE
-            (0.30..0.85 step 0.05) x THRESHOLD_GRID_EDEMA (0.10..0.60
-            step 0.05), pairs with edema < core only
-            (``threshold_pairs``), and the QoIs report Dice* and the
-            thresholds of the best pair (below) as well as the Dice at
-            the fixed pair TAU_CORE / TAU_EDEMA = 0.6 / 0.3 (the row
-            thresholds of this mode).
-  sampled   (the default) the two cheap factors are in the design
-            (k = 14 with the shipped search space), with
+            the shipped isotropic search space, 16 with the two-species
+            one). Per session and region the Dice is evaluated on the
+            fixed grid THRESHOLD_GRID_CORE (0.30..0.85 step 0.05) x
+            THRESHOLD_GRID_EDEMA (0.10..0.60 step 0.05), pairs with
+            edema < core only (``threshold_pairs``), and the QoIs
+            report Dice* and the thresholds of the best pair (below) as
+            well as the Dice at the fixed pair TAU_CORE / TAU_EDEMA =
+            0.6 / 0.3 (the row thresholds of this mode). The necrotic
+            region has its own grid THRESHOLD_GRID_NECROTIC (0.10..0.85
+            step 0.05, the edema and the core grids joined; N stays
+            below the core densities) profiled on its own (the best
+            value maximises dice_necrotic) and the fixed threshold
+            FIXED_NECROTIC_THRESHOLD = 0.3.
+  sampled   (the default) the cheap factors are in the design (k = 14
+            with the shipped isotropic search space, 19 with the
+            two-species one), with
             edema_threshold = edema_threshold_ratio * core_threshold
             (a deterministic map, no rejection; edema < core on every
-            row). The run list is DEDUPLICATED on the non-cheap columns
+            row) and necrotic_threshold sampled on its own (linear
+            within (0, 1], no relation to the core threshold). The run
+            list is DEDUPLICATED on the non-cheap columns
             (``dedup_runs``): rows sharing every solver parameter (the
             A_B^(i) rows of the cheap columns, whose dynamics equal
             their block's A row) share one run directory. design.csv
@@ -157,23 +211,32 @@ DEFAULT_THRESHOLD_MODE):
             column pointing at the shared run; spec.json records the
             mapping counts (n_rows = N (k + 2), n_runs = N (k_dyn + 2))
             and the design step prints them. The row thresholds of this
-            mode are the sampled pair, and the QoIs of the fixed pair
-            0.6 / 0.3 are computed as well under the suffix _fixed.
+            mode are the sampled ones, and the QoIs of the fixed
+            thresholds 0.6 / 0.3 (/ 0.3) are computed as well under the
+            suffix _fixed.
 Both modes analyse their QoIs through the atlas's ``analyze_response``
 (bootstrap, half-sample bookkeeping); the analysed list is explicit
 (``analysed_qois``).
 
 QoIs, per session s (prefixed by the session id, e.g. ses03_) and region
-r in {core, whole}, with u the session's snapshot field, dV the voxel
-volume (mm^3) and, in the post-op sessions, every label-4 voxel of THAT
-session's segmentation, after the cavity correction above, excluded
+r of the solver (core, whole; and necrotic for the two-species solver),
+with u_r the region's density of the session's snapshot
+(``region_densities``: the cell density; or P, P + N and N), dV the
+voxel volume (mm^3) and, in the post-op sessions, every label-4 voxel of
+THAT session's segmentation, after the cavity correction above, excluded
 from the model and the reference masks (``session_references``; the
 pre-op session excludes nothing):
-  model core  = u >= core_threshold;  reference core  = labels {1, 3} in
-                                      the pre-op session, {3} afterwards
-  model whole = u >= edema_threshold; reference whole = labels {1, 2, 3}
+  model core     = u_core >= core_threshold;
+                   reference core = labels {1, 3} in the pre-op session
+                   and {3} afterwards (isotropic), {3} in every session
+                   (two-species)
+  model whole    = u_whole >= edema_threshold; reference whole = labels {1, 2, 3}
+  model necrotic = u_necrotic >= necrotic_threshold; reference necrotic =
+                   label {1} after the cavity correction (two-species)
   dice_<r>           Dice of the row thresholds; NaN when both masks are
-                     empty (counted), 0 when one is (``dice``)
+                     empty (counted), 0 when one is (``dice``); the
+                     necrotic Dice is NaN whenever the session has no
+                     necrotic label (``region_dice``)
   log10_V_<r>        log10(V_model + dV), the atlas's volume convention
   log_vol_ratio_<r>  log10_V_<r> - log10(V_reference + dV) (NaN when the
                      reference is empty, counted)
@@ -192,16 +255,22 @@ pre-op session excludes nothing):
                      model and the reference both empty at every
                      threshold, is left out of the objective and its
                      Dice* is NaN)
+  dice_star_necrotic, necrotic_threshold_star
+                     (two-species) the necrotic grid value maximising
+                     dice_necrotic and the Dice there; NaN in a session
+                     without a necrotic label
   <name>_fixed       in sampled mode, the five threshold QoIs per
-                     region at the fixed pair 0.6 / 0.3
+                     region at the fixed thresholds 0.6 / 0.3 (/ 0.3)
   mass, log10_mass, centroid_drift, R_g, anisotropy, log10_anisotropy,
-  wm_fraction        the atlas's threshold-free QoIs of the field
-                     (``compute_qois`` with the patient's white-matter
+  wm_fraction        the atlas's threshold-free QoIs of the moment field
+                     (MOMENT_FIELD: the cell density, or P;
+                     ``compute_qois`` with the patient's white-matter
                      map and the projected seed voxel)
 and per run dice_mean_core, the mean of the finite dice_core over the
 post-op sessions (the enhancing-tumour Dice, by the core rule above). Every Dice / volume / distance is computed on the
-bounding box of the reference whole mask and the field at or above the
-smallest threshold in use (exact: every mask lies inside it).
+bounding box of the reference whole mask and the whole density at or
+above the smallest threshold in use (exact: every mask lies inside it;
+the whole density is pointwise at least every other region's).
 
 Output layout (--output-dir, default DEFAULT_OUTPUT_DIR; --name required):
   <output-dir>/<name>/
@@ -210,16 +279,18 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR; --name required):
                        timeline at the midpoint of preop_time (the
                        config the design-time checks ran on)
     spec.json          patient, sessions (ids, labels, dates, files), the
-                       label conventions, data_checks, the protocol
-                       doses, the timeline (calendar dates and offsets of
-                       the resection, the fractions, the TMZ days, the
-                       adjuvant cycles, the snapshots, the horizon),
-                       threshold_mode, thresholds (fixed pair, grid,
-                       factors), cheap_factors, dedup counts, the search
-                       space record of the atlas script (factors,
-                       overrides, derived groups, ...), N, k, k_dyn,
-                       factor order, seedable voxels, chemo budget, the
-                       dose map's maximum, analysed_qois
+                       solver record (mode, class, fields, regions,
+                       densities) and regions, the label conventions,
+                       data_checks, the protocol doses, the timeline
+                       (calendar dates and offsets of the resection, the
+                       fractions, the TMZ days, the adjuvant cycles, the
+                       snapshots, the horizon), threshold_mode,
+                       thresholds (fixed thresholds, grids, factors),
+                       cheap_factors, dedup counts, the search space
+                       record of the atlas script (factors, overrides,
+                       derived groups, ...), N, k, k_dyn, factor order,
+                       seedable voxels, chemo budget, the dose map's
+                       maximum, analysed_qois
     design.csv         one line per Saltelli row: row_name, run_name (the
                        shared run), index, row, matrix, u_<factor> and
                        <factor> per factor, the derived parameters and
@@ -228,19 +299,23 @@ Output layout (--output-dir, default DEFAULT_OUTPUT_DIR; --name required):
     configs/<run>.json one config per distinct run
     logs/<run>.log     stdout/stderr of the runs
     runs/<run>/        Result.save's output without the initial state
-                       (config.json, result.json, final_cell_density.nii.gz),
-                       the session snapshots <session>_cell_density.nii.gz
-                       and timeline.json (dt, the snapshot moments and the
-                       recorded days)
+                       (config.json, result.json, final_<field>.nii.gz),
+                       the session snapshots <session>_<field>.nii.gz per
+                       field of MODEL_FIELDS and timeline.json (dt, the
+                       solver, the fields, the snapshot moments, the
+                       recorded days and the files per session)
     run_status.csv     appended as runs finish (STATUS_COLUMNS)
-    qoi.csv            one line per Saltelli row (QOI columns)
-    qoi_summary.json   run counts, NaN counts and relabelled cavity
-                       voxels per session, the label conventions, the
-                       per-QoI run/block accounting
+    qoi.csv            one line per Saltelli row (``qoi_columns`` of the
+                       solver: the row thresholds per region, the
+                       session QoIs of the regions)
+    qoi_summary.json   run counts, NaN counts (per region) and relabelled
+                       cavity voxels per session, the solver and the
+                       label conventions, the per-QoI run/block accounting
     sobol.csv, sobol_summary.json, figures/   as the atlas script writes them
 
 Run from the project root, e.g.:
   python scripts/patient_sensitivity_analysis.py design --name sa_sub01 --log2-n 3 --threshold-mode profiled
+  python scripts/patient_sensitivity_analysis.py design --solver twospecies --name sa_sub01_twospecies --log2-n 3
   python scripts/patient_sensitivity_analysis.py run --sweep-dir <output-dir>/sa_sub01 --gpus 2,3
   python scripts/patient_sensitivity_analysis.py qoi --sweep-dir <output-dir>/sa_sub01
   python scripts/patient_sensitivity_analysis.py analyze --sweep-dir <output-dir>/sa_sub01
@@ -284,7 +359,13 @@ import numpy as np  # noqa: E402
 from numpy.typing import NDArray  # noqa: E402
 from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure  # noqa: E402
 
-from fisher_kpp_jax import FKPPSolver, StuppFKPPSolver, read_config, write_config  # noqa: E402
+from fisher_kpp_jax import (  # noqa: E402
+    FKPPSolver,
+    TwoCompartmentWithNutrientFKPPSolver,
+    read_config,
+    solver_class,
+    write_config,
+)
 from sensitivity_analysis import (  # noqa: E402
     DEFAULT_BOOTSTRAP_SEED,
     DEFAULT_CONFIG,
@@ -334,7 +415,39 @@ from sensitivity_analysis import (  # noqa: E402
 # StuppFKPPSolver is the former name of FKPPSolver as the treated solver; a
 # config or search space naming it still loads.
 SOLVER_NAME = FKPPSolver.__name__
-DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_v2_search_space.json"
+# The solver (--solver): the class, its treated base config, its search
+# space, the state fields a run saves per session (MODEL_FIELDS), the ones
+# the QoI step loads (QOI_FIELDS), the field the moment QoIs are computed
+# on (MOMENT_FIELD) and the regions scored (SOLVER_REGIONS; the densities
+# of the regions are ``region_densities``).
+SOLVER_MODES: dict[str, type[FKPPSolver] | type[TwoCompartmentWithNutrientFKPPSolver]] = {
+    "standard": FKPPSolver,
+    "twospecies": TwoCompartmentWithNutrientFKPPSolver,
+}
+DEFAULT_SOLVER_MODE = "standard"
+DEFAULT_CONFIGS: dict[str, Path] = {
+    "standard": Path(DEFAULT_CONFIG),
+    "twospecies": _ROOT / "fisher_kpp_jax" / "configs" / "TwoCompartmentWithNutrientFKPPSolver_stupp.json",
+}
+DEFAULT_SEARCH_SPACES: dict[str, Path] = {
+    "standard": _ROOT / "fisher_kpp_jax" / "search_spaces" / "patient_SA_v2_search_space.json",
+    "twospecies": _ROOT / "fisher_kpp_jax" / "search_spaces" / "patient_SA_v2_search_space_twospecies.json",
+}
+DEFAULT_SEARCH_SPACE = DEFAULT_SEARCH_SPACES[DEFAULT_SOLVER_MODE]
+MODEL_FIELDS: dict[str, tuple[str, ...]] = {
+    "standard": ("cell_density",),
+    "twospecies": ("proliferative", "necrotic", "nutrient"),
+}
+QOI_FIELDS: dict[str, tuple[str, ...]] = {
+    "standard": ("cell_density",),
+    "twospecies": ("proliferative", "necrotic"),
+}
+MOMENT_FIELD: dict[str, str] = {"standard": "cell_density", "twospecies": "proliferative"}
+REGION_CORE, REGION_WHOLE, REGION_NECROTIC = "core", "whole", "necrotic"
+SOLVER_REGIONS: dict[str, tuple[str, ...]] = {
+    "standard": (REGION_CORE, REGION_WHOLE),
+    "twospecies": (REGION_CORE, REGION_WHOLE, REGION_NECROTIC),
+}
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_patient")
 DEFAULT_PATIENT = "sub-01"
 DEFAULT_PATIENT_ROOT = Path("/mnt/Drive4/lucas/SAILOR/processed")
@@ -359,31 +472,72 @@ LABEL_PREOP, LABEL_POSTOP, LABEL_FOLLOWUP = "preop", "postop", "followup"
 # Segmentation labels (all tumour segmentations) and the compartments.
 LABEL_NECROTIC, LABEL_EDEMA, LABEL_ENHANCING, LABEL_CAVITY = 1, 2, 3, 4
 KNOWN_LABELS: tuple[int, ...] = (0, LABEL_NECROTIC, LABEL_EDEMA, LABEL_ENHANCING, LABEL_CAVITY)
-# The core of the pre-op session (the seedable region as well) is the
-# necrotic and the enhancing tumour; the core of every later session is
-# the enhancing tumour alone (since 2026-10-01, see the module docstring).
+# The core of the pre-op session (the seedable region of both solvers, and
+# the isotropic model's pre-op reference core) is the necrotic and the
+# enhancing tumour; the core of every later session is the enhancing tumour
+# alone (since 2026-10-01, see the module docstring). The two-species model
+# scores its proliferative density against the enhancing tumour in every
+# session, the pre-op one included (PREOP_CORE_LABELS), and its necrotic
+# density against the necrotic label (NECROTIC_LABELS).
 CORE_LABELS: tuple[int, ...] = (LABEL_NECROTIC, LABEL_ENHANCING)
 POSTOP_CORE_LABELS: tuple[int, ...] = (LABEL_ENHANCING,)
+NECROTIC_LABELS: tuple[int, ...] = (LABEL_NECROTIC,)
 WHOLE_LABELS: tuple[int, ...] = (LABEL_NECROTIC, LABEL_EDEMA, LABEL_ENHANCING)
-PREOP_RELABEL: dict[int, int] = {LABEL_CAVITY: LABEL_ENHANCING}
-LABEL_CONVENTIONS: dict[str, Any] = {
-    "labels": {"1": "necrotic", "2": "edema", "3": "enhancing", "4": "cavity"},
-    "reference_core_preop": list(CORE_LABELS),
-    "reference_core_postop": list(POSTOP_CORE_LABELS),
-    "reference_whole": list(WHOLE_LABELS),
-    "postop_core": (
-        f"in every later session the reference core is label {LABEL_ENHANCING} alone (since 2026-10-01): the "
-        "two-compartment solver turns the cells killed by chemotherapy and radiotherapy necrotic, so after the "
-        "resection only the enhancing tumour is comparable with a model's viable cells"
-    ),
-    "preop_relabel": {str(k): v for k, v in PREOP_RELABEL.items()},
-    "postop_exclusion": f"label {LABEL_CAVITY} voxels of the session's own segmentation, after the cavity correction, are removed from the model and the reference masks",
-    "cavity_correction": (
-        f"in a later session, label {LABEL_NECROTIC} voxels that any earlier later session of the design labelled "
-        f"{LABEL_CAVITY} count as {LABEL_CAVITY} (the union of the earlier sessions' label {LABEL_CAVITY}; the pre-op "
-        "segmentation contributes none); the files on disk are unchanged"
-    ),
+PREOP_CORE_LABELS: dict[str, tuple[int, ...]] = {"standard": CORE_LABELS, "twospecies": POSTOP_CORE_LABELS}
+
+
+def label_conventions(solver_mode: str = DEFAULT_SOLVER_MODE) -> dict[str, Any]:
+    """
+    The label conventions a design's masks follow, for spec.json and
+    qoi_summary.json: the labels, the reference core of the pre-op session
+    (PREOP_CORE_LABELS of the solver) and of the later sessions, the whole
+    tumour, the cavity rules and, for the two-species solver, the
+    necrotic reference and the densities the regions are thresholded on.
+    The standard record is LABEL_CONVENTIONS, which the fit script's
+    FIT_LABEL_CONVENTIONS extends. Until 2026-10-02 a pre-op label 4 was
+    relabelled 3 and the record held "preop_relabel": {"4": 3}; now
+    ``check_preop_labels`` refuses it (``comparable_label_conventions``).
+    """
+    preop_core = PREOP_CORE_LABELS[solver_mode]
+    record: dict[str, Any] = {
+        "labels": {"1": "necrotic", "2": "edema", "3": "enhancing", "4": "cavity"},
+        "reference_core_preop": list(preop_core),
+        "reference_core_postop": list(POSTOP_CORE_LABELS),
+        "reference_whole": list(WHOLE_LABELS),
+        "postop_core": (
+            f"in every later session the reference core is label {LABEL_ENHANCING} alone (since 2026-10-01): the "
+            "two-compartment solver turns the cells killed by chemotherapy and radiotherapy necrotic, so after the "
+            "resection only the enhancing tumour is comparable with a model's viable cells"
+        ),
+        "preop_cavity": f"a pre-op segmentation with label {LABEL_CAVITY} voxels is refused",
+        "postop_exclusion": f"label {LABEL_CAVITY} voxels of the session's own segmentation, after the cavity correction, are removed from the model and the reference masks",
+        "cavity_correction": (
+            f"in a later session, label {LABEL_NECROTIC} voxels that any earlier later session of the design labelled "
+            f"{LABEL_CAVITY} count as {LABEL_CAVITY} (the union of the earlier sessions' label {LABEL_CAVITY}; the pre-op "
+            "segmentation contributes none); the files on disk are unchanged"
+        ),
+    }
+    if solver_mode == "twospecies":
+        record["solver"] = SOLVER_MODES[solver_mode].__name__
+        record["reference_necrotic"] = list(NECROTIC_LABELS)
+        record["preop_core"] = (
+            f"the pre-op reference core is label {LABEL_ENHANCING} alone as well: the proliferative density is compared "
+            f"with the enhancing tumour in every session and the necrotic density with label {LABEL_NECROTIC}"
+        )
+        record["necrotic_reference"] = (
+            f"label {LABEL_NECROTIC} after the cavity correction, the session's excluded cavity removed; a session "
+            "without a necrotic label has an undefined (NaN) necrotic Dice"
+        )
+        record["densities"] = REGION_DENSITY_RULE[solver_mode]
+    return record
+
+
+# The densities the regions are thresholded on, per solver (``region_densities``).
+REGION_DENSITY_RULE: dict[str, str] = {
+    "standard": "core and whole: cell_density",
+    "twospecies": "core: proliferative; whole: proliferative + necrotic; necrotic: necrotic",
 }
+LABEL_CONVENTIONS: dict[str, Any] = label_conventions(DEFAULT_SOLVER_MODE)
 
 # The clinical schedule.
 RESECTION_DAYS_BEFORE_POSTOP = 3
@@ -398,14 +552,28 @@ PROTOCOL_ANCHOR = "ses-03 = day 0 of CRT week 1; weekdays from the calendar are 
 # The dose map's maximum should be the total prescribed dose, about 60 Gy.
 RT_TOTAL_DOSE_PLAUSIBLE_GY: tuple[float, float] = (50.0, 70.0)
 
-# Script factors: not solver parameters.
+# Script factors: not solver parameters. The cheap threshold factors are
+# the solver's (SOLVER_THRESHOLD_FACTORS): the two-species solver adds the
+# necrotic threshold, sampled independently of the core threshold.
 PREOP_TIME_FACTOR = "preop_time"
 CORE_THRESHOLD_FACTOR = "core_threshold"
 EDEMA_RATIO_FACTOR = "edema_threshold_ratio"
 EDEMA_THRESHOLD_COLUMN = "edema_threshold"
+NECROTIC_THRESHOLD_FACTOR = "necrotic_threshold"
 THRESHOLD_FACTORS: tuple[str, ...] = (CORE_THRESHOLD_FACTOR, EDEMA_RATIO_FACTOR)
+SOLVER_THRESHOLD_FACTORS: dict[str, tuple[str, ...]] = {
+    "standard": THRESHOLD_FACTORS,
+    "twospecies": (*THRESHOLD_FACTORS, NECROTIC_THRESHOLD_FACTOR),
+}
 SCRIPT_FACTORS: tuple[str, ...] = (PREOP_TIME_FACTOR, *THRESHOLD_FACTORS)
+ALL_SCRIPT_FACTORS: tuple[str, ...] = (PREOP_TIME_FACTOR, *THRESHOLD_FACTORS, NECROTIC_THRESHOLD_FACTOR)
 CHEAP_KEY = "cheap"
+
+
+def script_factors(solver_mode: str = DEFAULT_SOLVER_MODE) -> tuple[str, ...]:
+    """The script factors of a solver: preop_time and its cheap threshold
+    factors (SCRIPT_FACTORS for the standard solver)."""
+    return (PREOP_TIME_FACTOR, *SOLVER_THRESHOLD_FACTORS[solver_mode])
 # Config entries the script sets per run; a search space may not hold them.
 TIMELINE_KEYS: tuple[str, ...] = (
     "resection_time",
@@ -420,25 +588,71 @@ PATIENT_VOLUME_KEYS: tuple[str, ...] = (*TISSUE_FILES, *DERIVED_VOLUME_KEYS)
 THRESHOLD_MODES: tuple[str, ...] = ("profiled", "sampled")
 DEFAULT_THRESHOLD_MODE = "sampled"
 FIXED_THRESHOLDS: tuple[float, float] = (TAU_CORE, TAU_EDEMA)  # 0.6 / 0.3
+FIXED_NECROTIC_THRESHOLD = TAU_EDEMA  # 0.3, the fixed threshold of the necrotic region
 THRESHOLD_GRID_CORE: tuple[float, ...] = tuple(round(0.30 + 0.05 * i, 2) for i in range(12))  # 0.30..0.85
 THRESHOLD_GRID_EDEMA: tuple[float, ...] = tuple(round(0.10 + 0.05 * i, 2) for i in range(11))  # 0.10..0.60
+# The necrotic grid: the edema and the core grids joined, 0.10..0.85 (the
+# necrotic density stays below the core densities, so its grid starts lower).
+THRESHOLD_GRID_NECROTIC: tuple[float, ...] = tuple(sorted(set(THRESHOLD_GRID_EDEMA) | set(THRESHOLD_GRID_CORE)))
+REGION_GRIDS: dict[str, tuple[float, ...]] = {
+    REGION_CORE: THRESHOLD_GRID_CORE,
+    REGION_WHOLE: THRESHOLD_GRID_EDEMA,
+    REGION_NECROTIC: THRESHOLD_GRID_NECROTIC,
+}
+FIXED_REGION_THRESHOLDS: dict[str, float] = {
+    REGION_CORE: FIXED_THRESHOLDS[0],
+    REGION_WHOLE: FIXED_THRESHOLDS[1],
+    REGION_NECROTIC: FIXED_NECROTIC_THRESHOLD,
+}
+# The qoi.csv column holding a region's row threshold.
+REGION_THRESHOLD_COLUMNS: dict[str, str] = {
+    REGION_CORE: CORE_THRESHOLD_FACTOR,
+    REGION_WHOLE: EDEMA_THRESHOLD_COLUMN,
+    REGION_NECROTIC: NECROTIC_THRESHOLD_FACTOR,
+}
 
 # Run directory files besides Result.save's.
 SNAPSHOT_FIELD = "cell_density"  # the field the run-one snapshots hold
 SNAPSHOT_SUFFIX = f"_{SNAPSHOT_FIELD}.nii.gz"
 TIMELINE_FILE = "timeline.json"
 
-REGIONS: tuple[str, ...] = ("core", "whole")
+REGIONS: tuple[str, ...] = SOLVER_REGIONS[DEFAULT_SOLVER_MODE]
 THRESHOLD_QUANTITIES: tuple[str, ...] = ("dice", "log10_V", "log_vol_ratio", "msd", "hd95")
-THRESHOLD_QOIS: list[str] = [f"{quantity}_{region}" for quantity in THRESHOLD_QUANTITIES for region in REGIONS]
-STAR_QOIS: list[str] = [*(f"dice_star_{region}" for region in REGIONS), "core_threshold_star", "edema_threshold_star"]
 FIXED_SUFFIX = "_fixed"
-FIXED_QOIS: list[str] = [f"{name}{FIXED_SUFFIX}" for name in THRESHOLD_QOIS]
-# The atlas's threshold-free QoIs kept per session (``compute_qois``).
+
+
+def threshold_qoi_names(regions: Sequence[str] = REGIONS) -> list[str]:
+    """The threshold-dependent QoI columns of the regions, unprefixed:
+    <quantity>_<region> for every THRESHOLD_QUANTITIES quantity."""
+    return [f"{quantity}_{region}" for quantity in THRESHOLD_QUANTITIES for region in regions]
+
+
+def star_qoi_names(regions: Sequence[str] = REGIONS) -> list[str]:
+    """The profiled-threshold QoI columns of the regions: dice_star_<region>
+    per region, then the profiled threshold per region
+    (core_threshold_star, edema_threshold_star, necrotic_threshold_star)."""
+    return [*(f"dice_star_{region}" for region in regions), *(f"{REGION_THRESHOLD_COLUMNS[region]}_star" for region in regions)]
+
+
+def fixed_qoi_names(regions: Sequence[str] = REGIONS) -> list[str]:
+    """The threshold QoI columns at the fixed thresholds (suffix _fixed)."""
+    return [f"{name}{FIXED_SUFFIX}" for name in threshold_qoi_names(regions)]
+
+
+def row_threshold_columns(solver_mode: str = DEFAULT_SOLVER_MODE) -> list[str]:
+    """The qoi.csv columns holding the row thresholds, in region order."""
+    return [REGION_THRESHOLD_COLUMNS[region] for region in SOLVER_REGIONS[solver_mode]]
+
+
+THRESHOLD_QOIS: list[str] = threshold_qoi_names(REGIONS)
+STAR_QOIS: list[str] = star_qoi_names(REGIONS)
+FIXED_QOIS: list[str] = fixed_qoi_names(REGIONS)
+# The atlas's threshold-free QoIs kept per session (``compute_qois``), of
+# the solver's moment field (MOMENT_FIELD).
 FIELD_QOIS: list[str] = ["mass", "log10_mass", "centroid_drift", "R_g", "anisotropy", "log10_anisotropy", "wm_fraction"]
 FIELD_ANALYSED_QOIS: list[str] = ["log10_mass", "centroid_drift", "R_g", "log10_anisotropy", "wm_fraction"]
 RUN_QOIS: list[str] = ["dice_mean_core"]
-ROW_THRESHOLD_COLUMNS: list[str] = ["core_threshold", "edema_threshold"]
+ROW_THRESHOLD_COLUMNS: list[str] = row_threshold_columns(DEFAULT_SOLVER_MODE)
 CARRIED_COLUMNS: list[str] = ["voxel_volume", "final_time", "n_steps", "dt", "wall_time_s"]
 STATUS_COLUMNS: list[str] = ["run_name", "success", "exit_code", "wall_time_s", "error", "final_time", "n_steps", "dt"]
 
@@ -447,10 +661,61 @@ ACCOUNTING_NOTE = (
     "mode several rows share one solve); counts prefixed n_blocks_ are Saltelli "
     "blocks of block_size rows. A block is dropped from a QoI's Sobol' analysis "
     "when any of its rows is failed or non-finite for that QoI. A Dice is NaN "
-    "when the model and the reference masks are both empty, a log_vol_ratio when "
-    "the reference is empty, msd / hd95 when either mask is empty, the "
-    "mass-weighted field QoIs when the field's mass is at or below the mass floor."
+    "when the model and the reference masks are both empty (the necrotic Dice "
+    "of the two-species solver whenever the session has no necrotic label), a "
+    "log_vol_ratio when the reference is empty, msd / hd95 when either mask is "
+    "empty, the mass-weighted field QoIs when the field's mass is at or below "
+    "the mass floor."
 )
+
+
+# --- solver modes ---
+
+
+def solver_mode_of(cls: type) -> str:
+    """The mode of SOLVER_MODES whose class is cls (StuppFKPPSolver, the
+    former name of FKPPSolver, resolves to the same class)."""
+    for mode, known in SOLVER_MODES.items():
+        if known is cls:
+            return mode
+    raise ValueError(f"{cls.__name__} is not a solver of this script; known: {list(SOLVER_MODES)}.")
+
+
+def solver_record(solver_mode: str) -> dict[str, Any]:
+    """The spec.json solver record: the mode, the class, the fields saved
+    per session, the fields the QoI step loads, the moment field, the
+    regions and the densities they are thresholded on."""
+    if solver_mode not in SOLVER_MODES:
+        raise ValueError(f"unknown solver mode {solver_mode!r}; known: {list(SOLVER_MODES)}.")
+    return {
+        "mode": solver_mode,
+        "class": SOLVER_MODES[solver_mode].__name__,
+        "fields": list(MODEL_FIELDS[solver_mode]),
+        "qoi_fields": list(QOI_FIELDS[solver_mode]),
+        "moment_field": MOMENT_FIELD[solver_mode],
+        "regions": list(SOLVER_REGIONS[solver_mode]),
+        "densities": REGION_DENSITY_RULE[solver_mode],
+    }
+
+
+def spec_solver_mode(spec: Mapping[str, Any]) -> str:
+    """The solver mode a spec.json records (designs before 2026-10-02 have
+    no solver record and are standard)."""
+    mode = str(spec.get("solver", {}).get("mode", DEFAULT_SOLVER_MODE))
+    if mode not in SOLVER_MODES:
+        raise ValueError(f"spec.json names the solver mode {mode!r}; known: {list(SOLVER_MODES)}.")
+    return mode
+
+
+def spec_regions(spec: Mapping[str, Any]) -> tuple[str, ...]:
+    """The regions a spec.json's design scores (the solver's, for a spec
+    without the entry)."""
+    return tuple(spec.get("regions", SOLVER_REGIONS[spec_solver_mode(spec)]))
+
+
+def resolve_default(given: str | None, defaults: Mapping[str, Path], solver_mode: str) -> Path:
+    """A path argument: the given one, or the solver mode's default."""
+    return Path(given) if given else defaults[solver_mode]
 
 
 # --- sessions and patient files ---
@@ -739,9 +1004,7 @@ def check_patient_data(data: PatientData) -> dict[str, Any]:
         }
         note = ""
         if session.id == data.preop.id:
-            relabelled = relabel_preop(segmentation)
-            entry["label_counts_after_relabel"] = _label_counts(relabelled)
-            note = f"; after 4 -> 3: {entry['label_counts_after_relabel']}"
+            check_preop_labels(segmentation, entry["file"])
         else:
             corrected, n_relabelled = correct_cavity_labels(segmentation, earlier_cavity)
             entry["n_necrotic_relabelled_cavity"] = n_relabelled
@@ -789,11 +1052,38 @@ def check_patient_data(data: PatientData) -> dict[str, Any]:
     return record
 
 
-def relabel_preop(segmentation: NDArray) -> NDArray:
-    """The pre-op segmentation with PREOP_RELABEL applied (4 -> 3)."""
-    out = np.array(segmentation, dtype=np.int64, copy=True)
-    for source, target in PREOP_RELABEL.items():
-        out[segmentation == source] = target
+def check_preop_labels(segmentation: NDArray, name: str = "") -> NDArray:
+    """
+    The pre-op segmentation as an array, refused when it contains label
+    LABEL_CAVITY: before the resection a cavity is a prior surgery's, not
+    tumour, and no reading of it as a tumour label is defensible.
+
+    Raises:
+        ValueError: Label-4 voxels in the segmentation.
+    """
+    segmentation = np.asarray(segmentation)
+    n_cavity = int((segmentation == LABEL_CAVITY).sum())
+    if n_cavity:
+        where = f"{name}: " if name else ""
+        raise ValueError(
+            f"{where}the pre-op segmentation has {n_cavity} label-{LABEL_CAVITY} (cavity) voxels; a pre-op "
+            "segmentation must not contain a cavity (a prior surgery's cavity is not tumour)."
+        )
+    return segmentation
+
+
+def comparable_label_conventions(conventions: Mapping[str, Any] | None) -> dict[str, Any]:
+    """
+    A recorded label_conventions dict made comparable with the script's
+    LABEL_CONVENTIONS: the legacy key "preop_relabel" (until 2026-10-02 a
+    pre-op label 4 was relabelled 3) is dropped and "preop_cavity" set
+    to the present text, because a design or fit that loads today passed
+    ``check_preop_labels`` and so had no pre-op label 4 to relabel: its
+    masks are the ones the present rule gives.
+    """
+    out = dict(conventions or {})
+    out.pop("preop_relabel", None)
+    out["preop_cavity"] = LABEL_CONVENTIONS["preop_cavity"]
     return out
 
 
@@ -1199,27 +1489,37 @@ def _ranges(values: Iterable[int]) -> str:
 # --- search space ---
 
 
-def read_patient_search_space(path: str | Path, threshold_mode: str) -> tuple[SearchSpace, dict[str, Any]]:
+def read_patient_search_space(
+    path: str | Path, threshold_mode: str, solver_mode: str = DEFAULT_SOLVER_MODE
+) -> tuple[SearchSpace, dict[str, Any]]:
     """
     The search space of a design: the file's entries with the "cheap"
     flags stripped (recorded), the cheap factors dropped in profiled mode,
-    handed to the atlas's ``load_search_space`` with the script factors
-    among the admissible keys.
+    handed to the atlas's ``load_search_space`` with the solver's
+    parameters (SOLVER_MODES) and the solver's script factors
+    (``script_factors``) among the admissible keys; the file's "solver"
+    entry must name the solver's class.
 
     Returns:
-        (space, meta) with meta holding threshold_mode, cheap_factors (in
-        factor order; empty in profiled mode), threshold_factors (the two
-        threshold ranges as read, also in profiled mode) and source.
+        (space, meta) with meta holding threshold_mode, solver_mode,
+        cheap_factors (in factor order; empty in profiled mode),
+        threshold_factors (the threshold ranges as read, also in profiled
+        mode) and source.
 
     Raises:
-        ValueError: The mode is unknown; the file holds a timeline entry
-            or a patient volume; preop_time is not a factor; a cheap
-            factor is not one of THRESHOLD_FACTORS or one of them is not
-            cheap; in sampled mode a threshold factor is not linear
-            within (0, 1] or the ratio's max is not below 1.
+        ValueError: The threshold or the solver mode is unknown; the file
+            holds a timeline entry or a patient volume; preop_time is not
+            a factor; the cheap factors are not exactly the solver's
+            threshold factors (SOLVER_THRESHOLD_FACTORS); in sampled mode
+            a threshold factor is not linear within (0, 1] or the ratio's
+            max is not below 1.
     """
     if threshold_mode not in THRESHOLD_MODES:
         raise ValueError(f"threshold mode must be one of {THRESHOLD_MODES}, got {threshold_mode!r}.")
+    if solver_mode not in SOLVER_MODES:
+        raise ValueError(f"unknown solver mode {solver_mode!r}; known: {list(SOLVER_MODES)}.")
+    cls = SOLVER_MODES[solver_mode]
+    threshold_factors = SOLVER_THRESHOLD_FACTORS[solver_mode]
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"search space not found: {path}")
@@ -1230,9 +1530,10 @@ def read_patient_search_space(path: str | Path, threshold_mode: str) -> tuple[Se
     if forbidden:
         raise ValueError(f"search space {path}: {forbidden} are set per run from the patient's data and may not appear.")
     cheap = [key for key, value in entries.items() if isinstance(value, Mapping) and value.get(CHEAP_KEY)]
-    if sorted(cheap) != sorted(THRESHOLD_FACTORS):
+    if sorted(cheap) != sorted(threshold_factors):
         raise ValueError(
-            f"search space {path}: the factors marked {CHEAP_KEY!r} must be exactly {list(THRESHOLD_FACTORS)}, got {cheap}."
+            f"search space {path}: the factors marked {CHEAP_KEY!r} must be exactly {list(threshold_factors)} "
+            f"(--solver {solver_mode}), got {cheap}."
         )
     stripped: dict[str, Any] = {}
     thresholds: dict[str, Any] = {}
@@ -1244,14 +1545,14 @@ def read_patient_search_space(path: str | Path, threshold_mode: str) -> tuple[Se
                 stripped[key] = entry
         else:
             stripped[key] = value
-    keys = StuppFKPPSolver.config_keys() | set(SCRIPT_FACTORS)
-    space = load_search_space(stripped, keys)
+    keys = cls.config_keys() | set(script_factors(solver_mode))
+    space = load_search_space(stripped, keys, cls.__name__)
     if PREOP_TIME_FACTOR not in space.factors:
         raise ValueError(f"search space {path}: {PREOP_TIME_FACTOR} must be a factor, got {entries.get(PREOP_TIME_FACTOR)!r}.")
     if space.factors[PREOP_TIME_FACTOR].low <= 0:
         raise ValueError(f"search space {path}: {PREOP_TIME_FACTOR} must be positive.")
     if threshold_mode == "sampled":
-        for key in THRESHOLD_FACTORS:
+        for key in threshold_factors:
             factor = space.factors[key]
             if factor.scale != "linear" or factor.low <= 0 or factor.high > 1:
                 raise ValueError(f"search space {path}: {key} must be a linear factor within (0, 1], got {factor}.")
@@ -1260,6 +1561,7 @@ def read_patient_search_space(path: str | Path, threshold_mode: str) -> tuple[Se
     cheap_in_order = [name for name in space.names if name in cheap]
     meta = {
         "threshold_mode": threshold_mode,
+        "solver_mode": solver_mode,
         "cheap_factors": cheap_in_order,
         "threshold_factors": thresholds,
         "source": dict(entries),
@@ -1269,8 +1571,9 @@ def read_patient_search_space(path: str | Path, threshold_mode: str) -> tuple[Se
 
 def solver_values(space: SearchSpace, record: Mapping[str, Any]) -> dict[str, float]:
     """The solver parameter values of a design record: the atlas's
-    ``SearchSpace.solver_values`` without the script factors."""
-    return {key: value for key, value in space.solver_values(record).items() if key not in SCRIPT_FACTORS}
+    ``SearchSpace.solver_values`` without the script factors (of either
+    solver, ALL_SCRIPT_FACTORS; none is a solver parameter)."""
+    return {key: value for key, value in space.solver_values(record).items() if key not in ALL_SCRIPT_FACTORS}
 
 
 # --- seeding and design ---
@@ -1405,22 +1708,28 @@ def make_design(
     patient_root: str | Path = DEFAULT_PATIENT_ROOT,
     session_labels: str | Path = DEFAULT_SESSION_LABELS,
     sessions: str = DEFAULT_SESSIONS,
+    solver_mode: str = DEFAULT_SOLVER_MODE,
 ) -> Path:
     """
     Check the patient's data (STEP 0), build the timeline, sample the
     Saltelli design and write the sweep directory (everything but the
-    runs). Refuses to overwrite an existing directory.
+    runs) for the solver of ``solver_mode`` (SOLVER_MODES; the base config
+    must name its class). Refuses to overwrite an existing directory.
 
     Returns:
         The sweep directory <output_dir>/<name>.
     """
+    if solver_mode not in SOLVER_MODES:
+        raise ValueError(f"unknown solver mode {solver_mode!r}; known: {list(SOLVER_MODES)}.")
+    cls = SOLVER_MODES[solver_mode]
+    regions = SOLVER_REGIONS[solver_mode]
     sweep_dir = Path(output_dir) / name
     if sweep_dir.exists():
         raise FileExistsError(f"{sweep_dir} exists; a design is never overwritten.")
     config_path = Path(config_path).resolve()
     search_space_path = Path(search_space_path).resolve()
     session_labels = Path(session_labels).resolve()
-    base = read_config(config_path, solver=StuppFKPPSolver)
+    base = read_config(config_path, solver=cls)
     all_sessions = read_session_labels(session_labels, patient)
     print(f"session labels {session_labels}, rows of {patient}:")
     for s in all_sessions:
@@ -1436,11 +1745,11 @@ def make_design(
         f"cycle length is {protocol.base_cycle_days} days; this analysis uses {ADJUVANT_CYCLE_DAYS}-day cycles)"
     )
     print(format_timeline(timeline))
-    space, meta = read_patient_search_space(search_space_path, threshold_mode)
+    space, meta = read_patient_search_space(search_space_path, threshold_mode, solver_mode)
     cheap_columns = [space.names.index(f) for f in meta["cheap_factors"]]
     # The config every run shares, at the midpoint of preop_time: its
-    # StuppFKPPSolver instance loads the patient's volumes, resolves the
-    # defaults and validates the schedule and the maps; no solve is run.
+    # solver instance loads the patient's volumes, resolves the defaults
+    # and validates the schedule and the maps; no solve is run.
     preop = space.factors[PREOP_TIME_FACTOR]
     nominal_preop_time = 0.5 * (preop.low + preop.high)
     effective = run_config(base, space, {}, data, timeline, nominal_preop_time)
@@ -1448,7 +1757,7 @@ def make_design(
         "the base config with the search space's overrides, the patient's volumes and the timeline at the "
         f"midpoint of {PREOP_TIME_FACTOR} ({nominal_preop_time:g} days): the config the design-time checks ran on"
     )
-    solver = StuppFKPPSolver(read_config_from_mapping(effective))
+    solver = cls(read_config_from_mapping(effective))
     wm, gm = solver.params["white_matter_pbmap"], solver.params["gray_matter_pbmap"]
     min_tissue_fraction = float(solver.params["min_tissue_fraction"])
     time_step = {key: solver.params[key] for key in TIME_STEP_KEYS}
@@ -1470,11 +1779,11 @@ def make_design(
         for group in space.groups.values()
     }
     preop_seg, _ = load_segmentation(data.preop_segmentation)
-    core = np.isin(relabel_preop(preop_seg), CORE_LABELS)
+    core = np.isin(check_preop_labels(preop_seg, str(data.preop_segmentation)), CORE_LABELS)
     geometry = patient_seed_geometry(wm, gm, core, min_tissue_fraction)
     print(
-        f"seedable voxels: {geometry.n_voxels} (pre-op core {int(core.sum())} voxels of labels {list(CORE_LABELS)} "
-        f"after the relabelling, with wm + gm >= {min_tissue_fraction:g}); box "
+        f"seedable voxels: {geometry.n_voxels} (pre-op core {int(core.sum())} voxels of labels {list(CORE_LABELS)}, "
+        f"with wm + gm >= {min_tissue_fraction:g}); box "
         f"{[round(float(v), 4) for v in geometry.bbox_lo]} .. {[round(float(v), 4) for v in geometry.bbox_hi]}"
     )
     samples = saltelli_design(space.names, log2_n, seed)
@@ -1488,25 +1797,35 @@ def make_design(
         raise RuntimeError(f"dedup gave {len(run_names)} distinct runs, expected N (k_dyn + 2) = {expected_runs}.")
     chemo_total = float(sum(timeline.chemo_schedule[1]))
     log_kill = chemo_budget(space, base, chemo_total)
-    analysed = analysed_qois([s.prefix for s in data.sessions], threshold_mode)
+    analysed = analysed_qois([s.prefix for s in data.sessions], threshold_mode, regions)
+    thresholds: dict[str, Any] = {
+        "fixed": {"core": FIXED_THRESHOLDS[0], "edema": FIXED_THRESHOLDS[1]},
+        "grid_core": list(THRESHOLD_GRID_CORE),
+        "grid_edema": list(THRESHOLD_GRID_EDEMA),
+        "grid_rule": "pairs with edema < core; the best pair maximises dice_core + dice_whole",
+        "factors": meta["threshold_factors"],
+        "edema_threshold": f"{EDEMA_RATIO_FACTOR} * {CORE_THRESHOLD_FACTOR} (sampled mode)",
+    }
+    if REGION_NECROTIC in regions:
+        thresholds["fixed"]["necrotic"] = FIXED_NECROTIC_THRESHOLD
+        thresholds["grid_necrotic"] = list(THRESHOLD_GRID_NECROTIC)
+        thresholds["grid_rule"] += (
+            "; the necrotic threshold is profiled on its own grid (the best value maximises dice_necrotic) and, in "
+            "sampled mode, sampled independently of the core threshold"
+        )
     spec = {
         "name": name,
         "patient": data.record(),
         "session_labels": str(session_labels),
         "sessions_requested": sessions,
-        "label_conventions": LABEL_CONVENTIONS,
+        "solver": solver_record(solver_mode),
+        "regions": list(regions),
+        "label_conventions": label_conventions(solver_mode),
         "data_checks": checks,
         "protocol": protocol.record(),
         "timeline": timeline.record(),
         "threshold_mode": threshold_mode,
-        "thresholds": {
-            "fixed": {"core": FIXED_THRESHOLDS[0], "edema": FIXED_THRESHOLDS[1]},
-            "grid_core": list(THRESHOLD_GRID_CORE),
-            "grid_edema": list(THRESHOLD_GRID_EDEMA),
-            "grid_rule": "pairs with edema < core; the best pair maximises dice_core + dice_whole",
-            "factors": meta["threshold_factors"],
-            "edema_threshold": f"{EDEMA_RATIO_FACTOR} * {CORE_THRESHOLD_FACTOR} (sampled mode)",
-        },
+        "thresholds": thresholds,
         "cheap_factors": meta["cheap_factors"],
         "dedup": {
             "rule": "rows with equal unit-cube coordinates in every non-cheap column share one run (the row_name of the first)",
@@ -1522,7 +1841,7 @@ def make_design(
         "derived_groups": derived_groups,
         "derived_keys": space.derived_keys,
         "extra_keys": space.extra_keys,
-        "script_factors": [f for f in SCRIPT_FACTORS if f in space.factors],
+        "script_factors": [f for f in script_factors(solver_mode) if f in space.factors],
         "base_config": str(config_path),
         "time_step": time_step,
         "seed": int(seed),
@@ -1573,27 +1892,28 @@ def read_config_from_mapping(config: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in config.items() if not key.startswith("_")}
 
 
-def analysed_qois(prefixes: Sequence[str], threshold_mode: str) -> list[str]:
-    """The analysed QoI columns: per session the threshold QoIs, the
-    profiled ones, in sampled mode the fixed-pair ones, and the analysed
-    field QoIs; then the per-run QoIs."""
-    per_session = [*THRESHOLD_QOIS, *STAR_QOIS]
+def analysed_qois(prefixes: Sequence[str], threshold_mode: str, regions: Sequence[str] = REGIONS) -> list[str]:
+    """The analysed QoI columns: per session the threshold QoIs of the
+    regions, the profiled ones, in sampled mode the fixed-threshold ones,
+    and the analysed field QoIs; then the per-run QoIs."""
+    per_session = [*threshold_qoi_names(regions), *star_qoi_names(regions)]
     if threshold_mode == "sampled":
-        per_session += FIXED_QOIS
+        per_session += fixed_qoi_names(regions)
     per_session += FIELD_ANALYSED_QOIS
     return [f"{prefix}{name}" for prefix in prefixes for name in per_session] + list(RUN_QOIS)
 
 
-def session_qoi_names(threshold_mode: str) -> list[str]:
+def session_qoi_names(threshold_mode: str, regions: Sequence[str] = REGIONS) -> list[str]:
     """Every QoI column computed per session, in column order."""
-    names = [*THRESHOLD_QOIS, *STAR_QOIS]
+    names = [*threshold_qoi_names(regions), *star_qoi_names(regions)]
     if threshold_mode == "sampled":
-        names += FIXED_QOIS
+        names += fixed_qoi_names(regions)
     return names + FIELD_QOIS
 
 
-def qoi_columns(prefixes: Sequence[str], threshold_mode: str) -> list[str]:
-    """The qoi.csv columns."""
+def qoi_columns(prefixes: Sequence[str], threshold_mode: str, solver_mode: str = DEFAULT_SOLVER_MODE) -> list[str]:
+    """The qoi.csv columns of a solver's design."""
+    regions = SOLVER_REGIONS[solver_mode]
     return [
         "row_name",
         "run_name",
@@ -1601,9 +1921,9 @@ def qoi_columns(prefixes: Sequence[str], threshold_mode: str) -> list[str]:
         "row",
         "matrix",
         "success",
-        *ROW_THRESHOLD_COLUMNS,
+        *row_threshold_columns(solver_mode),
         *RUN_QOIS,
-        *(f"{prefix}{name}" for prefix in prefixes for name in session_qoi_names(threshold_mode)),
+        *(f"{prefix}{name}" for prefix in prefixes for name in session_qoi_names(threshold_mode, regions)),
         *CARRIED_COLUMNS,
     ]
 
@@ -1681,25 +2001,30 @@ def _save_session_snapshots(
 
 def run_one(config_path: str | Path, run_dir: str | Path, snapshots: Mapping[str, float]) -> int:
     """
-    Solve one run config into run_dir: the time step is resolved first
-    (``StuppFKPPSolver.resolve_time_stepping`` of the config), the
-    session snapshot days follow (``session_snapshot_days``), the solver
-    is built with them as snapshot_times and solved, the frames are saved
-    per session, then ``Result.save`` writes config.json, result.json and
-    the final field (without the initial state; every field rounded for
-    storage) and timeline.json records dt, the moments and the recorded
-    days.
+    Solve one run config into run_dir with the solver its "solver" entry
+    names (SOLVER_MODES; a config naming StuppFKPPSolver runs FKPPSolver):
+    the time step is resolved first (``resolve_time_stepping`` of the
+    config), the session snapshot days follow (``session_snapshot_days``),
+    the solver is built with them as snapshot_times and solved, the
+    frames of every field of MODEL_FIELDS are saved per session
+    (<session>_<field>.nii.gz), then ``Result.save`` writes config.json,
+    result.json and the final fields (without the initial state; every
+    field rounded for storage) and timeline.json records dt, the moments,
+    the recorded days and the files per session ("file" the first field's,
+    "files" every field's).
 
     Returns:
         0 on success, 1 if the solve reports a failure.
     """
     run_dir = Path(run_dir).resolve()
-    config = read_config(config_path, solver=StuppFKPPSolver)
+    config = read_config(config_path)
+    cls = solver_class(str(config.get(SOLVER_KEY, SOLVER_NAME)))
+    fields = MODEL_FIELDS[solver_mode_of(cls)]
     missing = [key for key in DERIVED_VOLUME_KEYS if config.get(key) is None]
     if missing:
         raise ValueError(f"run config {config_path} lacks {missing}: the patient's cavity and dose map must be set.")
     run_dir.mkdir(parents=True, exist_ok=True)
-    probe = StuppFKPPSolver(config)
+    probe = cls(config)
     n_steps, dt = probe.resolve_time_stepping()
     del probe
     days = session_snapshot_days(snapshots, dt)
@@ -1708,12 +2033,15 @@ def run_one(config_path: str | Path, run_dir: str | Path, snapshots: Mapping[str
     if late:
         raise ValueError(f"the snapshots {late} lie beyond the horizon {horizon:g}.")
     config["snapshot_times"] = sorted(set(days.values())) if days else None
-    solver = StuppFKPPSolver(config)
+    solver = cls(config)
     result = solver.solve()
     result.initial_state = {}  # the seed is not kept (design.csv holds its voxel)
     result.final_state = {key: round_field(value) for key, value in result.final_state.items()}
     affine = np.eye(4) if result.affine is None else np.asarray(result.affine, dtype=np.float64)
-    recorded = {} if result.snapshot_times is None else _save_session_snapshots(run_dir, result, days, affine)
+    recorded: dict[str, float] = {}
+    if result.snapshot_times is not None:
+        for field in fields:
+            recorded = _save_session_snapshots(run_dir, result, days, affine, field)
     result.time_series = None  # written above, not by Result.save
     result.save(run_dir)
     write_json(
@@ -1724,12 +2052,15 @@ def run_one(config_path: str | Path, run_dir: str | Path, snapshots: Mapping[str
             "dt_resolved_before_solve": dt,
             "resection_time": float(config["resection_time"]),
             "stopping_time": float(config["resection_time"]) + float(config["time_after_resection"]),
+            "solver": cls.__name__,
+            "fields": list(fields),
             "snapshots": {
                 name: {
                     "moment": float(snapshots[name]),
                     "requested_day": days[name],
                     "recorded_day": recorded.get(name),
-                    "file": snapshot_file(name) if name in recorded else None,
+                    "file": snapshot_file(name, fields[0]) if name in recorded else None,
+                    "files": {field: snapshot_file(name, field) for field in fields} if name in recorded else {},
                 }
                 for name in snapshots
             },
@@ -1878,7 +2209,9 @@ class Reference:
 
     Attributes:
         session: The session id.
-        core: Labels CORE_LABELS (pre-op session) or POSTOP_CORE_LABELS
+        core: The pre-op core labels given to ``reference_masks``
+            (CORE_LABELS for the isotropic model, POSTOP_CORE_LABELS for
+            the two-species one; the pre-op session) or POSTOP_CORE_LABELS
             (later sessions), the cavity excluded.
         whole: Labels WHOLE_LABELS, the cavity excluded.
         valid: The voxels kept: all but the session's label-4 voxels
@@ -1888,6 +2221,8 @@ class Reference:
         n_relabelled: The necrotic voxels the cavity correction turned
             into cavity (0 for the pre-op session or without earlier
             cavities).
+        necrotic: Labels NECROTIC_LABELS after the cavity correction, the
+            cavity excluded (the two-species solver's necrotic region).
     """
 
     session: str
@@ -1896,6 +2231,7 @@ class Reference:
     valid: NDArray
     n_cavity: int
     n_relabelled: int = 0
+    necrotic: NDArray | None = None
 
 
 def correct_cavity_labels(segmentation: NDArray, earlier_cavity: NDArray | None) -> tuple[NDArray, int]:
@@ -1922,55 +2258,67 @@ def correct_cavity_labels(segmentation: NDArray, earlier_cavity: NDArray | None)
 
 
 def reference_masks(
-    segmentation: NDArray, preop: bool, session: str = "", earlier_cavity: NDArray | None = None
+    segmentation: NDArray,
+    preop: bool,
+    session: str = "",
+    earlier_cavity: NDArray | None = None,
+    preop_core_labels: Sequence[int] = CORE_LABELS,
 ) -> Reference:
     """
-    The reference masks of a segmentation: the pre-op one relabelled
-    4 -> 3 and nothing excluded, its core the labels CORE_LABELS; a
+    The reference masks of a segmentation: the pre-op one checked for a
+    cavity (``check_preop_labels``) and nothing excluded, its core the
+    labels ``preop_core_labels`` (CORE_LABELS, the isotropic model's; the
+    two-species model passes POSTOP_CORE_LABELS, PREOP_CORE_LABELS); a
     post-op one corrected with the earlier sessions' cavity
     (``correct_cavity_labels``; None for the first later session) and its
     label-4 voxels then excluded from the masks (and, through ``valid``,
     from the model), its core the labels POSTOP_CORE_LABELS (the
-    enhancing tumour alone). The whole-tumour labels are the same for
-    every session.
+    enhancing tumour alone). The whole-tumour labels and the necrotic
+    labels (NECROTIC_LABELS, after the correction) are the same for every
+    session.
     """
     segmentation = np.asarray(segmentation)
     n_relabelled = 0
     if preop:
-        segmentation = relabel_preop(segmentation)
+        segmentation = check_preop_labels(segmentation, session)
         valid = np.ones(segmentation.shape, dtype=bool)
-        core_labels = CORE_LABELS
+        core_labels: Sequence[int] = preop_core_labels
     else:
         segmentation, n_relabelled = correct_cavity_labels(segmentation, earlier_cavity)
         valid = segmentation != LABEL_CAVITY
         core_labels = POSTOP_CORE_LABELS
     return Reference(
         session=session,
-        core=np.isin(segmentation, core_labels) & valid,
+        core=np.isin(segmentation, list(core_labels)) & valid,
         whole=np.isin(segmentation, WHOLE_LABELS) & valid,
         valid=valid,
         n_cavity=int((~valid).sum()),
         n_relabelled=n_relabelled,
+        necrotic=np.isin(segmentation, NECROTIC_LABELS) & valid,
     )
 
 
-def session_references(segmentations: Sequence[NDArray], sessions: Sequence[Mapping[str, Any]]) -> list[Reference]:
+def session_references(
+    segmentations: Sequence[NDArray], sessions: Sequence[Mapping[str, Any]], preop_core_labels: Sequence[int] = CORE_LABELS
+) -> list[Reference]:
     """
     The reference masks of a design's sessions (spec.json's patient
     sessions: the pre-op one first, then the later ones by date), each
     later session corrected with the union of the cavities of the later
-    sessions before it (``reference_masks``).
+    sessions before it (``reference_masks`` with the pre-op core labels).
 
     Args:
         segmentations: The raw label volumes, one per session, in the
             sessions' order.
         sessions: Records with "id" and "label".
+        preop_core_labels: The pre-op session's core labels
+            (PREOP_CORE_LABELS of the solver).
     """
     references: list[Reference] = []
     earlier_cavity: NDArray | None = None
     for segmentation, session in zip(segmentations, sessions, strict=True):
         preop = session["label"] == LABEL_PREOP
-        reference = reference_masks(segmentation, preop, session["id"], None if preop else earlier_cavity)
+        reference = reference_masks(segmentation, preop, session["id"], None if preop else earlier_cavity, preop_core_labels)
         references.append(reference)
         if not preop:
             cavity = ~reference.valid
@@ -1978,11 +2326,13 @@ def session_references(segmentations: Sequence[NDArray], sessions: Sequence[Mapp
     return references
 
 
-def load_session_references(sessions: Sequence[Mapping[str, Any]]) -> list[Reference]:
+def load_session_references(
+    sessions: Sequence[Mapping[str, Any]], preop_core_labels: Sequence[int] = CORE_LABELS
+) -> list[Reference]:
     """``session_references`` of the sessions' segmentation files
     (records with "id", "label" and "segmentation")."""
     segmentations = [load_segmentation(session["segmentation"])[0] for session in sessions]
-    return session_references(segmentations, sessions)
+    return session_references(segmentations, sessions, preop_core_labels)
 
 
 def dice(a: NDArray, b: NDArray) -> float:
@@ -2051,45 +2401,86 @@ def crop_box(density: NDArray, reference: Reference, min_threshold: float) -> tu
     return tuple(box)  # type: ignore[return-value]
 
 
+def region_densities(fields: Mapping[str, NDArray], solver_mode: str) -> dict[str, NDArray]:
+    """
+    The model densities the regions are thresholded on, by region
+    (REGION_DENSITY_RULE): the standard solver's cell density for the core
+    and the whole tumour; for the two-species solver P (proliferative)
+    for the core, P + N for the whole tumour and N (necrotic) for the
+    necrotic region. The whole density is pointwise at least every other
+    density, so a crop box of the whole density holds every mask.
+    """
+    if solver_mode == "standard":
+        density = np.asarray(fields["cell_density"])
+        return {REGION_CORE: density, REGION_WHOLE: density}
+    if solver_mode == "twospecies":
+        proliferative = np.asarray(fields["proliferative"])
+        necrotic = np.asarray(fields["necrotic"])
+        return {REGION_CORE: proliferative, REGION_WHOLE: proliferative + necrotic, REGION_NECROTIC: necrotic}
+    raise ValueError(f"unknown solver mode {solver_mode!r}; known: {list(SOLVER_MODES)}.")
+
+
+def reference_mask(reference: Reference, region: str) -> NDArray:
+    """The reference mask of a region (core, whole or necrotic)."""
+    masks = {REGION_CORE: reference.core, REGION_WHOLE: reference.whole, REGION_NECROTIC: reference.necrotic}
+    if region not in masks:
+        raise ValueError(f"unknown region {region!r}; known: {list(masks)}.")
+    mask = masks[region]
+    if mask is None:
+        raise ValueError(f"the reference of {reference.session or 'the session'} holds no {region} mask.")
+    return mask
+
+
+def region_dice(model: NDArray, ref: NDArray, region: str) -> float:
+    """``dice`` of a region's masks, with the necrotic convention: the
+    necrotic Dice is NaN whenever the necrotic reference is empty (a
+    session without a necrotic label), not only when both masks are."""
+    if region == REGION_NECROTIC and not np.any(ref):
+        return float("nan")
+    return dice(model, ref)
+
+
 def _region_masks(
-    density: NDArray, reference: Reference, core_threshold: float, edema_threshold: float
+    densities: Mapping[str, NDArray], reference: Reference, thresholds: Mapping[str, float]
 ) -> dict[str, tuple[NDArray, NDArray]]:
-    """(model, reference) masks per region at the given thresholds, the
-    reference's excluded voxels removed from the model."""
+    """(model, reference) masks per region of ``thresholds`` (region ->
+    threshold, in region order): the region's density at or above its
+    threshold, the reference's excluded voxels removed from the model."""
     return {
-        "core": ((density >= float(core_threshold)) & reference.valid, reference.core),
-        "whole": ((density >= float(edema_threshold)) & reference.valid, reference.whole),
+        region: ((np.asarray(densities[region]) >= float(threshold)) & reference.valid, reference_mask(reference, region))
+        for region, threshold in thresholds.items()
     }
 
 
 def threshold_qois(
-    density: NDArray,
+    densities: Mapping[str, NDArray],
     reference: Reference,
     zooms: Sequence[float],
-    core_threshold: float,
-    edema_threshold: float,
+    thresholds: Mapping[str, float],
     distances: bool = True,
 ) -> dict[str, float]:
     """
-    The threshold-dependent QoIs of one session at one threshold pair
-    (THRESHOLD_QOIS): per region the Dice, log10(V_model + dV),
+    The threshold-dependent QoIs of one session at one threshold per
+    region (``threshold_qoi_names`` of the regions of ``thresholds``):
+    per region the Dice (``region_dice``), log10(V_model + dV),
     log10(V_model + dV) - log10(V_reference + dV) (NaN for an empty
     reference), msd and hd95 (``symmetric_surface_distances``; skipped,
     NaN, with distances=False).
 
     Args:
-        density: The session's field (any box holding every mask).
+        densities: The session's region densities (``region_densities``,
+            any box holding every mask).
         reference: The session's masks on the same box.
         zooms: Voxel size per axis in mm.
-        core_threshold: Model core = density >= it.
-        edema_threshold: Model whole = density >= it.
+        thresholds: Region -> threshold, in region order; the model mask
+            of a region is its density >= the threshold.
         distances: Whether the surface distances are computed.
     """
     voxel_volume = float(np.prod(np.asarray(zooms, dtype=np.float64)))
     out: dict[str, float] = {}
-    for region, (model, ref) in _region_masks(density, reference, core_threshold, edema_threshold).items():
+    for region, (model, ref) in _region_masks(densities, reference, thresholds).items():
         n_model, n_ref = int(model.sum()), int(ref.sum())
-        out[f"dice_{region}"] = dice(model, ref)
+        out[f"dice_{region}"] = region_dice(model, ref, region)
         out[f"log10_V_{region}"] = float(np.log10(voxel_volume * (n_model + 1)))
         out[f"log_vol_ratio_{region}"] = (
             out[f"log10_V_{region}"] - float(np.log10(voxel_volume * (n_ref + 1))) if n_ref else float("nan")
@@ -2100,20 +2491,31 @@ def threshold_qois(
     return out
 
 
-def profiled_qois(density: NDArray, reference: Reference) -> dict[str, float]:
+def profiled_qois(densities: Mapping[str, NDArray], reference: Reference, regions: Sequence[str] = REGIONS) -> dict[str, float]:
     """
-    The profiled-threshold QoIs of one session (STAR_QOIS): the Dice of
-    both regions on the grid of ``threshold_pairs`` (dice_core depends
-    on the core threshold only, dice_whole on the edema threshold only,
-    so each is evaluated once per threshold), the pair maximising
-    dice_core + dice_whole (the first in grid order on a tie; a region
-    whose Dice is NaN on the whole grid, the model and the reference both
-    empty at every threshold, is left out of the objective; an empty
-    reference against a nonempty model is a Dice of 0, not NaN) and the
-    two Dice at that pair.
+    The profiled-threshold QoIs of one session (``star_qoi_names`` of the
+    regions): the Dice of the core and the whole tumour on the grid of
+    ``threshold_pairs`` (dice_core depends on the core threshold only,
+    dice_whole on the edema threshold only, so each is evaluated once per
+    threshold), the pair maximising dice_core + dice_whole (the first in
+    grid order on a tie; a region whose Dice is NaN on the whole grid,
+    the model and the reference both empty at every threshold, is left
+    out of the objective; an empty reference against a nonempty model is
+    a Dice of 0, not NaN) and the two Dice at that pair; with the
+    necrotic region, its Dice on THRESHOLD_GRID_NECROTIC and the
+    threshold maximising it on its own (the first on a tie; the necrotic
+    Dice is NaN at every threshold in a session without a necrotic label,
+    ``region_dice``, and the necrotic QoIs are NaN then).
     """
-    dice_core = {t: dice((density >= t) & reference.valid, reference.core) for t in THRESHOLD_GRID_CORE}
-    dice_whole = {t: dice((density >= t) & reference.valid, reference.whole) for t in THRESHOLD_GRID_EDEMA}
+    grid = {
+        region: {
+            t: region_dice((np.asarray(densities[region]) >= t) & reference.valid, reference_mask(reference, region), region)
+            for t in REGION_GRIDS[region]
+        }
+        for region in regions
+    }
+    out = {name: float("nan") for name in star_qoi_names(regions)}
+    dice_core, dice_whole = grid[REGION_CORE], grid[REGION_WHOLE]
     use_core = any(np.isfinite(v) for v in dice_core.values())
     use_whole = any(np.isfinite(v) for v in dice_whole.values())
     best_pair: tuple[float, float] | None = None
@@ -2123,15 +2525,20 @@ def profiled_qois(density: NDArray, reference: Reference) -> dict[str, float]:
             objective = (dice_core[core] if use_core else 0.0) + (dice_whole[edema] if use_whole else 0.0)
             if objective > best:
                 best, best_pair = objective, (core, edema)
-    if best_pair is None:
-        return {name: float("nan") for name in STAR_QOIS}
-    core, edema = best_pair
-    return {
-        "dice_star_core": dice_core[core] if use_core else float("nan"),
-        "dice_star_whole": dice_whole[edema] if use_whole else float("nan"),
-        "core_threshold_star": core,
-        "edema_threshold_star": edema,
-    }
+    if best_pair is not None:
+        core, edema = best_pair
+        out["dice_star_core"] = dice_core[core] if use_core else float("nan")
+        out["dice_star_whole"] = dice_whole[edema] if use_whole else float("nan")
+        out["core_threshold_star"] = core
+        out["edema_threshold_star"] = edema
+    if REGION_NECROTIC in regions:
+        dice_necrotic = grid[REGION_NECROTIC]
+        finite = [(t, v) for t, v in dice_necrotic.items() if np.isfinite(v)]
+        if finite:
+            best_t = max(finite, key=lambda item: item[1])[0]  # max keeps the first of equal values
+            out["dice_star_necrotic"] = dice_necrotic[best_t]
+            out["necrotic_threshold_star"] = best_t
+    return out
 
 
 def field_qois(density: NDArray, zooms: Sequence[float], seed_voxel: Sequence[int], wm: NDArray) -> dict[str, float]:
@@ -2141,49 +2548,69 @@ def field_qois(density: NDArray, zooms: Sequence[float], seed_voxel: Sequence[in
     return {name: qois[name] for name in (*FIELD_QOIS, "voxel_volume")}
 
 
-_REFERENCE_CACHE: dict[tuple[str, ...], list[Reference]] = {}
+_REFERENCE_CACHE: dict[tuple[Any, ...], list[Reference]] = {}
 
 
-def _cached_references(sessions: Sequence[Mapping[str, Any]]) -> list[Reference]:
+def _cached_references(sessions: Sequence[Mapping[str, Any]], preop_core_labels: Sequence[int] = CORE_LABELS) -> list[Reference]:
     """The design's reference masks (``load_session_references``),
-    cached per process on the segmentation files."""
-    key = tuple(str(session["segmentation"]) for session in sessions)
+    cached per process on the segmentation files and the pre-op core
+    labels."""
+    key = (tuple(int(label) for label in preop_core_labels), *(str(session["segmentation"]) for session in sessions))
     if key not in _REFERENCE_CACHE:
-        _REFERENCE_CACHE[key] = load_session_references(sessions)
+        _REFERENCE_CACHE[key] = load_session_references(sessions, preop_core_labels)
     return _REFERENCE_CACHE[key]
 
 
 def session_records(
-    density: NDArray,
+    densities: Mapping[str, NDArray],
+    moment: NDArray,
     reference: Reference,
     zooms: Sequence[float],
     seed_voxel: Sequence[int],
     wm: NDArray,
-    row_thresholds: Sequence[tuple[float, float]],
+    row_thresholds: Sequence[Mapping[str, float]],
     threshold_mode: str,
     min_threshold: float,
+    regions: Sequence[str] = REGIONS,
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
     """
-    The QoIs of one session field for the rows sharing its run: the
-    run-level QoIs (STAR_QOIS, in sampled mode the fixed-pair FIXED_QOIS,
-    FIELD_QOIS and voxel_volume) and, per row, the THRESHOLD_QOIS at that
-    row's (core, edema) pair; everything but the field QoIs on the crop
-    box (``crop_box``).
+    The QoIs of one session for the rows sharing its run: the run-level
+    QoIs (``star_qoi_names``, in sampled mode the fixed-threshold
+    ``fixed_qoi_names``, FIELD_QOIS of the moment field and voxel_volume)
+    and, per row, the ``threshold_qoi_names`` at that row's thresholds;
+    everything but the field QoIs on the crop box of the whole density
+    (``crop_box``, which holds every region's masks).
+
+    Args:
+        densities: The session's region densities (``region_densities``)
+            on the full grid.
+        moment: The field the moment QoIs are computed on (MOMENT_FIELD).
+        row_thresholds: Per row, region -> threshold.
+        regions: The regions scored, in order.
 
     Returns:
         (shared, per_row), unprefixed names.
     """
-    box = crop_box(density, reference, min_threshold)
-    cropped = density[box]
+    box = crop_box(densities[REGION_WHOLE], reference, min_threshold)
+    cropped = {region: np.asarray(densities[region])[box] for region in regions}
     cropped_reference = Reference(
-        reference.session, reference.core[box], reference.whole[box], reference.valid[box], reference.n_cavity
+        reference.session,
+        reference.core[box],
+        reference.whole[box],
+        reference.valid[box],
+        reference.n_cavity,
+        reference.n_relabelled,
+        None if reference.necrotic is None else reference.necrotic[box],
     )
-    shared = profiled_qois(cropped, cropped_reference)
+    shared = profiled_qois(cropped, cropped_reference, regions)
     if threshold_mode == "sampled":
-        fixed = threshold_qois(cropped, cropped_reference, zooms, *FIXED_THRESHOLDS)
+        fixed = threshold_qois(cropped, cropped_reference, zooms, {region: FIXED_REGION_THRESHOLDS[region] for region in regions})
         shared.update({f"{name}{FIXED_SUFFIX}": value for name, value in fixed.items()})
-    shared.update(field_qois(density, zooms, seed_voxel, wm))
-    per_row = [threshold_qois(cropped, cropped_reference, zooms, core, edema) for core, edema in row_thresholds]
+    shared.update(field_qois(moment, zooms, seed_voxel, wm))
+    per_row = [
+        threshold_qois(cropped, cropped_reference, zooms, {region: float(thresholds[region]) for region in regions})
+        for thresholds in row_thresholds
+    ]
     return shared, per_row
 
 
@@ -2196,19 +2623,24 @@ def run_qoi_records(
     wm_zooms: Sequence[float],
     threshold_mode: str,
     min_threshold: float,
+    solver_mode: str = DEFAULT_SOLVER_MODE,
 ) -> list[dict[str, Any]]:
     """
     The qoi.csv records of the rows sharing one run: the design
-    bookkeeping, the row thresholds (the fixed pair in profiled mode, the
-    sampled pair in sampled mode), the carried columns of result.json
-    and, for a successful run with every session field, the session QoIs
-    under the session prefixes and dice_mean_core. A run without a
-    session's field is recorded as failed for every row.
+    bookkeeping, the row thresholds per region (the fixed ones in
+    profiled mode, the sampled ones in sampled mode;
+    ``row_threshold_columns``), the carried columns of result.json and,
+    for a successful run with every session field of QOI_FIELDS, the
+    session QoIs under the session prefixes and dice_mean_core. A run
+    without a session's field is recorded as failed for every row.
 
     Args:
         sessions: spec.json's patient sessions (id, label, segmentation)
             in order.
+        solver_mode: The design's solver (SOLVER_MODES): its fields,
+            regions, moment field and pre-op core labels.
     """
+    regions = SOLVER_REGIONS[solver_mode]
     run_dir = sweep_dir / "runs" / run_name
     saved = run_records(run_dir, False)  # a patient run is always treated
     records: list[dict[str, Any]] = []
@@ -2222,28 +2654,43 @@ def run_qoi_records(
             "success": False,
         }
         if threshold_mode == "sampled":
-            record["core_threshold"] = float(row[CORE_THRESHOLD_FACTOR])
-            record["edema_threshold"] = float(row[EDEMA_THRESHOLD_COLUMN])
+            record[CORE_THRESHOLD_FACTOR] = float(row[CORE_THRESHOLD_FACTOR])
+            record[EDEMA_THRESHOLD_COLUMN] = float(row[EDEMA_THRESHOLD_COLUMN])
+            if REGION_NECROTIC in regions:
+                record[NECROTIC_THRESHOLD_FACTOR] = float(row[NECROTIC_THRESHOLD_FACTOR])
         else:
-            record["core_threshold"], record["edema_threshold"] = FIXED_THRESHOLDS
+            for region in regions:
+                record[REGION_THRESHOLD_COLUMNS[region]] = FIXED_REGION_THRESHOLDS[region]
         record.update({key: saved.get(key) for key in ("final_time", "n_steps", "dt", "wall_time_s")})
         records.append(record)
     if not saved["success"]:
         return records
-    fields = {s["id"]: run_dir / snapshot_file(s["id"]) for s in sessions}
-    missing = [sid for sid, path in fields.items() if not path.is_file()]
+    files = {s["id"]: {field: run_dir / snapshot_file(s["id"], field) for field in QOI_FIELDS[solver_mode]} for s in sessions}
+    missing = [path.name for per_field in files.values() for path in per_field.values() if not path.is_file()]
     if missing:
         for record in records:
             record["error"] = f"missing snapshot field(s) {missing}"
         return records
     seed_voxel = tuple(int(rows[0][f"seed_voxel_{ijk}"]) for ijk in "ijk")
-    row_thresholds = [(float(r["core_threshold"]), float(r["edema_threshold"])) for r in records]
+    row_thresholds = [{region: float(r[REGION_THRESHOLD_COLUMNS[region]]) for region in regions} for r in records]
     dice_core_postop: list[list[float]] = [[] for _ in records]
-    for session, reference in zip(sessions, _cached_references(sessions), strict=True):
+    references = _cached_references(sessions, PREOP_CORE_LABELS[solver_mode])
+    for session, reference in zip(sessions, references, strict=True):
         prefix = session["prefix"]
-        density, zooms = _load_field(fields[session["id"]], wm.shape, wm_zooms)
+        loaded = {field: _load_field(path, wm.shape, wm_zooms) for field, path in files[session["id"]].items()}
+        arrays = {field: density for field, (density, _) in loaded.items()}
+        zooms = next(iter(loaded.values()))[1]
         shared, per_row = session_records(
-            density, reference, zooms, seed_voxel, wm, row_thresholds, threshold_mode, min_threshold
+            region_densities(arrays, solver_mode),
+            arrays[MOMENT_FIELD[solver_mode]],
+            reference,
+            zooms,
+            seed_voxel,
+            wm,
+            row_thresholds,
+            threshold_mode,
+            min_threshold,
+            regions,
         )
         for record, own, collected in zip(records, per_row, dice_core_postop):
             record.update({f"{prefix}{name}": value for name, value in shared.items() if name != "voxel_volume"})
@@ -2257,11 +2704,11 @@ def run_qoi_records(
     return records
 
 
-def _qoi_job(job: tuple[str, str, list[dict[str, Any]], list[dict[str, Any]], str, str, float]) -> list[dict[str, Any]]:
+def _qoi_job(job: tuple[str, str, list[dict[str, Any]], list[dict[str, Any]], str, str, float, str]) -> list[dict[str, Any]]:
     """Worker of ``qoi_table``."""
-    sweep_dir, run_name, rows, sessions, wm_path, threshold_mode, min_threshold = job
+    sweep_dir, run_name, rows, sessions, wm_path, threshold_mode, min_threshold, solver_mode = job
     wm, zooms = _load_wm(wm_path)
-    return run_qoi_records(Path(sweep_dir), run_name, rows, sessions, wm, zooms, threshold_mode, min_threshold)
+    return run_qoi_records(Path(sweep_dir), run_name, rows, sessions, wm, zooms, threshold_mode, min_threshold, solver_mode)
 
 
 def spec_sessions(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2271,20 +2718,27 @@ def spec_sessions(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def min_threshold_in_use(spec: Mapping[str, Any]) -> float:
     """The smallest threshold any QoI of the design applies (the crop
-    box's threshold): the grid's and the fixed pair's minima and, in
-    sampled mode, the smallest sampled edema threshold."""
+    box's threshold): the grids' and the fixed thresholds' minima (the
+    necrotic ones among them when the design scores the necrotic region)
+    and, in sampled mode, the smallest sampled edema threshold and the
+    smallest sampled necrotic threshold."""
     thresholds = spec["thresholds"]
     values = [min(thresholds["grid_edema"]), min(thresholds["grid_core"]), thresholds["fixed"]["edema"], thresholds["fixed"]["core"]]
+    if "grid_necrotic" in thresholds:
+        values += [min(thresholds["grid_necrotic"]), thresholds["fixed"]["necrotic"]]
     if spec["threshold_mode"] == "sampled":
         factors = thresholds["factors"]
         values.append(float(factors[CORE_THRESHOLD_FACTOR]["min"]) * float(factors[EDEMA_RATIO_FACTOR]["min"]))
+        if NECROTIC_THRESHOLD_FACTOR in factors:
+            values.append(float(factors[NECROTIC_THRESHOLD_FACTOR]["min"]))
     return float(min(values))
 
 
 def qoi_table(sweep_dir: str | Path, workers: int = 1) -> list[dict[str, Any]]:
     """
     The QoIs of every design row of a sweep directory, in design order
-    (one job per distinct run, the rows sharing it evaluated together).
+    (one job per distinct run, the rows sharing it evaluated together),
+    with the solver spec.json records.
     """
     sweep_dir = Path(sweep_dir)
     spec = read_json(sweep_dir / "spec.json")
@@ -2292,11 +2746,12 @@ def qoi_table(sweep_dir: str | Path, workers: int = 1) -> list[dict[str, Any]]:
     wm_path = str(read_json(sweep_dir / "base_config.json")["white_matter_pbmap"])
     sessions = spec_sessions(spec)
     min_threshold = min_threshold_in_use(spec)
+    solver_mode = spec_solver_mode(spec)
     rows_by_run: dict[str, list[dict[str, Any]]] = {}
     for record in design:
         rows_by_run.setdefault(record["run_name"], []).append(record)
     jobs = [
-        (str(sweep_dir), run, rows, sessions, wm_path, spec["threshold_mode"], min_threshold)
+        (str(sweep_dir), run, rows, sessions, wm_path, spec["threshold_mode"], min_threshold, solver_mode)
         for run, rows in rows_by_run.items()
     ]
     records: list[dict[str, Any]] = []
@@ -2334,15 +2789,20 @@ def qoi_summary(
     """
     successes = [r for r in records if _is_success(r)]
     n_blocks, size = int(spec["N"]), int(spec["block_size"])
+    solver_mode = spec_solver_mode(spec)
+    regions = spec_regions(spec)
     per_session: dict[str, Any] = {}
-    references = {r.session: r for r in load_session_references(spec_sessions(spec))}
+    references = {r.session: r for r in load_session_references(spec_sessions(spec), PREOP_CORE_LABELS[solver_mode])}
     for session in spec_sessions(spec):
         prefix = session["prefix"]
         entry: dict[str, Any] = {
             "n_cavity_excluded": references[session["id"]].n_cavity,
             "n_necrotic_relabelled_cavity": references[session["id"]].n_relabelled,
         }
-        for region in REGIONS:
+        if REGION_NECROTIC in regions:
+            necrotic = references[session["id"]].necrotic
+            entry["n_necrotic_reference"] = 0 if necrotic is None else int(necrotic.sum())
+        for region in regions:
             entry[f"n_nan_dice_{region}"] = sum(1 for r in successes if not np.isfinite(as_float(r.get(f"{prefix}dice_{region}"))))
             entry[f"n_zero_dice_{region}"] = sum(1 for r in successes if as_float(r.get(f"{prefix}dice_{region}")) == 0)
             entry[f"n_nan_log_vol_ratio_{region}"] = sum(
@@ -2368,7 +2828,9 @@ def qoi_summary(
         "n_blocks_total": n_blocks,
         "threshold_mode": spec["threshold_mode"],
         "thresholds": spec["thresholds"],
-        "label_conventions": LABEL_CONVENTIONS,
+        "solver": solver_record(solver_mode),
+        "regions": list(regions),
+        "label_conventions": label_conventions(solver_mode),
         "mass_floor_voxels": MASS_FLOOR_VOXELS,
         "n_nan_dice_mean_core": sum(1 for r in successes if not np.isfinite(as_float(r.get("dice_mean_core")))),
         "per_session": per_session,
@@ -2426,9 +2888,17 @@ def analyze_sweep(
 
 def _add_design_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--search-space", default=str(DEFAULT_SEARCH_SPACE), help=f"search-space JSON (default {DEFAULT_SEARCH_SPACE.name})"
+        "--solver", choices=list(SOLVER_MODES), default=DEFAULT_SOLVER_MODE,
+        help=f"the forward model: standard = {SOLVER_MODES['standard'].__name__}, twospecies = {SOLVER_MODES['twospecies'].__name__} (default {DEFAULT_SOLVER_MODE})",
     )
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="base config JSON")
+    parser.add_argument(
+        "--search-space", default=None,
+        help="search-space JSON (default per --solver: " + ", ".join(f"{m} {p.name}" for m, p in DEFAULT_SEARCH_SPACES.items()) + ")",
+    )
+    parser.add_argument(
+        "--config", default=None,
+        help="base config JSON (default per --solver: " + ", ".join(f"{m} {p.name}" for m, p in DEFAULT_CONFIGS.items()) + ")",
+    )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="parent of the sweep directory")
     parser.add_argument("--name", required=True, help="sweep directory name")
     parser.add_argument("--log2-n", type=int, default=DEFAULT_LOG2_N, help=f"N = 2 ** log2_n base points (default {DEFAULT_LOG2_N})")
@@ -2492,8 +2962,8 @@ def design_command(args: argparse.Namespace) -> Path:
     os.environ["JAX_PLATFORMS"] = "cpu"
     try:
         sweep_dir = make_design(
-            args.search_space,
-            args.config,
+            resolve_default(args.search_space, DEFAULT_SEARCH_SPACES, args.solver),
+            resolve_default(args.config, DEFAULT_CONFIGS, args.solver),
             args.output_dir,
             args.name,
             args.log2_n,
@@ -2503,6 +2973,7 @@ def design_command(args: argparse.Namespace) -> Path:
             args.patient_root,
             args.session_labels,
             args.sessions,
+            solver_mode=args.solver,
         )
     finally:
         if previous is None:
@@ -2511,6 +2982,10 @@ def design_command(args: argparse.Namespace) -> Path:
             os.environ["JAX_PLATFORMS"] = previous
     spec = read_json(sweep_dir / "spec.json")
     print(f"design directory: {sweep_dir}")
+    print(
+        f"solver: {spec['solver']['class']} (--solver {spec['solver']['mode']}); fields saved per session "
+        f"{spec['solver']['fields']}; regions scored {spec['regions']} ({spec['solver']['densities']})"
+    )
     print(
         f"threshold mode {spec['threshold_mode']}: N = {spec['N']} (2^{spec['log2_n']}), k = {spec['k']} "
         f"(k_dyn = {spec['k_dyn']}, cheap: {spec['cheap_factors'] or 'none'}), {spec['n_rows']} rows -> "
@@ -2542,7 +3017,7 @@ def qoi_command(sweep_dir: Path, workers: int) -> None:
     """The qoi subcommand: qoi.csv and qoi_summary.json."""
     spec = read_json(sweep_dir / "spec.json")
     records = qoi_table(sweep_dir, workers)
-    columns = qoi_columns([s["prefix"] for s in spec_sessions(spec)], spec["threshold_mode"])
+    columns = qoi_columns([s["prefix"] for s in spec_sessions(spec)], spec["threshold_mode"], spec_solver_mode(spec))
     write_csv(sweep_dir / "qoi.csv", records, columns)
     status_path = sweep_dir / "run_status.csv"
     status_records = read_csv(status_path) if status_path.is_file() else []

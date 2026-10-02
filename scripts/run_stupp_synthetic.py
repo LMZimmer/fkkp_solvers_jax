@@ -6,7 +6,7 @@ The counterpart of scripts/run_stupp_example.py without patient data: the
 tissue maps default to reference_solves/{wm,gm}_pbmap.nii.gz and the cavity
 and dose map are derived from the simulation itself instead of segmentations
 and a planning dose. Two solves with the config's parameters
-(scripts/stupp_config_example.json by default; its volume entries
+(fisher_kpp_jax/search_spaces/stupp_config_example.json by default; its volume entries
 white_matter_pbmap, gray_matter_pbmap, resection_cavity and rt_dose are
 ignored and may be null):
 
@@ -73,7 +73,7 @@ from fisher_kpp_jax import SOLVER_KEY, FKPPSolver, StuppFKPPSolver, read_config 
 from fisher_kpp_jax.config import jsonable  # noqa: E402
 from fisher_kpp_jax.util import montage_days, render, select_panels, session_blocks  # noqa: E402
 
-DEFAULT_CONFIG = str(_ROOT / "scripts" / "stupp_config_example.json")
+DEFAULT_CONFIG = str(_ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_config_example.json")
 DEFAULT_WM = str(_ROOT / "reference_solves" / "wm_pbmap.nii.gz")
 DEFAULT_GM = str(_ROOT / "reference_solves" / "gm_pbmap.nii.gz")
 # Right-hemisphere deep white matter around mid-height of the

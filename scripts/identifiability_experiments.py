@@ -180,7 +180,7 @@ min_tissue_fraction), with dV the voxel volume:
 
 Subcommand design (the cohort). The search space is the script's
 (--search-space, fisher_kpp_jax/search_spaces/
-stupp_identifiability_search_space.json): the growth group
+identifiability_search_space.json): the growth group
 (front_speed_mm_per_day 0.03-0.25 mm/day and front_width_mm 1-8 mm,
 both log-uniform), the seed group (seed_peak_density 0.6-1 uniform,
 seed_sigma_mm 1-5 mm log-uniform: the width in mm, independent of the
@@ -922,7 +922,7 @@ sa = load_sensitivity_analysis()
 
 EXPERIMENTS: tuple[str, ...] = ("design", "invariance", "fisher", "substitute", "seedfix", "profile", "dt-check")
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_identifiability")
-DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "stupp_identifiability_search_space.json"
+DEFAULT_SEARCH_SPACE = _ROOT / "fisher_kpp_jax" / "search_spaces" / "identifiability_search_space.json"
 DEFAULT_GPUS: str = str(sa.DEFAULT_GPUS)  # the sensitivity script's slots, "1,2,3,6"
 # The seed voxel of every patient: right-hemisphere deep white matter on
 # the atlas, the voxel scripts/run_stupp_synthetic.py uses (snapped to the

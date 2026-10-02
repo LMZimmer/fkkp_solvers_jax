@@ -1,0 +1,120 @@
+{
+  "solver": "TwoCompartmentWithNutrientFKPPSolver",
+  "_note": "Search space of scripts/patient_sensitivity_analysis.py with --solver twospecies: the Sobol' sensitivity analysis of TwoCompartmentWithNutrientFKPPSolver (proliferative P, necrotic N, nutrient) on one SAILOR patient, written 2026-10-02. The format and the loader are those of patient_SA_v2_search_space.json (the isotropic patient space): one entry per swept parameter ({\"min\", \"max\", \"scale\"}, \"log\" as 10 ** (log10 min + u (log10 max - log10 min)), \"linear\" as min + u (max - min)), per fixed override (a plain JSON value written into every run config) or per derived factor group (an entry with \"derives\" and one range per sampled factor of the derivation registered in scripts/sensitivity_analysis.py); keys starting with '_' are comments; \"solver\" is checked against the class of --solver. Every entry of the isotropic file is kept with its range, scale and reasons (its _revision, _scales, _growth_band, _preop_time, _chemo, _chemo_decay_rate, _seed, _seed_band, _thresholds, _units and _sources apply here unchanged and are not repeated): the groups \"growth\" and \"seed\", preop_time, diffusivity_ratio, chemo_kill_rate, chemo_decay_rate 9.24, rt_alpha, rt_alpha_beta_ratio, the three seed fractions, gaussian_seed_scale 1, core_threshold and edema_threshold_ratio. Added are the four two-compartment parameters necrosis_rate, nutrient_threshold, nutrient_diffusivity and nutrient_consumption_rate as plain factors with the ranges of the CMA-ES fit's patient_fit_search_space_twospecies.json (see _twospecies) and a third cheap threshold factor necrotic_threshold (see _thresholds). The script factors are preop_time and the three cheap threshold factors; the timeline entries (resection_time, time_after_resection, chemo_times, chemo_doses, rt_times, snapshot_times), the tissue maps, resection_cavity and rt_dose may not appear here, the script sets them per run from the patient's data. Everything not listed comes from the base config given on the command line (fisher_kpp_jax/configs/TwoCompartmentWithNutrientFKPPSolver_stupp.json by default: its max_tumor_occupancy 0.9, nt_multiplier 8, min_tissue_fraction 0.1, gaussian_seed_floor 0.1, steps_per_day 12, the protocol doses and the response entries). Design size in --threshold-mode sampled: k = 19 factors (16 the solve depends on, 3 cheap), so N (k + 2) rows and N (k_dyn + 2) distinct solves, 21 504 and 18 432 at the default N = 1024 (the isotropic file: 16 384 and 14 336).",
+  "_growth_band": "D = v lambda / 2 and rho = v / (2 lambda) from the front speed v = front_speed_mm_per_day and the width lambda = front_width_mm, as in the isotropic file. In the two-compartment model the growth term is rho * nutrient * P (1 - P - N), so v and lambda are the speed and width of a WELL-FED front (nutrient 1); where the nutrient is depleted the front is slower and the derivation is a parametrisation, not the model's front. The implied D range [0.015, 1.0] mm^2/day and rho range [0.001875, 0.125] /day are the isotropic file's and pass the design step's bounds.",
+  "_twospecies": "The four two-compartment parameters, swept for the first time in a sensitivity analysis (the class config carries placeholders; every range is a design choice, no literature value is claimed), with the ranges of the CMA-ES fit's patient_fit_search_space_twospecies.json (2026-10-01). necrosis_rate (1/day, log-uniform 0.01-1.0): the rate at which proliferative cells turn necrotic where the nutrient is below nutrient_threshold (a smooth switch of steepness 50 in the solver); the range spans necrosis time scales of 1 to 100 days. nutrient_threshold (nutrient level, uniform 0.1-0.9): the nutrient starts at 1 inside tissue and is only consumed, so the switch level is a fraction of the initial supply; the band leaves out the ends where the switch never (below 0.1) or always (above 0.9) fires in a consumed region. nutrient_diffusivity (mm^2/day, log-uniform 0.01-1.0) and nutrient_consumption_rate (1/day per unit P, log-uniform 0.01-1.0): together they set the depletion length sqrt(nutrient_diffusivity / nutrient_consumption_rate) of the nutrient around a dense tumour, here 0.1 to 10 mm, the scale on which a necrotic core forms inside a tumour of a few centimetres. Time step: the solver's stability rule for this class is n_steps >= stopping_time * max(white_matter_diffusivity, nutrient_diffusivity) / h^2 * nt_multiplier (8) + 300 with h = 1 mm; at the base config's 12 steps per day and the sweep's horizons (preop_time plus the patient's last-session offset, at least about 230 days for sub-01) the rule stays below 12 steps per day for every nutrient diffusivity of the range, and where it does not the run step raises the count per run and records the step in timeline.json and the dt column of qoi.csv. The consumption cap 1.0 /day keeps the explicit reaction step stable at dt = 1/12 day. Unlike the fit, which starts its CMA-ES at a well-fed point because the midpoint of these ranges is a starved tumour whose post-op proliferative core is empty, the Sobol' design covers the ranges uniformly on purpose: a starved tumour is an outcome the analysis is meant to attribute, and an empty model core shows as a zero Dice counted per session in qoi_summary.json.",
+  "_thresholds": "Three cheap factors (\"cheap\": true: the solve does not depend on them; in --threshold-mode sampled, the script's default, they are in the design and the run list is deduplicated on the other columns, in --threshold-mode profiled they are dropped and the Dice is evaluated on fixed grids). core_threshold (0.45-0.75, uniform) and edema_threshold_ratio (0.25-0.6, uniform) are the isotropic file's with edema_threshold = edema_threshold_ratio * core_threshold (see its _thresholds); here the model core is P >= core_threshold, compared with the ENHANCING tumour (label 3) in every session, the pre-op one included (the necrotic label is scored by the necrotic region instead; the isotropic model compares its one density with labels 1 and 3 before the surgery), and the model whole tumour is P + N >= edema_threshold compared with labels 1, 2 and 3. necrotic_threshold (0.10-0.85, uniform; the span of the profiled grid 0.10..0.85 step 0.05 of the script and of the CMA-ES fit's --loss core+necrotic, the edema and the core grids joined, lower than the core range because N stays below the core densities) thresholds the necrotic density: the model necrotic region is N >= necrotic_threshold, compared with label 1 after the cavity correction, the session's cavity excluded; it is sampled independently of core_threshold (no ratio relation). In profiled mode the script reports the best pair of the core and the edema grids and, separately, the best value of the necrotic grid; the fixed thresholds reported alongside are 0.6 / 0.3 (core / edema, the isotropic file's) and 0.3 (necrotic). A session without a necrotic label has an undefined necrotic Dice (NaN, counted in qoi_summary.json).",
+  "_units": "front_speed_mm_per_day mm/day; front_width_mm mm; the derived white_matter_diffusivity mm^2/day and rho 1/day; diffusivity_ratio dimensionless; preop_time days from the seed to the pre-op scan; chemo_kill_rate 1/day per mg/m^2; chemo_decay_rate 1/day; rt_alpha 1/Gy; rt_alpha_beta_ratio Gy; necrosis_rate 1/day; nutrient_threshold a nutrient level (fraction of the initial supply); nutrient_diffusivity mm^2/day; nutrient_consumption_rate 1/day per unit proliferative density; seed_peak_density a cell density (fraction of the carrying capacity); seed_sigma_mm mm (the standard deviation of the seed profile); the derived gaussian_seed_diffusion_time mm^2 and gaussian_seed_mass density times mm^3; core_threshold, edema_threshold_ratio and necrotic_threshold dimensionless (the derived edema_threshold a cell density).",
+  "growth": {
+    "derives": [
+      "white_matter_diffusivity",
+      "rho"
+    ],
+    "front_speed_mm_per_day": {
+      "min": 0.03,
+      "max": 0.25,
+      "scale": "log"
+    },
+    "front_width_mm": {
+      "min": 1.0,
+      "max": 8.0,
+      "scale": "log"
+    }
+  },
+  "seed": {
+    "derives": [
+      "gaussian_seed_mass",
+      "gaussian_seed_diffusion_time"
+    ],
+    "seed_peak_density": {
+      "min": 0.6,
+      "max": 1.0,
+      "scale": "linear"
+    },
+    "seed_sigma_mm": {
+      "min": 5.0,
+      "max": 16.0,
+      "scale": "log"
+    }
+  },
+  "preop_time": {
+    "min": 30.0,
+    "max": 200.0,
+    "scale": "linear"
+  },
+  "diffusivity_ratio": {
+    "min": 1.0,
+    "max": 100.0,
+    "scale": "log"
+  },
+  "chemo_kill_rate": {
+    "min": 5e-05,
+    "max": 0.01,
+    "scale": "log"
+  },
+  "chemo_decay_rate": 9.24,
+  "rt_alpha": {
+    "min": 0.0005,
+    "max": 0.1,
+    "scale": "log"
+  },
+  "rt_alpha_beta_ratio": {
+    "min": 4.0,
+    "max": 12.0,
+    "scale": "linear"
+  },
+  "necrosis_rate": {
+    "min": 0.01,
+    "max": 1.0,
+    "scale": "log"
+  },
+  "nutrient_threshold": {
+    "min": 0.1,
+    "max": 0.9,
+    "scale": "linear"
+  },
+  "nutrient_diffusivity": {
+    "min": 0.01,
+    "max": 1.0,
+    "scale": "log"
+  },
+  "nutrient_consumption_rate": {
+    "min": 0.01,
+    "max": 1.0,
+    "scale": "log"
+  },
+  "gaussian_seed_x_fraction": {
+    "min": 0.0,
+    "max": 1.0,
+    "scale": "linear"
+  },
+  "gaussian_seed_y_fraction": {
+    "min": 0.0,
+    "max": 1.0,
+    "scale": "linear"
+  },
+  "gaussian_seed_z_fraction": {
+    "min": 0.0,
+    "max": 1.0,
+    "scale": "linear"
+  },
+  "gaussian_seed_scale": 1.0,
+  "core_threshold": {
+    "min": 0.45,
+    "max": 0.75,
+    "scale": "linear",
+    "cheap": true
+  },
+  "edema_threshold_ratio": {
+    "min": 0.25,
+    "max": 0.6,
+    "scale": "linear",
+    "cheap": true
+  },
+  "necrotic_threshold": {
+    "min": 0.1,
+    "max": 0.85,
+    "scale": "linear",
+    "cheap": true
+  }
+}

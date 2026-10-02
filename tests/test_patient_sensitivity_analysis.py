@@ -8,7 +8,7 @@ t3, the adjuvant start at t3 + 69, 28-day cycles of 5 days on with the
 config's per-cycle doses, truncation at the last session, every model
 day shifted by preop_time, the CRT-relative offsets and the anchor line
 of the spec record), the protocol doses read from the shipped base
-config, (2) the pre-op relabelling 4 -> 3 and the
+config, (2) the refusal of a pre-op label 4 and the
 cavity exclusion in the Dice, (3) Dice / msd / hd95 on toy masks with the
 empty-mask conventions, (4) the threshold-pair grid, the profiled
 thresholds and the row thresholds on a synthetic field, (5) the
@@ -34,7 +34,7 @@ from fisher_kpp_jax import StuppFKPPSolver, read_config
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "patient_sensitivity_analysis.py"
 # The script's default (v2, 2026-09-17).
-SEARCH_SPACE = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "search_spaces" / "sailor_patient_v2_search_space.json"
+SEARCH_SPACE = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "search_spaces" / "patient_SA_v2_search_space.json"
 BASE_CONFIG = Path(__file__).resolve().parent.parent / "fisher_kpp_jax" / "configs" / "FKPPSolver_stupp.json"
 # The ranges v2 widened against its predecessor (patient-fit priors widened toward non-response).
 V2_CHANGES = {
@@ -244,16 +244,33 @@ def test_session_parsing_and_selection():
 # --- (2) relabelling and cavity exclusion ---
 
 
-def test_relabel_preop_and_cavity_exclusion():
+
+def _single(density):
+    """The region densities of the isotropic model: one field for both regions."""
+    return {"core": density, "whole": density}
+
+
+def _pair(core, edema):
+    """The row thresholds of the two regions."""
+    return {"core": core, "whole": edema}
+
+
+def test_preop_label4_refused_and_cavity_exclusion():
     seg = np.zeros((6, 6, 6), dtype=np.int64)
     seg[1:3, 1:3, 1:3] = 4  # cavity, 8 voxels
     seg[3:5, 1:3, 1:3] = 1  # necrotic, 8 voxels
     seg[1:5, 3:5, 1:3] = 2  # edema, 16 voxels
     seg[1:5, 1:3, 3:5] = 3  # enhancing, 16 voxels
-    relabelled = psa.relabel_preop(seg)
-    assert not (relabelled == 4).any() and (relabelled == 3).sum() == 24 and (seg == 4).sum() == 8
-    # Pre-op: the core is the necrotic and the enhancing tumour (4 -> 3).
-    preop = psa.reference_masks(seg, preop=True)
+    # A pre-op segmentation with a cavity is refused (no relabelling).
+    with pytest.raises(ValueError, match="8 label-4"):
+        psa.check_preop_labels(seg, "preop")
+    with pytest.raises(ValueError):
+        psa.reference_masks(seg, preop=True)
+    # Pre-op without the cavity block: the core is the necrotic and the
+    # enhancing tumour, nothing excluded.
+    preop_seg = np.where(seg == 4, 3, seg)
+    assert psa.check_preop_labels(preop_seg) is not None
+    preop = psa.reference_masks(preop_seg, preop=True)
     assert preop.n_cavity == 0 and preop.valid.all()
     assert preop.core.sum() == 32 and preop.whole.sum() == 48
     # Post-op: the cavity is excluded, the core is the enhancing tumour
@@ -269,11 +286,11 @@ def test_relabel_preop_and_cavity_exclusion():
     density = np.zeros(seg.shape)
     density[1:3, 1:3, 1:3] = 1.0
     density[1:5, 1:3, 3:5] = 1.0
-    qois = psa.threshold_qois(density, postop, (1.0, 1.0, 1.0), 0.6, 0.3, distances=False)
+    qois = psa.threshold_qois(_single(density), postop, (1.0, 1.0, 1.0), _pair(0.6, 0.3), distances=False)
     assert qois["dice_core"] == pytest.approx(1.0)
     assert qois["log10_V_core"] == pytest.approx(np.log10(16 + 1))
     assert qois["log_vol_ratio_core"] == pytest.approx(0.0)
-    qois_pre = psa.threshold_qois(density, preop, (1.0, 1.0, 1.0), 0.6, 0.3, distances=False)
+    qois_pre = psa.threshold_qois(_single(density), preop, (1.0, 1.0, 1.0), _pair(0.6, 0.3), distances=False)
     assert qois_pre["dice_core"] == pytest.approx(2 * 24 / (24 + 32)) and qois_pre["log10_V_core"] == pytest.approx(np.log10(25))
 
 
@@ -315,7 +332,7 @@ def test_threshold_qois_empty_conventions():
     seg[2:5, 2:5, 2:5] = 2  # edema only: the reference core is empty
     reference = psa.reference_masks(seg, preop=False)
     density = np.zeros(seg.shape)
-    qois = psa.threshold_qois(density, reference, zooms, 0.6, 0.3)
+    qois = psa.threshold_qois(_single(density), reference, zooms, _pair(0.6, 0.3))
     assert np.isnan(qois["dice_core"])  # both empty
     assert qois["dice_whole"] == 0.0  # model empty, reference not
     assert np.isnan(qois["log_vol_ratio_core"]) and np.isfinite(qois["log_vol_ratio_whole"])
@@ -349,33 +366,33 @@ def test_profiled_thresholds_on_synthetic_field():
     seg[density >= 0.2] = 2
     seg[density >= 0.55] = 3
     reference = psa.reference_masks(seg, preop=True)
-    star = psa.profiled_qois(density, reference)
+    star = psa.profiled_qois(_single(density), reference)
     assert star["core_threshold_star"] == 0.55 and star["edema_threshold_star"] == 0.20
     assert star["dice_star_core"] == pytest.approx(1.0) and star["dice_star_whole"] == pytest.approx(1.0)
     # The row thresholds 0.6 / 0.3 give smaller model masks and Dice below 1.
-    qois = psa.threshold_qois(density, reference, (1.0, 1.0, 1.0), 0.6, 0.3)
+    qois = psa.threshold_qois(_single(density), reference, (1.0, 1.0, 1.0), _pair(0.6, 0.3))
     assert 0 < qois["dice_core"] < 1 and 0 < qois["dice_whole"] < 1
     assert qois["log_vol_ratio_core"] < 0 and qois["msd_core"] > 0 and qois["hd95_core"] >= qois["msd_core"]
     # An empty reference core against a nonempty model core is a Dice of 0
     # at every threshold: the whole tumour's best threshold is found, the
     # core's is the first admissible one in grid order, the core's Dice* 0.
     seg_edema = np.where(seg == 3, 2, seg)
-    star = psa.profiled_qois(density, psa.reference_masks(seg_edema, preop=True))
+    star = psa.profiled_qois(_single(density), psa.reference_masks(seg_edema, preop=True))
     assert star["dice_star_core"] == 0.0 and star["dice_star_whole"] == pytest.approx(1.0)
     assert star["edema_threshold_star"] == 0.20 and star["core_threshold_star"] == 0.30
     # An empty field against an empty reference: both masks empty on the
     # whole grid, everything NaN; against the reference, Dice 0 at the
     # first grid pair.
-    star = psa.profiled_qois(np.zeros_like(density), psa.reference_masks(np.zeros_like(seg), preop=True))
+    star = psa.profiled_qois(_single(np.zeros_like(density)), psa.reference_masks(np.zeros_like(seg), preop=True))
     assert all(np.isnan(v) for v in star.values())
-    star = psa.profiled_qois(np.zeros_like(density), reference)
+    star = psa.profiled_qois(_single(np.zeros_like(density)), reference)
     assert star["dice_star_core"] == 0.0 and star["dice_star_whole"] == 0.0
     assert (star["core_threshold_star"], star["edema_threshold_star"]) == psa.threshold_pairs()[0]
     # The crop box holds every mask, and the QoIs on it equal the full-grid ones.
     box = psa.crop_box(density, reference, 0.1)
     cropped = psa.Reference("", reference.core[box], reference.whole[box], reference.valid[box], 0)
-    assert psa.threshold_qois(density[box], cropped, (1.0, 1.0, 1.0), 0.6, 0.3) == pytest.approx(qois, nan_ok=True)
-    assert psa.profiled_qois(density[box], cropped) == pytest.approx(psa.profiled_qois(density, reference), nan_ok=True)
+    assert psa.threshold_qois(_single(density[box]), cropped, (1.0, 1.0, 1.0), _pair(0.6, 0.3)) == pytest.approx(qois, nan_ok=True)
+    assert psa.profiled_qois(_single(density[box]), cropped) == pytest.approx(psa.profiled_qois(_single(density), reference), nan_ok=True)
 
 
 # --- (5) dedup and the sampled thresholds ---
@@ -507,7 +524,8 @@ def test_v2_widened_ranges():
     assert (space.factors["front_width_mm"].low, space.factors["front_width_mm"].high) == (1.0, 8.0)
     assert psa.DEFAULT_SEARCH_SPACE == SEARCH_SPACE
     args = psa.build_parser().parse_args(["design", "--name", "x"])
-    assert Path(args.search_space) == SEARCH_SPACE
+    assert args.search_space is None  # resolved per --solver
+    assert psa.resolve_default(args.search_space, psa.DEFAULT_SEARCH_SPACES, args.solver) == SEARCH_SPACE
 
 
 def test_defaults():
@@ -516,8 +534,10 @@ def test_defaults():
     assert psa.DEFAULT_THRESHOLD_MODE == "sampled"
     args = psa.build_parser().parse_args(["design", "--name", "x"])
     assert args.sessions == "02-08" and args.log2_n == 10 and args.threshold_mode == "sampled"
-    assert args.search_space == str(psa.DEFAULT_SEARCH_SPACE) and args.patient == "sub-01"
-    assert psa.DEFAULT_SEARCH_SPACE.name == "sailor_patient_v2_search_space.json"
+    assert args.solver == "standard" and args.search_space is None and args.config is None and args.patient == "sub-01"
+    assert psa.resolve_default(args.search_space, psa.DEFAULT_SEARCH_SPACES, args.solver) == psa.DEFAULT_SEARCH_SPACE
+    assert psa.resolve_default(args.config, psa.DEFAULT_CONFIGS, args.solver) == BASE_CONFIG
+    assert psa.DEFAULT_SEARCH_SPACE.name == "patient_SA_v2_search_space.json"
     assert psa.parse_sessions(args.sessions) == [f"ses-{n:02d}" for n in range(2, 9)]
 
 

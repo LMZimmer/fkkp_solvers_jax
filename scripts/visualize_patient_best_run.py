@@ -39,9 +39,9 @@ later session.
 between the segmented core and the thresholded field over the grid
 0.05..0.95 step 0.01. A number fixes it. Masks follow the sweep
 (``session_references``): the reference core is labels 1 (necrotic) and
-3 (enhancing) in the pre-op session, the pre-op segmentation relabelled
-4 -> 3, and label 3 (enhancing) alone in every post-op session (since
-2026-10-01); the model
+3 (enhancing) in the pre-op session (a pre-op segmentation with label 4
+is refused) and label 3 (enhancing) alone in every post-op session
+(since 2026-10-01); the model
 core is field >= threshold; in a post-op session a necrotic voxel that
 an earlier post-op session labelled cavity counts as cavity, and the
 session's label-4 (cavity) voxels are then removed from both masks. The
@@ -90,14 +90,21 @@ config.json):
   model           the recorded field overlaid (inferno at alpha 0.75 as
                   PredictGBM's prediction overlay, densities below
                   --display-threshold transparent) with the session's
-                  segmented enhancing tumour (label 3, the pre-op 4 -> 3)
-                  as a white contour and the session's cavity (after the
-                  cavity correction, the one the Dice excludes) outlined
-                  in the palette's green; below, the model core
-                  volume per session (cavity excluded), with
-                  --volume-curve the thresholded core volume along the
-                  run (latest scan's mask) as a line through them, the
-                  reference core volumes as hollow markers, and the
+                  segmented tumour core (labels 1 + 3 of the display
+                  labels) as a red contour and, in every post-op and
+                  follow-up panel, the resection cavity (the post-op
+                  session's label 4, the one the solver removed) outlined
+                  in the palette's green, both named in a legend above
+                  the panels ("observed core", "resection cavity"); the
+                  Dice's full exclusion (the session's own cavity and the
+                  earlier sessions' cavities as well) is not drawn;
+                  below, the model core
+                  volume per session
+                  (cavity excluded) as hollow red circles, with --volume-curve
+                  the thresholded core volume along the run (latest
+                  scan's mask) as a dashed red line through them (the
+                  resection line is solid red), the reference
+                  core volumes as filled black squares, and the
                   per-session Dice in each panel
 Written into <output-dir>/<run-name>/ (exist_ok=False, nothing outside
 it): config.json, result.json, initial_cell_density.nii.gz and
@@ -150,6 +157,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import nibabel as nib  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.colors import ListedColormap  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 from numpy.typing import NDArray  # noqa: E402
 from scipy.ndimage import center_of_mass  # noqa: E402
@@ -171,14 +179,14 @@ from patient_sensitivity_analysis import (  # noqa: E402
     Session,
     build_timeline,
     dice,
+    check_preop_labels,
     load_segmentation,
-    relabel_preop,
     run_snapshots,
     session_references,
     session_snapshot_days,
     snapshot_file,
 )
-from patient_cmaes_fit import FIT_LABEL_CONVENTIONS, fit_session_references  # noqa: E402
+from patient_cmaes_fit import fit_session_references, same_label_conventions  # noqa: E402
 from sensitivity_analysis import as_float, read_csv, read_json, round_field, write_json  # noqa: E402
 
 DEFAULT_CRITERION = "dice_mean_core"
@@ -211,9 +219,20 @@ LABEL_COLORS: dict[int, tuple[float, float, float, float]] = {
 SEGMENTATION_ALPHA = 0.6
 FIELD_ALPHA = 0.75
 CAVITY_OUTLINE_COLOR = LABEL_COLORS[LABEL_CAVITY]
-ENHANCING_CONTOUR_COLOR = "white"
-MODEL_COLOR = "black"
+# model.pdf: the session's segmented tumour core (necrotic + enhancing,
+# raw display labels) outlined in red, the corrected cavity in green.
+OBSERVED_CORE_LABELS = (LABEL_NECROTIC, LABEL_ENHANCING)
+OBSERVED_CORE_CONTOUR_COLOR = "red"
+CONTOUR_LEGEND: dict[str, tuple[Any, float]] = {
+    "observed core": (OBSERVED_CORE_CONTOUR_COLOR, 1.2),
+    "resection cavity": (CAVITY_OUTLINE_COLOR, 1.2),
+}
+# segmentations.pdf: the segmented core volumes in red.  model.pdf: the
+# model in red (hollow circles, the curve), the segmented core volumes as
+# filled black squares.
 REFERENCE_COLOR = (0.85, 0.25, 0.10, 1.0)
+MODEL_COLOR = REFERENCE_COLOR
+OBSERVED_COLOR = "black"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -495,7 +514,7 @@ def render_model(
     outfile_stem: Path,
     sessions: list[dict[str, Any]],
     fields: list[NDArray],
-    references: list[Reference],
+    resection_cavity: NDArray,
     labels: list[NDArray],
     backgrounds: list[NDArray],
     z: int,
@@ -512,13 +531,23 @@ def render_model(
     stopping_time: float,
     n_col: int,
 ) -> None:
-    """The model figure: per session the segmented enhancing tumour of the
-    display labels (white) and the session's corrected cavity (green) over
-    the field; the volume curve is drawn only when given."""
+    """The model figure: per session the segmented tumour core of the
+    display labels (necrotic + enhancing, red) and, in every session but
+    the pre-op one, the resection cavity (the post-op session's label-4
+    mask, green) over the field, the two contours named in a frameless
+    legend above the panels; the volume curve is drawn only when given."""
     fig, axes, (bottom, colorbar_ax) = _figure(len(sessions), n_col)
+    fig.legend(
+        handles=[
+            Line2D([], [], color=color, linewidth=width, label=label)
+            for label, (color, width) in CONTOUR_LEGEND.items()
+        ],
+        loc="outside upper center", ncol=len(CONTOUR_LEGEND), fontsize=10, frameon=False,
+    )
     image = None
-    for ax, session, field, reference, label_volume, background, day, value in zip(
-        axes, sessions, fields, references, labels, backgrounds, days, dices, strict=True
+    cavity = np.rot90(np.asarray(resection_cavity, dtype=bool)[:, :, z])
+    for ax, session, field, label_volume, background, day, value in zip(
+        axes, sessions, fields, labels, backgrounds, days, dices, strict=True
     ):
         ax.imshow(np.rot90(background[:, :, z]), cmap="gray", interpolation="none")
         field_slice = np.rot90(field[:, :, z])
@@ -526,11 +555,12 @@ def render_model(
             np.ma.masked_less(field_slice, display_threshold), cmap="inferno", alpha=FIELD_ALPHA,
             vmin=0.0, vmax=1.0, interpolation="none",
         )
-        enhancing = np.rot90((label_volume == LABEL_ENHANCING)[:, :, z])
-        if enhancing.any():
-            ax.contour(enhancing.astype(float), levels=[0.5], colors=[ENHANCING_CONTOUR_COLOR], linewidths=1.0)
-        cavity = np.rot90((~reference.valid)[:, :, z])
-        if cavity.any():
+        observed_core = np.rot90(np.isin(label_volume, OBSERVED_CORE_LABELS)[:, :, z])
+        if observed_core.any():
+            ax.contour(
+                observed_core.astype(float), levels=[0.5], colors=[OBSERVED_CORE_CONTOUR_COLOR], linewidths=1.2
+            )
+        if session["label"] != LABEL_PREOP and cavity.any():
             ax.contour(cavity.astype(float), levels=[0.5], colors=[CAVITY_OUTLINE_COLOR], linewidths=1.2)
         ax.set_title(session_title(session, day), fontsize=12, fontweight="bold", pad=8)
         ax.text(
@@ -541,14 +571,14 @@ def render_model(
         fig.colorbar(image, cax=colorbar_ax, label="cell density")
     if curve_times is not None and curve_volumes is not None:
         bottom.plot(
-            curve_times, curve_volumes, "-", color=MODEL_COLOR, linewidth=1.2,
+            curve_times, curve_volumes, "--", color=MODEL_COLOR, linewidth=1.2,  # dashed: the resection line is solid red
             label=f"model core (u >= {threshold:g}, latest scan's cavity excluded)",
         )
-    bottom.plot(moments, model_volumes, "s", color=MODEL_COLOR, markersize=6, label="model core at scan (cavity excluded)")
     bottom.plot(
-        moments, reference_volumes, "o", markerfacecolor="none", markeredgecolor=REFERENCE_COLOR,
-        markersize=7, markeredgewidth=1.5, label=REFERENCE_CORE_LABEL,
+        moments, model_volumes, "o", markerfacecolor="none", markeredgecolor=MODEL_COLOR,
+        markersize=7, markeredgewidth=1.5, label="model core at scan (cavity excluded)",
     )
+    bottom.plot(moments, reference_volumes, "s", color=OBSERVED_COLOR, markersize=6, label=REFERENCE_CORE_LABEL)
     _finish_curve(bottom, params, stopping_time)
     fig.savefig(str(outfile_stem) + ".png", dpi=110)
     fig.savefig(str(outfile_stem) + ".pdf", format="pdf")
@@ -688,17 +718,26 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(f"{session['segmentation']}: shape {segmentation.shape} differs from the run's grid {shape}.")
         preop = session["label"] == LABEL_PREOP
         segmentations.append(segmentation)
-        labels.append(relabel_preop(segmentation) if preop else segmentation)
+        labels.append(check_preop_labels(segmentation, session["segmentation"]) if preop else segmentation)
         backgrounds.append(load_volume(session_background(patient_root, patient, session), shape))
     # The sweep's reference masks: the later sessions corrected with the
     # earlier sessions' cavities before their own cavity is excluded; a
     # fit's also exclude the resection cavity in every later session. The
     # overlay (labels) stays the raw segmentation.
+    # The resection cavity drawn in the model figure: the post-op
+    # session's label-4 voxels (what the solver removed).
+    postop_index = next(i for i, s in enumerate(sessions) if s["label"] == LABEL_POSTOP)
+    resection_cavity = segmentations[postop_index] == LABEL_CAVITY
     if args.fit_dir is not None:
         cavity_spec = config["resection_cavity"]
-        resection_cavity = load_segmentation(cavity_spec["segmentation"])[0] == int(cavity_spec["label"])
-        references: list[Reference] = fit_session_references(segmentations, sessions, resection_cavity)
-        if json.dumps(spec.get("label_conventions"), sort_keys=True) != json.dumps(FIT_LABEL_CONVENTIONS, sort_keys=True):
+        fit_cavity = load_segmentation(cavity_spec["segmentation"])[0] == int(cavity_spec["label"])
+        if not np.array_equal(fit_cavity, resection_cavity):
+            print(
+                f"note: the fit's resection cavity ({cavity_spec['segmentation']}, label {cavity_spec['label']}) differs "
+                f"from the post-op session's label {LABEL_CAVITY}; the masks use the fit's, the figure outlines the latter"
+            )
+        references: list[Reference] = fit_session_references(segmentations, sessions, fit_cavity)
+        if not same_label_conventions(spec.get("label_conventions")):
             print(
                 "note: the fit was scored with older reference masks (its spec.json's label_conventions differ from "
                 "FIT_LABEL_CONVENTIONS), so the Dice below differ from the fit's"
@@ -757,7 +796,7 @@ def main(argv: list[str] | None = None) -> int:
         reference_volumes, params, stopping_time, args.columns,
     )
     render_model(
-        run_dir / "model", sessions, fields, references, labels, backgrounds, z, threshold,
+        run_dir / "model", sessions, fields, resection_cavity, labels, backgrounds, z, threshold,
         args.display_threshold, session_moments, session_postop_days, dices, model_volumes, reference_volumes,
         curve_times, curve_volumes, params, stopping_time, args.columns,
     )
