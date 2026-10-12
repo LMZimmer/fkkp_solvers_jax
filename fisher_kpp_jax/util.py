@@ -79,16 +79,17 @@ def mark_treatment_events(ax: Any, params: dict[str, Any]) -> None:
     line, the radiotherapy days as lines split by whether chemotherapy is
     given the same day, and the chemotherapy-only days (daily sessions,
     many of them) as one shaded band per contiguous block of sessions.
-    Every kind gets one legend entry.
+    Every kind gets one legend entry; an untreated run (resection_time
+    inf, no fractions, no chemotherapy sessions) gets nothing.
 
     Args:
         ax: A matplotlib Axes with time in days on the x axis.
         params: The solver's resolved parameters (resection_time,
             rt_times, chemo_times).
     """
-    ax.axvline(
-        float(params["resection_time"]), color=CAVITY_COLOR, linewidth=1.5, label="resection"
-    )
+    resection_time = float(params["resection_time"])
+    if np.isfinite(resection_time):
+        ax.axvline(resection_time, color=CAVITY_COLOR, linewidth=1.5, label="resection")
     rt_days = np.atleast_1d(np.asarray(params["rt_times"], dtype=np.float64))
     ct_days = np.atleast_1d(np.asarray(params["chemo_times"], dtype=np.float64))
     with_ct = np.isin(rt_days, ct_days)

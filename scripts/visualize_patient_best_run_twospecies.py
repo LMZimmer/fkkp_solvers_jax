@@ -11,8 +11,13 @@ backgrounds, the palette, the masks and the volume panel are that
 script's (its helpers are imported, nothing is copied); what differs is
 below. The fit directory (--fit-dir, the only source: the two-species
 model has been run in fits only) must have been run with --solver
-twospecies and --objective full (the figures carry the treated timeline);
-the isotropic solver's fits are rendered by the other script.
+twospecies; the isotropic solver's fits are rendered by the other script.
+A fit with --objective preop (spec.json objective.scope) is rendered as
+the other script renders one: the pre-op session is the only panel, the
+run ends at the scan (the "_fit" record's stopping_time), no resection
+cavity is excluded or outlined, the volume panels mark no treatment
+events, and the title's clinical day is still relative to the patient's
+post-op scan.
 
 Run. The best run is the fit's re-solved best evaluation (best/config.json,
 written by the fit's resolve). It is solved once more as the fit saved
@@ -133,6 +138,7 @@ from scipy.ndimage import center_of_mass  # noqa: E402
 from fisher_kpp_jax import TwoCompartmentWithNutrientFKPPSolver, read_config  # noqa: E402
 from fisher_kpp_jax.config import jsonable  # noqa: E402
 from patient_cmaes_fit import (  # noqa: E402
+    OBJECTIVE_SCOPES,
     fit_session_references,
     model_core_mask,
     region_densities,
@@ -164,7 +170,7 @@ from visualize_patient_best_run import (  # noqa: E402
     fit_best_run,
     infer_threshold,
     load_volume,
-    postop_days,
+    postop_days_of,
     recorded_frame,
     render_segmentations,
     session_background,
@@ -332,11 +338,9 @@ def main(argv: list[str] | None = None) -> int:
             f"solver (--solver {SOLVER_MODE}) only; scripts/visualize_patient_best_run.py renders the isotropic solver's."
         )
     scope = spec.get("objective", {}).get("scope", "full")
-    if scope != "full":
-        raise NotImplementedError(
-            f"the fit {fit_dir} was run with --objective {scope}; this script renders the treated timeline "
-            "(resection, fractions, chemotherapy) of a full-series fit only."
-        )
+    if scope not in OBJECTIVE_SCOPES:
+        raise NotImplementedError(f"the fit {fit_dir} was run with --objective {scope}; this script knows {OBJECTIVE_SCOPES}.")
+    preop_only = scope == "preop"
     loss = spec.get("objective", {}).get("mode", "core")
     necrotic_scored = loss == NECROTIC_LOSS
     if loss not in DICE_RULES:
@@ -376,7 +380,8 @@ def main(argv: list[str] | None = None) -> int:
     sessions = [s for s in spec["patient"]["sessions"] if s["id"] in session_days]
     if len(sessions) != len(session_days):
         raise ValueError(f"spec.json lacks sessions of the fit's snapshot days {sorted(session_days)}.")
-    stopping_time = float(config["resection_time"]) + float(config["time_after_resection"])
+    # A pre-op fit's run ends at the scan (no resection in its config).
+    stopping_time = float(fit["stopping_time"]) if preop_only else float(config["resection_time"]) + float(config["time_after_resection"])
     if args.volume_curve:
         curve_days = np.arange(0.0, stopping_time, args.snapshot_interval_days)
         config["snapshot_times"] = sorted({*session_days.values(), *curve_days.tolist(), stopping_time})
@@ -436,16 +441,21 @@ def main(argv: list[str] | None = None) -> int:
         backgrounds.append(load_volume(session_background(patient_root, patient, session), shape))
     # The fit's reference masks (the resection cavity excluded in every
     # later session); the overlay (labels) stays the raw segmentation. The
-    # resection cavity drawn: the post-op session's label-4 voxels.
-    postop_index = next(i for i, s in enumerate(sessions) if s["label"] == LABEL_POSTOP)
-    resection_cavity = segmentations[postop_index] == LABEL_CAVITY
-    cavity_spec = config["resection_cavity"]
-    fit_cavity = load_segmentation(cavity_spec["segmentation"])[0] == int(cavity_spec["label"])
-    if not np.array_equal(fit_cavity, resection_cavity):
-        print(
-            f"note: the fit's resection cavity ({cavity_spec['segmentation']}, label {cavity_spec['label']}) differs "
-            f"from the post-op session's label {LABEL_CAVITY}; the masks use the fit's, the figures outline the latter"
-        )
+    # resection cavity drawn: the post-op session's label-4 voxels; none
+    # for a pre-op fit (the untreated run to the pre-op scan).
+    if preop_only:
+        resection_cavity = np.zeros(shape, dtype=bool)
+        fit_cavity = resection_cavity
+    else:
+        postop_index = next(i for i, s in enumerate(sessions) if s["label"] == LABEL_POSTOP)
+        resection_cavity = segmentations[postop_index] == LABEL_CAVITY
+        cavity_spec = config["resection_cavity"]
+        fit_cavity = load_segmentation(cavity_spec["segmentation"])[0] == int(cavity_spec["label"])
+        if not np.array_equal(fit_cavity, resection_cavity):
+            print(
+                f"note: the fit's resection cavity ({cavity_spec['segmentation']}, label {cavity_spec['label']}) differs "
+                f"from the post-op session's label {LABEL_CAVITY}; the masks use the fit's, the figures outline the latter"
+            )
     references: list[Reference] = fit_session_references(segmentations, sessions, fit_cavity)
     if not same_label_conventions(spec.get("label_conventions")):
         print(
@@ -540,7 +550,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("the pre-op reference core is empty; pass --slice-z.")
     z = args.slice_z if args.slice_z is not None else int(round(center_of_mass(preop_core)[2]))
     session_moments = [float(moments[s["id"]]) for s in sessions]
-    session_postop_days = postop_days(sessions)
+    session_postop_days = postop_days_of(spec["patient"]["sessions"], sessions)
     for k, session in enumerate(sessions):
         logged = fit_logged_dice.get(session["id"])
         fit_note = "" if logged is None else f" (fit {logged:.3f})"
@@ -599,6 +609,7 @@ def main(argv: list[str] | None = None) -> int:
             "solver": SOLVER_MODE,
             "fields": list(FIELDS),
             "loss": loss,
+            "objective_scope": "preop" if preop_only else "full",
             "dice_rule": DICE_RULES[loss],
             "core_threshold": threshold,
             "core_threshold_source": threshold_source,

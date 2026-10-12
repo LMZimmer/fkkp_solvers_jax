@@ -21,8 +21,13 @@ as the fit saved it: its schedule, its fixed n_steps and the session
 moments and snapshot days of the config's "_fit" record, over the
 sessions the fit simulated (plus the curve frames with --volume-curve); the patient and the
 sessions come from the fit's spec.json. The criterion is the re-solve's
-J (best/objective.json). --run-root, --criterion and --schedule are
-sweep options.
+J (best/objective.json). A fit with --objective preop (spec.json
+objective.scope) is the untreated growth to the pre-op scan: the pre-op
+session is the only panel, the run ends at the scan (the "_fit" record's
+stopping_time), no resection cavity is excluded or outlined and the
+volume panel marks no treatment events; the clinical day of the title is
+still relative to the patient's post-op scan (spec.json's sessions).
+--run-root, --criterion and --schedule are sweep options.
 
 Core threshold. --core-threshold logged (the default) takes the best
 row's core_threshold column (sampled mode records it per row; in
@@ -186,7 +191,7 @@ from patient_sensitivity_analysis import (  # noqa: E402
     session_snapshot_days,
     snapshot_file,
 )
-from patient_cmaes_fit import fit_session_references, same_label_conventions  # noqa: E402
+from patient_cmaes_fit import OBJECTIVE_SCOPES, fit_session_references, same_label_conventions  # noqa: E402
 from sensitivity_analysis import as_float, read_csv, read_json, round_field, write_json  # noqa: E402
 
 DEFAULT_CRITERION = "dice_mean_core"
@@ -435,16 +440,27 @@ def postop_days(sessions: list[dict[str, Any]]) -> list[int]:
     return [(date.fromisoformat(s["date"]) - origin).days for s in sessions]
 
 
+def postop_days_of(all_sessions: list[dict[str, Any]], sessions: list[dict[str, Any]]) -> list[int]:
+    """``postop_days`` of the patient's full session list (spec.json's),
+    picked for the rendered sessions: a pre-op fit renders the pre-op
+    session alone, whose day is still counted from the post-op scan."""
+    days = dict(zip([s["id"] for s in all_sessions], postop_days(all_sessions), strict=True))
+    return [days[s["id"]] for s in sessions]
+
+
 def session_title(session: dict[str, Any], postop_day: int) -> str:
     return f"{session['id']} {session['label']} (day {postop_day})"
 
 
 def _figure(n_panels: int, n_col: int) -> tuple[Any, list[Any], Any]:
     """The shared layout: n_panels axes in rows of n_col plus one wide axis
-    below for the volume curve."""
+    below for the volume curve. The figure is as wide as n_col panels
+    even when there are fewer (a pre-op fit has one), so the legends and
+    the volume panel keep the room they have in a full-series figure."""
+    width = 4.4 * n_col + 0.6
     n_col = max(1, min(n_col, n_panels))
     n_row = int(np.ceil(n_panels / n_col))
-    fig = plt.figure(figsize=(4.4 * n_col + 0.6, 4.6 * n_row + 4.0), constrained_layout=True)
+    fig = plt.figure(figsize=(width, 4.6 * n_row + 4.0), constrained_layout=True)
     grid = fig.add_gridspec(
         n_row + 1, n_col + 1, height_ratios=[1.0] * n_row + [0.9], width_ratios=[1.0] * n_col + [0.05]
     )
@@ -598,11 +614,9 @@ def main(argv: list[str] | None = None) -> int:
                 "of the isotropic solver only."
             )
         scope = spec.get("objective", {}).get("scope", "full")
-        if scope != "full":
-            raise NotImplementedError(
-                f"the fit {fit_dir} was run with --objective {scope}; this script renders the treated timeline "
-                "(resection, fractions, chemotherapy) of a full-series fit only."
-            )
+        if scope not in OBJECTIVE_SCOPES:
+            raise NotImplementedError(f"the fit {fit_dir} was run with --objective {scope}; this script knows {OBJECTIVE_SCOPES}.")
+        preop_only = scope == "preop"
         config_path, fit, objective = fit_best_run(fit_dir)
         resolved = objective["resolved"]
         criterion, criterion_value = FIT_CRITERION, float(resolved[FIT_CRITERION])
@@ -623,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         sweep_dir = Path(args.sweep_dir)
         spec = read_json(sweep_dir / "spec.json")
+        preop_only = False
         run_root = Path(args.run_root) if args.run_root else DEFAULT_OUTPUT_DIR / spec["name"]
         row = best_row(read_csv(sweep_dir / "qoi.csv"), args.criterion)
         run_name_sweep = row["run_name"]
@@ -670,7 +685,8 @@ def main(argv: list[str] | None = None) -> int:
         moments = run_snapshots(spec, design_record)
         session_days = session_snapshot_days(moments, dt)
         sessions = spec["patient"]["sessions"]
-    stopping_time = float(config["resection_time"]) + float(config["time_after_resection"])
+    # A pre-op fit's run ends at the scan (no resection in its config).
+    stopping_time = float(fit["stopping_time"]) if preop_only else float(config["resection_time"]) + float(config["time_after_resection"])
     if args.volume_curve:
         curve_days = np.arange(0.0, stopping_time, args.snapshot_interval_days)
         config["snapshot_times"] = sorted({*session_days.values(), *curve_days.tolist(), stopping_time})
@@ -725,17 +741,23 @@ def main(argv: list[str] | None = None) -> int:
     # fit's also exclude the resection cavity in every later session. The
     # overlay (labels) stays the raw segmentation.
     # The resection cavity drawn in the model figure: the post-op
-    # session's label-4 voxels (what the solver removed).
-    postop_index = next(i for i, s in enumerate(sessions) if s["label"] == LABEL_POSTOP)
-    resection_cavity = segmentations[postop_index] == LABEL_CAVITY
+    # session's label-4 voxels (what the solver removed); none for a
+    # pre-op fit (the untreated run to the pre-op scan).
+    if preop_only:
+        resection_cavity = np.zeros(shape, dtype=bool)
+    else:
+        postop_index = next(i for i, s in enumerate(sessions) if s["label"] == LABEL_POSTOP)
+        resection_cavity = segmentations[postop_index] == LABEL_CAVITY
     if args.fit_dir is not None:
-        cavity_spec = config["resection_cavity"]
-        fit_cavity = load_segmentation(cavity_spec["segmentation"])[0] == int(cavity_spec["label"])
-        if not np.array_equal(fit_cavity, resection_cavity):
-            print(
-                f"note: the fit's resection cavity ({cavity_spec['segmentation']}, label {cavity_spec['label']}) differs "
-                f"from the post-op session's label {LABEL_CAVITY}; the masks use the fit's, the figure outlines the latter"
-            )
+        fit_cavity = resection_cavity
+        if not preop_only:
+            cavity_spec = config["resection_cavity"]
+            fit_cavity = load_segmentation(cavity_spec["segmentation"])[0] == int(cavity_spec["label"])
+            if not np.array_equal(fit_cavity, resection_cavity):
+                print(
+                    f"note: the fit's resection cavity ({cavity_spec['segmentation']}, label {cavity_spec['label']}) differs "
+                    f"from the post-op session's label {LABEL_CAVITY}; the masks use the fit's, the figure outlines the latter"
+                )
         references: list[Reference] = fit_session_references(segmentations, sessions, fit_cavity)
         if not same_label_conventions(spec.get("label_conventions")):
             print(
@@ -785,7 +807,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("the pre-op reference core is empty; pass --slice-z.")
     z = args.slice_z if args.slice_z is not None else int(round(center_of_mass(preop_core)[2]))
     session_moments = [float(moments[s["id"]]) for s in sessions]
-    session_postop_days = postop_days(sessions)
+    session_postop_days = postop_days_of(spec["patient"]["sessions"], sessions)
     for session, value, mv, rv in zip(sessions, dices, model_volumes, reference_volumes, strict=True):
         logged = fit_logged_dice.get(session["id"])
         fit_note = "" if logged is None else f" (fit {logged:.3f})"
@@ -809,6 +831,7 @@ def main(argv: list[str] | None = None) -> int:
             "run_config": str(config_path),
             "criterion": criterion,
             "criterion_value": criterion_value,
+            "objective_scope": "preop" if preop_only else "full",
             "core_threshold": threshold,
             "core_threshold_source": threshold_source,
             "schedule": schedule,

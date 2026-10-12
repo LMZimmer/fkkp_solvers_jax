@@ -70,8 +70,9 @@ session is the cavity's source, the CRT start session the dose map's;
 the timeline is recorded in spec.json for reference), but none of them
 is simulated. spec.json objective.scope records the scope; a fit
 directory is resumed and resolved with its own scope (old specs are
-full). visualize_patient_best_run.py refuses preop fits (it renders the
-treated timeline).
+full). visualize_patient_best_run.py and
+visualize_patient_best_run_twospecies.py render a preop fit as the pre-op
+panel alone, the run ending at the scan.
 
 Objective. loss = 1 - J on the unit cube [0, 1]^n, n the number of factors.
 One evaluation is one
