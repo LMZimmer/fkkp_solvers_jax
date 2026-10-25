@@ -84,7 +84,9 @@ in time order in rows of --columns (default 4), each titled
 post-op scan (day 0; the pre-op scan negative; from spec.json's dates),
 and a volume-vs-time panel below in model days (the seed is day 0, the
 pre-op scan at the row's preop_time) with the treatment events marked
-(fisher_kpp_jax.util.mark_treatment_events); no figure title (the run,
+(fisher_kpp_jax.util.mark_treatment_events; --yscale LOW HIGH fixes the
+panel's y limits in mL in every figure, for figures to be compared side
+by side); no figure title (the run,
 its parameters and the threshold are in run_summary.json and
 config.json):
   segmentations   the session's labels overlaid in the palette of
@@ -105,11 +107,11 @@ config.json):
                   earlier sessions' cavities as well) is not drawn;
                   below, the model core
                   volume per session
-                  (cavity excluded) as hollow red circles, with --volume-curve
+                  (cavity excluded) as filled black squares, with --volume-curve
                   the thresholded core volume along the run (latest
-                  scan's mask) as a dashed red line through them (the
+                  scan's mask) as a dashed black line through them (the
                   resection line is solid red), the reference
-                  core volumes as filled black squares, and the
+                  core volumes as hollow red circles, and the
                   per-session Dice in each panel
 Written into <output-dir>/<run-name>/ (exist_ok=False, nothing outside
 it): config.json, result.json, initial_cell_density.nii.gz and
@@ -233,11 +235,10 @@ CONTOUR_LEGEND: dict[str, tuple[Any, float]] = {
     "resection cavity": (CAVITY_OUTLINE_COLOR, 1.2),
 }
 # segmentations.pdf: the segmented core volumes in red.  model.pdf: the
-# model in red (hollow circles, the curve), the segmented core volumes as
-# filled black squares.
+# model in black (filled squares, the dashed curve), the segmented core
+# volumes as hollow red circles (the segmentation figure's colour).
 REFERENCE_COLOR = (0.85, 0.25, 0.10, 1.0)
-MODEL_COLOR = REFERENCE_COLOR
-OBSERVED_COLOR = "black"
+MODEL_COLOR = "black"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -303,6 +304,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--display-threshold", type=float, default=0.01, help="field below which the overlay is transparent"
     )
     parser.add_argument("--columns", type=int, default=4, help="panels per row (default 4)")
+    parser.add_argument(
+        "--yscale", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
+        help="y limits in mL of the volume panels of every figure (default: matplotlib's autoscale)",
+    )
     args = parser.parse_args(argv)
     if args.fit_dir is not None:
         if args.run_root is not None or args.schedule is not None or args.criterion != DEFAULT_CRITERION:
@@ -470,9 +475,15 @@ def _figure(n_panels: int, n_col: int) -> tuple[Any, list[Any], Any]:
     return fig, axes, (bottom, colorbar_ax)
 
 
-def _finish_curve(ax: Any, params: dict[str, Any], stopping_time: float) -> None:
+def _finish_curve(
+    ax: Any, params: dict[str, Any], stopping_time: float, yscale: tuple[float, float] | None = None
+) -> None:
+    """The volume panel's events, limits (yscale fixes the y limits, --yscale),
+    labels and legend."""
     mark_treatment_events(ax, params)
     ax.set_xlim(-0.01 * stopping_time, 1.01 * stopping_time)
+    if yscale is not None:
+        ax.set_ylim(*yscale)
     ax.set_xlabel("time [days]", fontsize=12)
     ax.set_ylabel("core volume [mL]", fontsize=12)
     ax.grid(alpha=0.3)
@@ -491,6 +502,7 @@ def render_segmentations(
     params: dict[str, Any],
     stopping_time: float,
     n_col: int,
+    yscale: tuple[float, float] | None = None,
 ) -> None:
     fig, axes, (bottom, colorbar_ax) = _figure(len(sessions), n_col)
     colors = [(0, 0, 0, 0)] + [LABEL_COLORS[k] for k in sorted(LABEL_COLORS)]
@@ -520,7 +532,7 @@ def render_segmentations(
         )
     low, high = bottom.get_ylim()
     bottom.set_ylim(low, high + 0.08 * (high - low))  # room for the label above the highest point
-    _finish_curve(bottom, params, stopping_time)
+    _finish_curve(bottom, params, stopping_time, yscale)
     fig.savefig(str(outfile_stem) + ".png", dpi=110)
     fig.savefig(str(outfile_stem) + ".pdf", format="pdf")
     plt.close(fig)
@@ -546,6 +558,7 @@ def render_model(
     params: dict[str, Any],
     stopping_time: float,
     n_col: int,
+    yscale: tuple[float, float] | None = None,
 ) -> None:
     """The model figure: per session the segmented tumour core of the
     display labels (necrotic + enhancing, red) and, in every session but
@@ -587,15 +600,15 @@ def render_model(
         fig.colorbar(image, cax=colorbar_ax, label="cell density")
     if curve_times is not None and curve_volumes is not None:
         bottom.plot(
-            curve_times, curve_volumes, "--", color=MODEL_COLOR, linewidth=1.2,  # dashed: the resection line is solid red
+            curve_times, curve_volumes, "--", color=MODEL_COLOR, linewidth=1.2,
             label=f"model core (u >= {threshold:g}, latest scan's cavity excluded)",
         )
+    bottom.plot(moments, model_volumes, "s", color=MODEL_COLOR, markersize=6, label="model core at scan (cavity excluded)")
     bottom.plot(
-        moments, model_volumes, "o", markerfacecolor="none", markeredgecolor=MODEL_COLOR,
-        markersize=7, markeredgewidth=1.5, label="model core at scan (cavity excluded)",
+        moments, reference_volumes, "o", markerfacecolor="none", markeredgecolor=REFERENCE_COLOR,
+        markersize=7, markeredgewidth=1.5, label=REFERENCE_CORE_LABEL,
     )
-    bottom.plot(moments, reference_volumes, "s", color=OBSERVED_COLOR, markersize=6, label=REFERENCE_CORE_LABEL)
-    _finish_curve(bottom, params, stopping_time)
+    _finish_curve(bottom, params, stopping_time, yscale)
     fig.savefig(str(outfile_stem) + ".png", dpi=110)
     fig.savefig(str(outfile_stem) + ".pdf", format="pdf")
     plt.close(fig)
@@ -815,12 +828,12 @@ def main(argv: list[str] | None = None) -> int:
 
     render_segmentations(
         run_dir / "segmentations", sessions, labels, backgrounds, z, session_moments, session_postop_days,
-        reference_volumes, params, stopping_time, args.columns,
+        reference_volumes, params, stopping_time, args.columns, args.yscale,
     )
     render_model(
         run_dir / "model", sessions, fields, resection_cavity, labels, backgrounds, z, threshold,
         args.display_threshold, session_moments, session_postop_days, dices, model_volumes, reference_volumes,
-        curve_times, curve_volumes, params, stopping_time, args.columns,
+        curve_times, curve_volumes, params, stopping_time, args.columns, args.yscale,
     )
     write_json(
         run_dir / "run_summary.json",

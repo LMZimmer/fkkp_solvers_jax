@@ -55,7 +55,7 @@ the axial slice through the centre of mass of the pre-op reference core,
 or --slice-z; the session's T1c as the background; rows of --columns;
 titles "<session> <label> (day <n>)" with the clinical day relative to
 the post-op scan; a volume-vs-time panel below in model days with the
-treatment events marked; no figure title):
+treatment events marked, --yscale fixing its y limits; no figure title):
   segmentations   the other script's segmentation figure, unchanged
   proliferative   the P frame overlaid (inferno at alpha 0.75, values
                   below --display-threshold transparent) with the
@@ -65,17 +65,18 @@ treatment events marked; no figure title):
                   panel the fit's core Dice (the rule of the fit's loss,
                   named in the legend above the panels); below, the
                   volume of P >= core threshold
-                  per session (cavity excluded) as hollow red circles,
+                  per session (cavity excluded) as filled black squares,
                   with --volume-curve the same quantity along the run
-                  (latest scan's mask) as a dashed red line, and the
-                  segmented core volumes as filled black squares
-  necrotic        the same with the N frame: with core+necrotic the
-                  necrotic Dice in each panel ("n/a" where the session
-                  has no necrotic label), the volume of N >= necrotic
-                  threshold and the segmented NECROTIC volumes (label 1
-                  after the correction) as the black squares; with the
-                  core loss the core Dice again, N >= core threshold and
-                  the segmented core volumes
+                  (latest scan's mask) as a dashed black line, and the
+                  segmented core volumes as hollow red circles
+  necrotic        the same with the N frame against the segmented
+                  NECROSIS (label 1 after the correction) whatever the
+                  loss: the necrotic Dice in each panel ("n/a" where the
+                  session has no necrotic label) and the volume of N >=
+                  the necrotic threshold (core+necrotic; the fit's
+                  dice_necrotic_star) or >= the core threshold (core loss;
+                  not scored by the fit, the panel says so), with the
+                  segmented necrotic volumes as the hollow red circles
   nutrient        the nutrient DEPLETION 1 - nutrient overlaid, in tissue
                   only (where the solver's initial nutrient is 1: wm + gm
                   >= min_tissue_fraction; the CSF, where the nutrient is
@@ -161,7 +162,7 @@ from visualize_patient_best_run import (  # noqa: E402
     FIELD_ALPHA,
     FIT_CRITERION,
     MODEL_COLOR,
-    OBSERVED_COLOR,
+    REFERENCE_COLOR,
     OBSERVED_CORE_CONTOUR_COLOR,
     OBSERVED_CORE_LABELS,
     REFERENCE_CORE_LABEL,
@@ -242,6 +243,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--display-threshold", type=float, default=0.01, help="overlay value below which the overlay is transparent"
     )
     parser.add_argument("--columns", type=int, default=4, help="panels per row (default 4)")
+    parser.add_argument(
+        "--yscale", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
+        help="y limits in mL of the volume panels of every figure (default: matplotlib's autoscale)",
+    )
     return parser.parse_args(argv)
 
 
@@ -270,6 +275,7 @@ def render_field(
     params: dict[str, Any],
     stopping_time: float,
     n_col: int,
+    yscale: tuple[float, float] | None = None,
 ) -> None:
     """
     One field's figure: per session the overlay (the field, or the
@@ -278,8 +284,8 @@ def render_field(
     cavity (green); the fit's Dice in each panel when given (P and N
     figures: "<dice_label> <value>", "n/a" for a NaN; the rule is named
     in the legend above the panels); below, the field's volume per
-    session as hollow red circles, the curve along the run when given,
-    and the reference volumes (reference_label) as filled black squares.
+    session as filled black squares, the curve along the run when given,
+    and the reference volumes (reference_label) as hollow red circles.
     """
     fig, axes, (bottom, colorbar_ax) = _figure(len(sessions), n_col)
     handles = [
@@ -315,12 +321,12 @@ def render_field(
         fig.colorbar(image, cax=colorbar_ax, label=colorbar_label)
     if curve_times is not None and curve_volumes is not None:
         bottom.plot(curve_times, curve_volumes, "--", color=MODEL_COLOR, linewidth=1.2, label=curve_label)
+    bottom.plot(moments, volumes, "s", color=MODEL_COLOR, markersize=6, label=volume_label)
     bottom.plot(
-        moments, volumes, "o", markerfacecolor="none", markeredgecolor=MODEL_COLOR, markersize=7,
-        markeredgewidth=1.5, label=volume_label,
+        moments, reference_volumes, "o", markerfacecolor="none", markeredgecolor=REFERENCE_COLOR,
+        markersize=7, markeredgewidth=1.5, label=reference_label,
     )
-    bottom.plot(moments, reference_volumes, "s", color=OBSERVED_COLOR, markersize=6, label=reference_label)
-    _finish_curve(bottom, params, stopping_time)
+    _finish_curve(bottom, params, stopping_time, yscale)
     bottom.set_ylabel("volume [mL]", fontsize=12)
     fig.savefig(str(outfile_stem) + ".png", dpi=110)
     fig.savefig(str(outfile_stem) + ".pdf", format="pdf")
@@ -516,15 +522,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         for k, (core, s, r) in enumerate(zip(scored, sessions, references, strict=True))
     ]
-    necrotic_dices: list[float] | None = None
-    reference_necrotic_volumes: list[float] | None = None
-    if necrotic_scored:
-        # NaN where the session has no necrotic label (dropped by the fit).
-        necrotic_dices = [
-            dice((n >= necrotic_threshold) & r.valid, r.necrotic) if r.necrotic.any() else float("nan")
-            for n, r in zip(fields["necrotic"], references, strict=True)
-        ]
-        reference_necrotic_volumes = [float(r.necrotic.sum()) * voxel_volume_ml for r in references]
+    # The necrotic figure compares N with the segmented necrosis whatever
+    # the loss: at the profiled necrotic threshold under core+necrotic (the
+    # fit's dice_necrotic_star), at the core threshold under the core loss
+    # (not scored by the fit). NaN where the session has no necrotic label.
+    n_threshold = necrotic_threshold if necrotic_scored else threshold
+    necrotic_dices = [
+        dice((n >= n_threshold) & r.valid, r.necrotic) if r.necrotic.any() else float("nan")
+        for n, r in zip(fields["necrotic"], references, strict=True)
+    ]
+    reference_necrotic_volumes = [float(r.necrotic.sum()) * voxel_volume_ml for r in references]
     volumes = {
         field: [masked_volume(field_mask(field, f), r.valid) for f, r in zip(fields[field], references, strict=True)]
         for field in FIELDS
@@ -555,10 +562,9 @@ def main(argv: list[str] | None = None) -> int:
         logged = fit_logged_dice.get(session["id"])
         fit_note = "" if logged is None else f" (fit {logged:.3f})"
         necrotic_note = ""
-        if necrotic_dices is not None:
-            logged_n = fit_logged_necrotic.get(session["id"])
-            necrotic_note = f", Dice necrotic {necrotic_dices[k]:.3f}" + ("" if logged_n is None else f" (fit {logged_n:.3f})")
-            necrotic_note += f", segmented necrotic {reference_necrotic_volumes[k]:.2f} mL"
+        logged_n = fit_logged_necrotic.get(session["id"])
+        necrotic_note = f", Dice necrotic {necrotic_dices[k]:.3f}" + ("" if logged_n is None else f" (fit {logged_n:.3f})")
+        necrotic_note += f", segmented necrotic {reference_necrotic_volumes[k]:.2f} mL"
         print(
             f"  {session['id']}: Dice core {dices[k]:.3f}{fit_note}{necrotic_note}, P {volumes['proliferative'][k]:.2f} mL, "
             f"N {volumes['necrotic'][k]:.2f} mL, depleted {volumes['nutrient'][k]:.2f} mL, "
@@ -567,9 +573,8 @@ def main(argv: list[str] | None = None) -> int:
 
     render_segmentations(
         run_dir / "segmentations", sessions, labels, backgrounds, z, session_moments, session_postop_days,
-        reference_volumes, params, stopping_time, args.columns,
+        reference_volumes, params, stopping_time, args.columns, args.yscale,
     )
-    n_threshold = necrotic_threshold if necrotic_scored else threshold
     volume_labels = {
         "proliferative": f"model P >= {threshold:g} at scan (cavity excluded)",
         "necrotic": f"model N >= {n_threshold:g} at scan (cavity excluded)",
@@ -579,11 +584,12 @@ def main(argv: list[str] | None = None) -> int:
         if field == "nutrient":
             overlays = [np.where(tissue, 1.0 - frame, 0.0) for frame in fields[field]]
             panel_dices, dice_label = None, ""
-        elif field == "necrotic" and necrotic_scored:
-            overlays, panel_dices, dice_label = fields[field], necrotic_dices, "Dice necrotic"
+        elif field == "necrotic":
+            overlays, panel_dices = fields[field], necrotic_dices
+            dice_label = "Dice necrotic" if necrotic_scored else f"Dice necrotic (N >= {threshold:g}, not scored)"
         else:
             overlays, panel_dices, dice_label = fields[field], dices, "Dice core"
-        if field == "necrotic" and necrotic_scored:
+        if field == "necrotic":
             references_volumes, reference_label = reference_necrotic_volumes, REFERENCE_NECROTIC_LABEL
         else:
             references_volumes, reference_label = reference_volumes, REFERENCE_CORE_LABEL
@@ -592,7 +598,7 @@ def main(argv: list[str] | None = None) -> int:
             COLORBAR_LABELS[field], session_moments, session_postop_days, panel_dices, dice_label, DICE_RULES[loss],
             volumes[field], volume_labels[field], references_volumes, reference_label, times if field in curves else None,
             curves.get(field), volume_labels[field].replace(" at scan", " along the run (latest scan's cavity excluded)"),
-            params, stopping_time, args.columns,
+            params, stopping_time, args.columns, args.yscale,
         )
     write_json(
         run_dir / "run_summary.json",
@@ -632,9 +638,9 @@ def main(argv: list[str] | None = None) -> int:
                     "recorded_day": d,
                     "dice_core": v,
                     "fit_dice_core": fit_logged_dice.get(s["id"]),
-                    "dice_necrotic": None if necrotic_dices is None else necrotic_dices[k],
+                    "dice_necrotic": necrotic_dices[k],
                     "fit_dice_necrotic": fit_logged_necrotic.get(s["id"]),
-                    "reference_necrotic_volume_ml": None if reference_necrotic_volumes is None else reference_necrotic_volumes[k],
+                    "reference_necrotic_volume_ml": reference_necrotic_volumes[k],
                     "model_proliferative_volume_ml": volumes["proliferative"][k],
                     "model_necrotic_volume_ml": volumes["necrotic"][k],
                     "depleted_tissue_volume_ml": volumes["nutrient"][k],
