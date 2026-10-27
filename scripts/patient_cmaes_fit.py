@@ -148,7 +148,10 @@ The objective's sessions are --sessions (default 01-08: the pre-op session
 ses-01 and the later sessions; the pre-op session and every requested
 later session are simulated and recorded, and only the requested ones
 enter the sums; with --objective preop the pre-op session alone), weighted
-by --session-weights (ses-01=1,ses-02=1,...; default 1 each). A session whose Dice is NaN at a threshold (the model and
+by --session-weights (ses-01=1,ses-02=1,...; default 1 per later session
+and PREOP_WEIGHT_RATIO (1.0) times their sum for the pre-op session, so
+by default the pre-op session weighs as much as all later sessions
+combined; 1 for the pre-op session alone). A session whose Dice is NaN at a threshold (the model and
 the reference both empty, the SA's ``dice`` convention) is dropped from
 that threshold's mean with its weight (the mean is renormalised over the
 sessions with a finite Dice); a region whose mean is NaN at every
@@ -610,6 +613,12 @@ DEFAULT_SEARCH_SPACE = DEFAULT_SEARCH_SPACES[DEFAULT_SOLVER_MODE]
 DEFAULT_OUTPUT_DIR = Path("/mnt/Drive4/lucas/stupp_patient_fit")
 DEFAULT_SWEEP_DIR = Path("/mnt/Drive4/lucas/stupp_sensitivity_analysis_patient/sa_sub01_2026-09-16")
 DEFAULT_SESSIONS = "01-08"  # the objective's sessions, the pre-op one included (``split_sessions``)
+# The pre-op session's weight relative to the later objective sessions
+# combined (``parse_session_weights``): unless --session-weights names it,
+# the pre-op weight is PREOP_WEIGHT_RATIO times the sum of the later
+# sessions' weights (1 = as much as all later sessions together, 0.5 = half
+# of that). An objective of the pre-op session alone weighs it 1.
+PREOP_WEIGHT_RATIO = 1.0
 # The fit's masks (``fit_session_references``, since 2026-09-28): the SA's,
 # with every later session's cavity also covering the post-op cavity (the
 # solver's resection cavity), so the region the model keeps empty is never
@@ -823,12 +832,17 @@ def parse_preop_time_range(text: str) -> tuple[float, float]:
     return lo, hi
 
 
-def parse_session_weights(text: str | Mapping[str, Any], session_ids: Sequence[str]) -> dict[str, float]:
+def parse_session_weights(
+    text: str | Mapping[str, Any], session_ids: Sequence[str], preop_id: str | None = None
+) -> dict[str, float]:
     """
     The objective's session weights from "ses-01=1,ses-02=1,..." (or a
     mapping): every named session must be one of the objective's sessions,
-    an unnamed one weighs 1, no weight is negative and at least one is
-    positive.
+    an unnamed later one weighs 1, an unnamed pre-op session (preop_id)
+    weighs PREOP_WEIGHT_RATIO times the sum of the other sessions' weights
+    (1 when it is the only session), no weight is negative and at least
+    one is positive. A spec's recorded weights name every session, so a
+    resumed fit keeps its own.
     """
     given: dict[str, float] = {}
     if isinstance(text, Mapping):
@@ -843,6 +857,9 @@ def parse_session_weights(text: str | Mapping[str, Any], session_ids: Sequence[s
     if unknown:
         raise ValueError(f"--session-weights: session(s) {unknown} are not among the objective's {list(session_ids)}.")
     weights = {sid: float(given.get(sid, 1.0)) for sid in session_ids}
+    if preop_id in weights and preop_id not in given:
+        later = [w for sid, w in weights.items() if sid != preop_id]
+        weights[preop_id] = PREOP_WEIGHT_RATIO * sum(later) if later else 1.0
     if any(not np.isfinite(w) or w < 0 for w in weights.values()):
         raise ValueError(f"--session-weights must be finite and nonnegative, got {weights}.")
     if not any(w > 0 for w in weights.values()):
@@ -1874,7 +1891,7 @@ def build_problem(
         objective_ids: tuple[str, ...] = (preop_id,)
     else:
         objective_ids = tuple(s.id for s in selected if s.id in set(requested))
-    weights = parse_session_weights(session_weights, objective_ids)
+    weights = parse_session_weights(session_weights, objective_ids, preop_id)
     objective = Objective(loss, objective_ids, weights, objective_scope)
     doses = protocol if protocol is not None else protocol_from_config(base)
     timeline = build_timeline(data.sessions, doses)
@@ -3959,7 +3976,7 @@ def _add_problem_args(parser: argparse.ArgumentParser) -> None:
             f"(default {DEFAULT_SESSIONS}); with --objective preop they only assemble the patient data, the pre-op session alone is scored"
         ),
     )
-    parser.add_argument("--session-weights", default="", help="weights 'ses-01=1,ses-02=1,...' (default 1 each)")
+    parser.add_argument("--session-weights", default="", help="weights 'ses-01=1,ses-02=1,...' (default 1 per later session, the pre-op one PREOP_WEIGHT_RATIO times their sum)")
     parser.add_argument(
         "--loss", choices=LOSS_MODES, default=None,
         help="the profiled objective (default per --solver: " + ", ".join(f"{m} {l}" for m, l in DEFAULT_LOSSES.items()) + ")",
