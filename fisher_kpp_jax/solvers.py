@@ -511,7 +511,8 @@ class FKPPSolver(BaseFKPPSolver):
     radiotherapy (RT).
 
     State key: 'cell_density' (u in [0, 1]); grid in mm, time in days
-    with the seed at t = 0. Diffusivity is a WM/GM mixture,
+    with the seed at t = 0, cut to the flux-valid cells
+    (``BaseFKPPSolver._gaussian_seed``). Diffusivity is a WM/GM mixture,
     D = white_matter_diffusivity * (wm_face + gm_face / diffusivity_ratio),
     with faces masked by min_tissue_fraction, built once on the device.
 
@@ -700,7 +701,8 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
     field inside the cavity in every step, and the cavity is removed from
     the tissue mask of the tumor faces and of the nutrient faces, so no
     tumor or nutrient flux crosses the cavity boundary: the cavity behaves
-    like CSF.
+    like CSF. The proliferative seed is cut to the same tissue mask as the
+    nutrient (``BaseFKPPSolver._gaussian_seed``).
     """
 
     _REQUIRED: ClassVar[frozenset[str]] = frozenset(
@@ -832,9 +834,10 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
 
     State key: 'cell_density'. The per-axis diffusivity field (shape
     (Nx, Ny, Nz, 3)) is derived from the tensor diagonals on the host; the
-    crop mask and the seed check come from a brain mask thresholded on that
-    field. Every cell may carry flux (the field is zero outside the brain),
-    so the faces of an untreated run are plain face averages.
+    crop mask, the seed check and the seed cut (``_seed_mask_host``) come
+    from a brain mask thresholded on that field. Every cell may carry flux
+    (the field is zero outside the brain), so the faces of an untreated run
+    are plain face averages.
 
     Treatment: the parameters, their neutral defaults, the horizon and
     the event order are those of ``FKPPSolver`` (see its docstring), the
@@ -1041,6 +1044,11 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         # Every cell may carry flux: the per-axis field is zero outside
         # the brain, so the faces need no mask of their own.
         return np.ones(self._axial_lowres[box].shape[:3], dtype=bool)
+
+    def _seed_mask_host(self) -> NDArray:
+        # The faces carry no mask (above), so the seed is cut by the brain
+        # mask (the cells with a nonzero per-axis field) instead.
+        return self._brainmask_lowres
 
     def _structural_constants(
         self, box: tuple[slice, slice, slice], valid_mask_host: NDArray

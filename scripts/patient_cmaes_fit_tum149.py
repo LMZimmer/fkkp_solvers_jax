@@ -58,9 +58,10 @@ Design choices (2026-10-24)
    the first follow-up scan date (SAILOR rule; here ses-20210406, day
    34). The resection stays RESECTION_DAYS_BEFORE_POSTOP days before the
    post-op scan. The actual treatment dates of the patient are unknown.
-5. Adjuvant cycles are NOT capped at the six cycles of the protocol: as
-   in patient_sensitivity_analysis.py every cycle that starts before the
-   last session is scheduled (12 cycles over the 425-day horizon).
+5. Adjuvant cycles: at most ADJUVANT_CYCLES (6, the protocol's course)
+   of patient_sensitivity_analysis.py, as for SAILOR; fits before
+   2026-10-28 (fit_tum149_2026-10-24, fit_tum149_2026-10-27) had no cap
+   and scheduled every cycle up to the horizon (12 over the 425 days).
 6. Starts: --no-sweep-init is always set (no sensitivity-analysis sweep
    exists for this patient), so without --init-values CMA-ES starts at
    the centre of the unit cube of the search space.
@@ -89,6 +90,7 @@ sys.path.insert(0, str(_ROOT / "scripts"))
 import patient_cmaes_fit  # noqa: E402
 from patient_sensitivity_analysis import (  # noqa: E402
     ADJUVANT_CYCLE_DAYS,
+    ADJUVANT_CYCLES,
     ADJUVANT_DAYS_ON,
     ADJUVANT_DELAY_DAYS,
     CONCOMITANT_DAYS,
@@ -256,7 +258,7 @@ def build_timeline_tum149(sessions_: Sequence[Session], protocol: Protocol) -> T
     adjuvant_start = last_crt + protocol.adjuvant_delay_days
     cycles: list[AdjuvantCycle] = []
     number, start = 1, adjuvant_start
-    while start <= horizon:  # design choice 5: no cap on the number of cycles
+    while start <= horizon and (protocol.adjuvant_cycles is None or number <= protocol.adjuvant_cycles):  # design choice 5
         days = [start + i for i in range(protocol.adjuvant_days_on)]
         kept = tuple(d for d in days if d <= horizon)
         dose = protocol.adjuvant_first_dose if number == 1 else protocol.adjuvant_later_dose
@@ -314,7 +316,7 @@ def design_record() -> dict:
             "adjuvant_delay_days": ADJUVANT_DELAY_DAYS,
             "adjuvant_days_on": ADJUVANT_DAYS_ON,
             "adjuvant_cycle_days": ADJUVANT_CYCLE_DAYS,
-            "adjuvant_cycle_cap": None,
+            "adjuvant_cycles": ADJUVANT_CYCLES,
         },
         "starts": "no sweep starts (--no-sweep-init); centre of the unit cube unless --init-values",
         "notes": "see the module docstring of the script (Design choices, 2026-10-24)",

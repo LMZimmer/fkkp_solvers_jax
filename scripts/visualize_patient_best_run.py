@@ -635,7 +635,12 @@ def main(argv: list[str] | None = None) -> int:
         criterion, criterion_value = FIT_CRITERION, float(resolved[FIT_CRITERION])
         recorded_threshold = resolved.get("core_threshold_star")
         recorded_threshold = None if recorded_threshold is None else float(recorded_threshold)
-        fit_logged_dice = {sid: float(v["dice_core_star"]) for sid, v in resolved["per_session"].items()}
+        # a session whose Dice the fit left undefined (model and reference core both empty) has no logged value
+        fit_logged_dice = {
+            sid: float(v["dice_core_star"])
+            for sid, v in resolved["per_session"].items()
+            if v.get("dice_core_star") is not None
+        }
         default_name = f"best_{spec['name']}_restart{objective['restart']}_eval{objective['eval_id']}"
         origin: dict[str, Any] = {
             "fit_dir": str(fit_dir.resolve()),

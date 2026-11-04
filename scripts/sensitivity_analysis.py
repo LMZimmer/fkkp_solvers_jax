@@ -222,7 +222,9 @@ least its own estimate whenever the growth stage's is (both estimates
 are the same formula in their horizon). run_status.csv and qoi.csv carry
 the resolved growth_dt, growth_n_steps and treated_dt of every run.
 
-Seed. The solver's seed is a clipped Gaussian,
+Seed. The solver's seed is a clipped Gaussian, zero outside the
+solver's flux-valid tissue mask (since 2026-10-28; before, the tails
+outside the tissue grew in place),
 c0(r) = m / (4 pi tau)^(3/2) exp(-r^2 / (4 tau)) with r the distance from
 the seed voxel's centre in mm (voxel offsets times the grid spacing;
 gaussian_seed_scale, which would divide r, is fixed at 1 by the shipped

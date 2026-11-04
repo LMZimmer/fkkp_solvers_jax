@@ -96,9 +96,10 @@ last fraction and the last concomitant day, t3 + 41, so the first
 cycle starts on t3 + 69), ADJUVANT_DAYS_ON (5) days on then 23 off in
 ADJUVANT_CYCLE_DAYS (28) cycles (t3 + 69..73, t3 + 97..101, ...) with
 the base config's per-cycle doses (150 mg/m^2 in cycle 1, 200
-afterwards), as many cycles as start before the last session date, a
-cycle truncated at the end of the run; every event after the last
-session is dropped and counted. NOTE: the schedule constants are this
+afterwards), at most ADJUVANT_CYCLES (6, the protocol's course; no cap
+before 2026-10-28) cycles and only those that start before the last
+session date, a cycle truncated at the end of the run; every event
+after the last session is dropped and counted. NOTE: the schedule constants are this
 analysis's definition (the base config's own schedule is not used
 beyond its dose values; sweeps before 2026-09-17 ran 14-day cycles,
 recorded in their spec.json as adjuvant_cycle_days). The design step prints the
@@ -548,6 +549,7 @@ CONCOMITANT_DAYS = 7 * CRT_WEEKS  # 42 daily TMZ days from t3
 ADJUVANT_DELAY_DAYS = 28  # after the last CRT day
 ADJUVANT_DAYS_ON = 5
 ADJUVANT_CYCLE_DAYS = 28  # 5 on / 23 off (sweeps before 2026-09-17 used 14)
+ADJUVANT_CYCLES = 6  # the protocol's course; runs before 2026-10-28 had no cap (every cycle up to the horizon)
 PROTOCOL_ANCHOR = "ses-03 = day 0 of CRT week 1; weekdays from the calendar are not used"
 # The dose map's maximum should be the total prescribed dose, about 60 Gy.
 RT_TOTAL_DOSE_PLAUSIBLE_GY: tuple[float, float] = (50.0, 70.0)
@@ -1101,6 +1103,9 @@ class Protocol:
         adjuvant_first_dose: TMZ dose of adjuvant cycle 1.
         adjuvant_later_dose: TMZ dose of the later cycles.
         base_cycle_days: The base config's own cycle length (informational).
+        adjuvant_cycles: The most adjuvant cycles scheduled (ADJUVANT_CYCLES);
+            None schedules every cycle that starts by the last session
+            (the rule before 2026-10-28, kept for rebuilding such specs).
     """
 
     concomitant_dose: float
@@ -1112,6 +1117,7 @@ class Protocol:
     adjuvant_delay_days: int = ADJUVANT_DELAY_DAYS
     adjuvant_days_on: int = ADJUVANT_DAYS_ON
     adjuvant_cycle_days: int = ADJUVANT_CYCLE_DAYS
+    adjuvant_cycles: int | None = ADJUVANT_CYCLES
 
     def record(self) -> dict[str, Any]:
         return {
@@ -1127,6 +1133,7 @@ class Protocol:
             "adjuvant_delay_days": self.adjuvant_delay_days,
             "adjuvant_days_on": self.adjuvant_days_on,
             "adjuvant_cycle_days": self.adjuvant_cycle_days,
+            "adjuvant_cycles": self.adjuvant_cycles,
             "base_config_cycle_days": self.base_cycle_days,
             "resection_days_before_postop": RESECTION_DAYS_BEFORE_POSTOP,
         }
@@ -1373,9 +1380,10 @@ def build_timeline(sessions: Sequence[Session], protocol: Protocol) -> Timeline:
     (N_FRACTIONS fractions at t3 + 7 w + d, ``fraction_offsets``;
     CONCOMITANT_DAYS daily TMZ days from t3), the adjuvant cycles from
     ADJUVANT_DELAY_DAYS after the last CRT day in ADJUVANT_CYCLE_DAYS
-    cycles of ADJUVANT_DAYS_ON days, as many as start by the last session
-    date, and every event after the last session dropped (counted).
-    Calendar weekdays are not used (``PROTOCOL_ANCHOR``).
+    cycles of ADJUVANT_DAYS_ON days, at most protocol.adjuvant_cycles of
+    them and only those that start by the last session date, and every
+    event after the last session dropped (counted). Calendar weekdays
+    are not used (``PROTOCOL_ANCHOR``).
 
     Raises:
         ValueError: The resection falls before the pre-op scan or after
@@ -1402,7 +1410,7 @@ def build_timeline(sessions: Sequence[Session], protocol: Protocol) -> Timeline:
     adjuvant_start = last_crt + protocol.adjuvant_delay_days
     cycles: list[AdjuvantCycle] = []
     number, start = 1, adjuvant_start
-    while start <= horizon:
+    while start <= horizon and (protocol.adjuvant_cycles is None or number <= protocol.adjuvant_cycles):
         days = [start + i for i in range(protocol.adjuvant_days_on)]
         kept = tuple(d for d in days if d <= horizon)
         dose = protocol.adjuvant_first_dose if number == 1 else protocol.adjuvant_later_dose
@@ -1459,12 +1467,15 @@ def format_timeline(timeline: Timeline) -> str:
         f"  fractions: {len(rt)} at CRT days {_ranges(timeline.crt_offset(o) for o in rt)}; "
         f"concomitant TMZ: {len(conc)} days at CRT days {_ranges(timeline.crt_offset(o) for o in conc)}; "
         f"adjuvant: {sum(len(c.offsets) for c in timeline.adjuvant_cycles)} days in "
-        f"{len(timeline.adjuvant_cycles)} cycle(s) ({ADJUVANT_DAYS_ON} on / {ADJUVANT_CYCLE_DAYS - ADJUVANT_DAYS_ON} off)"
+        f"{len(timeline.adjuvant_cycles)} cycle(s) ({ADJUVANT_DAYS_ON} on / {ADJUVANT_CYCLE_DAYS - ADJUVANT_DAYS_ON} off; "
+        f"at most {ADJUVANT_CYCLES})"
     )
     lines.append("adjuvant cycle table (CRT day = days after the CRT start; dates for reference):")
     lines.append(f"  {'cycle':<6}{'start':<12}{'end':<12}{'CRT days':>12}{'days on':>8}{'dropped':>8}{'dose':>8}")
     if not timeline.adjuvant_cycles:
         lines.append("  (none: the first cycle would start after the last session)")
+    elif len(timeline.adjuvant_cycles) == ADJUVANT_CYCLES:
+        lines.append(f"  (capped at the protocol's {ADJUVANT_CYCLES} cycles)")
     for c in timeline.adjuvant_cycles:
         end = timeline.date_of(c.offsets[-1]) if c.offsets else timeline.date_of(c.start_offset)
         crt_days = _ranges(timeline.crt_offset(o) for o in c.offsets) if c.offsets else "-"

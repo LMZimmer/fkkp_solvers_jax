@@ -1087,12 +1087,31 @@ class BaseFKPPSolver(ABC):
         """
         return jnp.asarray(float(value), dtype=self._dtype)
 
+    def _seed_mask_host(self) -> NDArray:
+        """
+        Boolean host mask of the cells the seed may occupy, on the full
+        low-resolution grid: the cells that may carry flux
+        (``_valid_mask_host`` over the whole grid). A solver whose faces
+        need no mask of their own overrides it with its brain mask.
+        """
+        return self._valid_mask_host((slice(None), slice(None), slice(None)))
+
     def _gaussian_seed(self) -> jax.Array:
         """
         Create the clipped-Gaussian initial tumor density on the full
-        low-resolution grid.
+        low-resolution grid, zero outside ``_seed_mask_host``.
+
+        The profile is cut, not renormalised: the peak keeps its value
+        and the seeded mass falls below the analytic gaussian_seed_mass
+        by the part of the profile outside the mask. The cut is what
+        keeps the density zero outside the tissue for the whole run: a
+        cell outside the flux-valid mask has every face blocked, the
+        growth term is proportional to the density and the treatment
+        steps only scale or zero it, so an exact zero there stays zero.
+        Without it the tails of a seed near the cortex grow in place in
+        air and CSF (seen on real-data fits before 2026-10-28).
         """
-        return clipped_gaussian(
+        seed = clipped_gaussian(
             self.grid_shape,
             self.seed_voxel,
             self.grid_spacing,
@@ -1102,6 +1121,7 @@ class BaseFKPPSolver(ABC):
             mass=self.params["gaussian_seed_mass"],
             floor=self.params["gaussian_seed_floor"],
         )
+        return jnp.where(jnp.asarray(self._seed_mask_host()), seed, jnp.asarray(0.0, dtype=self._dtype))
 
     def solve(
         self,

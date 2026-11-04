@@ -149,8 +149,8 @@ ses-01 and the later sessions; the pre-op session and every requested
 later session are simulated and recorded, and only the requested ones
 enter the sums; with --objective preop the pre-op session alone), weighted
 by --session-weights (ses-01=1,ses-02=1,...; default 1 per later session
-and PREOP_WEIGHT_RATIO (1.0) times their sum for the pre-op session, so
-by default the pre-op session weighs as much as all later sessions
+and PREOP_WEIGHT_RATIO (0.5) times their sum for the pre-op session, so
+by default the pre-op session weighs half as much as all later sessions
 combined; 1 for the pre-op session alone). A session whose Dice is NaN at a threshold (the model and
 the reference both empty, the SA's ``dice`` convention) is dropped from
 that threshold's mean with its weight (the mean is renormalised over the
@@ -617,8 +617,9 @@ DEFAULT_SESSIONS = "01-08"  # the objective's sessions, the pre-op one included 
 # combined (``parse_session_weights``): unless --session-weights names it,
 # the pre-op weight is PREOP_WEIGHT_RATIO times the sum of the later
 # sessions' weights (1 = as much as all later sessions together, 0.5 = half
-# of that). An objective of the pre-op session alone weighs it 1.
-PREOP_WEIGHT_RATIO = 1.0
+# of that; 1.0 from 2026-10-27 to 2026-10-28, 0.5 since). An objective of
+# the pre-op session alone weighs it 1.
+PREOP_WEIGHT_RATIO = 0.5
 # The fit's masks (``fit_session_references``, since 2026-09-28): the SA's,
 # with every later session's cavity also covering the post-op cavity (the
 # solver's resection cavity), so the region the model keeps empty is never
@@ -1925,13 +1926,20 @@ def build_problem(
 
 
 def protocol_from_spec(spec: Mapping[str, Any]) -> Protocol:
-    """The protocol doses of a fit's spec.json (``Protocol.record``)."""
+    """
+    The protocol doses of a fit's spec.json (``Protocol.record``) and its
+    adjuvant cycle cap: a spec written before 2026-10-28 has no
+    adjuvant_cycles entry and scheduled every cycle up to the horizon,
+    which None reproduces (``build_timeline``).
+    """
     record = spec["protocol"]
+    cycles = record.get("adjuvant_cycles")
     return Protocol(
         concomitant_dose=float(record["concomitant_dose_mg_m2"]),
         adjuvant_first_dose=float(record["adjuvant_first_cycle_dose_mg_m2"]),
         adjuvant_later_dose=float(record["adjuvant_later_cycles_dose_mg_m2"]),
         base_cycle_days=record.get("base_config_cycle_days"),
+        adjuvant_cycles=None if cycles is None else int(cycles),
     )
 
 
