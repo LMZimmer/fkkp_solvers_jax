@@ -169,9 +169,8 @@ def sample_configs(
             config[name] = float(rng.uniform(low, high))
         voxel = cavity_voxels[rng.integers(len(cavity_voxels))]
         config["seed_voxel"] = [int(v) for v in voxel]
-        for axis, (v, n) in enumerate(zip(voxel, grid_shape)):
-            # +0.5 so the solver's int(fraction * N) lands on the voxel.
-            config[f"gaussian_seed_{'xyz'[axis]}_fraction"] = (int(v) + 0.5) / n
+        # +0.5 so the solver's int(fraction * N) lands on the voxel.
+        config["gaussian_seed_positions"] = [[(int(v) + 0.5) / n for v, n in zip(voxel, grid_shape)]]
         configs.append(config)
     return configs
 
@@ -184,9 +183,7 @@ def config_entries(base: dict[str, Any], config: dict[str, Any]) -> dict[str, An
         "rho",
         "white_matter_diffusivity",
         "diffusivity_ratio",
-        "gaussian_seed_x_fraction",
-        "gaussian_seed_y_fraction",
-        "gaussian_seed_z_fraction",
+        "gaussian_seed_positions",
         "resection_time",
         "chemo_kill_rate",
         "chemo_decay_rate",

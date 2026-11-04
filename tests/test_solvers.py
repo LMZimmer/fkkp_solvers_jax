@@ -24,9 +24,7 @@ from loguru import logger
 # f64 keeps the invariant checks tight; the f32 path is covered by
 # test_f32_vs_f64_agreement and the (default-precision) retrace test.
 _COMMON = dict(
-    gaussian_seed_x_fraction=0.5,
-    gaussian_seed_y_fraction=0.5,
-    gaussian_seed_z_fraction=0.5,
+    gaussian_seed_positions=[[0.5, 0.5, 0.5]],
     # The phantom seed is pinned (peak 0.50, sigma 3.2 mm, about 160 mass
     # units inside the 9-voxel phantom): the solver defaults (tau 15,
     # mass 1500, GliODIL's seed) fill the phantom and put its mass past
@@ -276,17 +274,27 @@ def test_no_time_series_by_default(tissue_phantom):
 
 def test_seed_outside_tissue_errors(tissue_phantom):
     gm, wm = tissue_phantom
-    params = fk_params(
-        gm,
-        wm,
-        gaussian_seed_x_fraction=0.02,
-        gaussian_seed_y_fraction=0.02,
-        gaussian_seed_z_fraction=0.02,
-    )
+    params = fk_params(gm, wm, gaussian_seed_positions=[[0.02, 0.02, 0.02]])
     result = FKPPSolver(params).solve()
     assert result.success is False
     assert result.stopping_criterion == "error"
-    assert result.error == "Initial tumor position is outside the brain matter."
+    assert result.error.startswith("Initial tumor position is outside the brain matter")
+
+
+def test_multi_seed_run(tissue_phantom):
+    """Two seeds with per-seed masses: the run succeeds and the initial
+    field holds more mass than the single seed's; a per-seed list of the
+    wrong length is refused."""
+    gm, wm = tissue_phantom
+    single = FKPPSolver(fk_params(gm, wm)).solve()
+    two = [[0.35, 0.5, 0.5], [0.65, 0.5, 0.5]]
+    double = FKPPSolver(
+        fk_params(gm, wm, gaussian_seed_positions=two, gaussian_seed_mass=[250.0, 125.0])
+    ).solve()
+    assert double.success, double.error
+    assert double.initial_state["cell_density"].sum() > single.initial_state["cell_density"].sum()
+    with pytest.raises(ValueError, match="one value per seed"):
+        FKPPSolver(fk_params(gm, wm, gaussian_seed_positions=two, gaussian_seed_mass=[1.0, 2.0, 3.0]))
 
 
 def test_param_validation_errors(tissue_phantom):

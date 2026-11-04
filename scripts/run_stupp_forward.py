@@ -143,8 +143,9 @@ def main(argv: list[str] | None = None) -> int:
         frames = result.time_series["cell_density"]
         times = result.snapshot_times
         masses = frames.sum(axis=(1, 2, 3))
+        # The first seed (the montage marks one seed).
         seed_voxel = tuple(
-            int(params[f"gaussian_seed_{axis}_fraction"] * n) for axis, n in zip("xyz", wm.shape)
+            int(f * n) for f, n in zip(params["gaussian_seed_positions"][0], wm.shape)
         )
         if args.background_image is not None:
             background = np.asarray(nib.load(args.background_image).get_fdata(), dtype=np.float64)

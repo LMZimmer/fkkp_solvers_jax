@@ -218,7 +218,7 @@ evaluation (``FitProblem.derive``):
                 Euclidean voxel distance (scipy's cKDTree over the seedable
                 indices, built once); seed_voxel_i/j/k and seed_snapped are
                 recorded. The config receives
-                gaussian_seed_{x,y,z}_fraction = (v + 0.5) / n as
+                gaussian_seed_positions = [[(v + 0.5) / n per axis]] as
                 ``project_seeds`` writes them (int(fraction n) recovers v;
                 checked for every seedable voxel at start-up).
   direct        rt_alpha and chemo_kill_rate are written as they are.
@@ -716,7 +716,7 @@ DERIVED_SOLVER_KEYS: tuple[str, ...] = (
     "gaussian_seed_mass",
     "gaussian_seed_diffusion_time",
 )
-SEED_FRACTION_KEYS: tuple[str, ...] = tuple(f"gaussian_seed_{axis}_fraction" for axis in "xyz")
+SEED_POSITIONS_KEY = "gaussian_seed_positions"  # the solver's seed entry, [[x, y, z]] fractions
 # Config entries the script sets per evaluation; a search space may not hold them.
 FORBIDDEN_KEYS: tuple[str, ...] = (
     *TIMELINE_KEYS,
@@ -725,7 +725,7 @@ FORBIDDEN_KEYS: tuple[str, ...] = (
     *TIME_STEP_KEYS,
     "resolution_factor",
     *DERIVED_SOLVER_KEYS,
-    *SEED_FRACTION_KEYS,
+    SEED_POSITIONS_KEY,
 )
 # The resolved base-config values the parametrisation depends on.
 CONSTANT_KEYS: tuple[str, ...] = ("min_tissue_fraction", "gaussian_seed_floor", "gaussian_seed_scale")
@@ -1779,7 +1779,7 @@ class FitProblem:
             gaussian_seed_diffusion_time=point.gaussian_seed_diffusion_time,
         )
         config.update({name: point.physical[name] for name in self.space.solver_factor_names})
-        config.update(dict(zip(SEED_FRACTION_KEYS, point.seed_fractions, strict=True)))
+        config[SEED_POSITIONS_KEY] = [list(point.seed_fractions)]
         config.update({key: str(path) for key, path in self.data.tissue.items()})
         config.update(volumes)
         config.update(schedule)

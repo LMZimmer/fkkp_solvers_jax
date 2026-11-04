@@ -220,10 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     if not all(0 <= seed_voxel[i] < wm.shape[i] for i in range(3)):
         raise ValueError(f"--seed-voxel {seed_voxel} lies outside the grid {wm.shape}.")
     # +0.5 so the solver's int(fraction * N) lands on the voxel.
-    seed_fractions = {
-        f"gaussian_seed_{axis}_fraction": (seed_voxel[i] + 0.5) / wm.shape[i]
-        for i, axis in enumerate("xyz")
-    }
+    seed_positions = [[(seed_voxel[i] + 0.5) / wm.shape[i] for i in range(3)]]
     # The tissue maps are passed as arrays, so the voxel size is given
     # explicitly (it would otherwise come from the reference volume's header).
     config.update(
@@ -231,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         white_matter_pbmap=wm,
         voxel_size_mm=voxel_size,
         verbose=False,
-        **seed_fractions,
+        gaussian_seed_positions=seed_positions,
     )
     resection_time = float(config["resection_time"])
     stopping_time = float(args.horizon_days)

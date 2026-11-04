@@ -20,6 +20,13 @@ config, a result record and the result volumes into a directory, and
 names the class, and a ``"solver"`` entry in the config is checked against
 it, never used to pick one.
 
+Every solver seeds its tumour field at ``gaussian_seed_positions``, a
+list of ``[x, y, z]`` grid fractions: one row is the classic single
+Gaussian seed, several rows sum one Gaussian per row, each with the
+per-seed ``gaussian_seed_diffusion_time`` and ``gaussian_seed_mass`` (a
+one-entry list applies to every seed), floored and clipped once (see
+``BaseFKPPSolver``).
+
 Common solver options: ``precision: "f32" | "f64"`` (default "f32")
 selects the device state dtype; the horizon is given as at most one of
 ``stopping_time`` or ``time_after_resection`` (days; neither: 100 days);

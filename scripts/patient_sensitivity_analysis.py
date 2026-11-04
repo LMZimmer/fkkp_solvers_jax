@@ -407,6 +407,7 @@ from sensitivity_analysis import (  # noqa: E402
     run_records,
     saltelli_design,
     seed_geometry,
+    seed_positions_entry,
     snapshot_days,
     sobol_rows,
     write_csv,
@@ -1680,7 +1681,10 @@ def run_config(
     }
     config.update({key: value for key, value in base.items() if key != SOLVER_KEY})
     config.update(space.overrides)
+    values = dict(values)
+    seed_positions = seed_positions_entry(values)
     config.update(values)
+    config["gaussian_seed_positions"] = seed_positions
     config.update({key: str(path) for key, path in data.tissue.items()})
     config["resection_cavity"] = {"segmentation": str(data.segmentations[data.cavity_session]), "label": LABEL_CAVITY}
     config["rt_dose"] = str(data.dose)

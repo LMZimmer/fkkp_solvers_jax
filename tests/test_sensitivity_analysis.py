@@ -148,9 +148,7 @@ def phantom_base(tmp_path: Path, tissue_phantom) -> dict:
         "gray_matter_pbmap": "volumes/gm.nii.gz",
         "white_matter_diffusivity": 0.2,
         "rho": 0.15,
-        "gaussian_seed_x_fraction": 0.5,
-        "gaussian_seed_y_fraction": 0.5,
-        "gaussian_seed_z_fraction": 0.5,
+        "gaussian_seed_positions": [[0.5, 0.5, 0.5]],
         # Pinned so the phantom's seed (mass 250 in the search space: a peak
         # of 0.50, sigma 3.2 mm on the 24-voxel grid) does not follow the
         # solver defaults (tau 15, at which mass 250 is below the floor).
@@ -485,8 +483,8 @@ def test_seed_derivation(tissue_phantom):
         solver = FKPPSolver({
             "white_matter_pbmap": wm, "gray_matter_pbmap": gm, "white_matter_diffusivity": 0.1, "rho": 0.1,
             "voxel_size_mm": list(zooms), "resolution_factor": factor, "precision": "f64", "stopping_time": 1.0,
-            "steps_per_day": 10, "gaussian_seed_x_fraction": 0.5, "gaussian_seed_y_fraction": 0.5,
-            "gaussian_seed_z_fraction": 0.5, "gaussian_seed_scale": 1.0, "gaussian_seed_floor": 0.1,
+            "steps_per_day": 10, "gaussian_seed_positions": [[0.5, 0.5, 0.5]],
+            "gaussian_seed_scale": 1.0, "gaussian_seed_floor": 0.1,
             "gaussian_seed_mass": float(d["gaussian_seed_mass"]),
             "gaussian_seed_diffusion_time": float(d["gaussian_seed_diffusion_time"]),
         })

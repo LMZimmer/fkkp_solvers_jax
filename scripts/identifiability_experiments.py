@@ -1271,7 +1271,8 @@ class Patient:
         """The patient a StuppFKPPSolver config describes (its D, rho,
         seed, resection_time, rt_alpha, chemo_kill_rate)."""
         front = sa.front_parameters(config["white_matter_diffusivity"], config["rho"])
-        tau = float(config["gaussian_seed_diffusion_time"])
+        tau = sa.single_seed_value(config["gaussian_seed_diffusion_time"], "gaussian_seed_diffusion_time")
+        mass = sa.single_seed_value(config["gaussian_seed_mass"], "gaussian_seed_mass")
         return cls(
             id=id,
             cell=cell,
@@ -1280,7 +1281,7 @@ class Patient:
             resection_time=float(config["resection_time"]),
             rt_alpha=float(config["rt_alpha"]),
             chemo_kill_rate=float(config["chemo_kill_rate"]),
-            seed_peak=float(sa.seed_peak_density(config["gaussian_seed_mass"], tau)),
+            seed_peak=float(sa.seed_peak_density(mass, tau)),
             seed_sigma=float(np.sqrt(2.0 * tau)),
             steps_per_day=None if config.get("steps_per_day") is None else int(config["steps_per_day"]),
         )
@@ -2242,8 +2243,7 @@ def patient_config(cohort: Cohort, patient: Patient, horizon: float) -> dict[str
     config: dict[str, Any] = {SOLVER_KEY: sa.SOLVER_NAME}
     config.update({key: value for key, value in base.items() if key != SOLVER_KEY})
     config.update(patient.solver_values())
-    for key, fraction in zip(sa.SEED_KEYS, cohort.seed_fractions):
-        config[key] = fraction
+    config[sa.SEED_POSITIONS_KEY] = [[float(f) for f in cohort.seed_fractions]]
     config["time_after_resection"] = float(horizon)
     schedule = sa.truncate_schedule(base, {"time_after_resection": float(horizon)})
     shift = patient.resection_time - float(base["resection_time"])

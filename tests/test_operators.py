@@ -140,31 +140,46 @@ def test_clipped_gaussian(mass: float) -> None:
     mass=4000 raises the amplitude above 1 (1.55 at the default width) so
     the cap is exercised too; the default mass peaks at 0.58.
     exp() may differ by ~1 ULP between XLA and libm; the floor/cap clipping
-    thresholds are only crossed well away from these values here.
+    thresholds are only crossed well away from these values here. A
+    second centre with its own width and mass adds its kernel before the
+    floor and the cap are applied.
     """
     shape = (20, 21, 22)
     center = (10, 9, 11)
+    other = (4, 14, 6)
     spacing = (1.4, 1.1, 0.8)
     scale = 1.3
+    diffusion_time = jax_ops.GAUSSIAN_SEED_DIFFUSION_TIME
     with jax.enable_x64():
         ours = np.asarray(
             jax_ops.clipped_gaussian(
-                shape, center, spacing, scale=scale, dtype=np.float64, mass=mass
+                shape, [center], spacing, scale=scale, dtype=np.float64, masses=mass
+            )
+        )
+        two = np.asarray(
+            jax_ops.clipped_gaussian(
+                shape, [center, other], spacing, scale=scale, dtype=np.float64,
+                diffusion_times=[diffusion_time, diffusion_time / 2], masses=[mass, mass / 2],
             )
         )
 
     idx = np.indices(shape, dtype=np.float64)
-    sq = sum(
-        ((idx[a] - center[a]) * spacing[a] / scale) ** 2 for a in range(3)
-    )
-    diffusion_time = jax_ops.GAUSSIAN_SEED_DIFFUSION_TIME
-    amplitude = mass / (4 * np.pi * diffusion_time) ** 1.5
-    expected = amplitude * np.exp(-sq / (4 * diffusion_time))
-    expected[expected <= jax_ops.GAUSSIAN_SEED_FLOOR] = 0.0
-    expected = np.minimum(expected, 1.0)
+
+    def kernel(c, tau, m):
+        sq = sum(((idx[a] - c[a]) * spacing[a] / scale) ** 2 for a in range(3))
+        return m / (4 * np.pi * tau) ** 1.5 * np.exp(-sq / (4 * tau))
+
+    def clipped(field):
+        field = field.copy()
+        field[field <= jax_ops.GAUSSIAN_SEED_FLOOR] = 0.0
+        return np.minimum(field, 1.0)
+
+    expected = clipped(kernel(center, diffusion_time, mass))
     assert (ours == 1.0).any() == (mass == 4000.0)  # cap active only at high mass
     assert (ours == 0.0).any()  # floor active
     np.testing.assert_allclose(ours, expected, rtol=1e-13, atol=1e-16)
+    expected_two = clipped(kernel(center, diffusion_time, mass) + kernel(other, diffusion_time / 2, mass / 2))
+    np.testing.assert_allclose(two, expected_two, rtol=1e-12, atol=1e-16)
 
 
 def test_tissue_bounding_box() -> None:

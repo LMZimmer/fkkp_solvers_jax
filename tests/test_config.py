@@ -43,9 +43,7 @@ SOLVERS = [
 ]
 
 _COMMON = dict(
-    gaussian_seed_x_fraction=0.5,
-    gaussian_seed_y_fraction=0.5,
-    gaussian_seed_z_fraction=0.5,
+    gaussian_seed_positions=[[0.5, 0.5, 0.5]],
     resolution_factor=0.6,
     stopping_time=10,
     precision="f64",
@@ -509,7 +507,7 @@ def test_save_and_reload(tmp_path, tissue_phantom, phantom_paths):
         solver.solve(store_result=True)
     # A failed run (seed outside the tissue) writes the JSON files only.
     failing = FKPPSolver(
-        **{**config, **{f"gaussian_seed_{axis}_fraction": 0.02 for axis in "xyz"}}
+        **{**config, "gaussian_seed_positions": [[0.02, 0.02, 0.02]]}
     )
     failed = failing.solve(store_result=True, outdir=tmp_path / "failed")
     assert not failed.success and failed.n_steps is None

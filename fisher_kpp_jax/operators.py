@@ -192,33 +192,23 @@ def logistic_sigmoid(x: jax.Array) -> jax.Array:
     return 1 / (1 + jnp.exp(-x))
 
 
-def clipped_gaussian(
+@partial(jax.jit, static_argnames=("grid_shape", "dtype"))
+def _gaussian_sum(
+    centers: jax.Array,
+    grid_spacing: jax.Array,
+    diffusion_times: jax.Array,
+    amplitudes: jax.Array,
+    scale: jax.Array,
+    *,
     grid_shape: tuple[int, int, int],
-    center_voxel: tuple[int, int, int],
-    grid_spacing: tuple[float, float, float],
-    scale: float = 1.0,
-    dtype: jnp.dtype = jnp.float64,
-    diffusion_time: float = GAUSSIAN_SEED_DIFFUSION_TIME,
-    mass: float = GAUSSIAN_SEED_MASS,
-    floor: float = GAUSSIAN_SEED_FLOOR,
+    dtype: jnp.dtype,
 ) -> jax.Array:
     """
-    Create the initial tumor cell density: an isotropic Gaussian profile
-    centered at center_voxel. Values below floor are set to 0, values above
-    1 are clipped to 1.
-
-    Args:
-        grid_shape: Grid shape of the output field.
-        center_voxel: Voxel index of the profile center.
-        grid_spacing: Grid spacing (dx, dy, dz) in mm.
-        scale: Widens the seed by scaling the voxel coordinates.
-        dtype: Dtype at which the whole profile is evaluated.
-        diffusion_time: Width of the analytic heat kernel.
-        mass: Total mass of the analytic heat kernel.
-        floor: Values at or below this are zeroed.
-
-    Returns:
-        The clipped Gaussian profile of the given shape and dtype.
+    The sum of the heat kernels of ``clipped_gaussian`` before the floor
+    and the clip, accumulated one centre at a time by a ``lax.scan`` so
+    that the memory stays one grid regardless of the number of centres.
+    The accumulator starts at zero, so a single centre gives its kernel
+    exactly.
     """
     xv, yv, zv = jnp.meshgrid(
         jnp.arange(0, grid_shape[0], dtype=dtype),
@@ -226,20 +216,79 @@ def clipped_gaussian(
         jnp.arange(0, grid_shape[2], dtype=dtype),
         indexing="ij",
     )
-    x_scaled = (xv - center_voxel[0]) * grid_spacing[0] / scale
-    y_scaled = (yv - center_voxel[1]) * grid_spacing[1] / scale
-    z_scaled = (zv - center_voxel[2]) * grid_spacing[2] / scale
 
-    amplitude = jnp.asarray(
-        mass / np.power(4 * np.pi * diffusion_time, 3 / 2),
+    def add_kernel(
+        total: jax.Array, seed: tuple[jax.Array, jax.Array, jax.Array]
+    ) -> tuple[jax.Array, None]:
+        center, diffusion_time, amplitude = seed
+        x_scaled = (xv - center[0]) * grid_spacing[0] / scale
+        y_scaled = (yv - center[1]) * grid_spacing[1] / scale
+        z_scaled = (zv - center[2]) * grid_spacing[2] / scale
+        gauss = amplitude * jnp.exp(
+            -(x_scaled**2 + y_scaled**2 + z_scaled**2) / (4 * diffusion_time)
+        )
+        return total + gauss, None
+
+    total, _ = jax.lax.scan(
+        add_kernel,
+        jnp.zeros(grid_shape, dtype=dtype),
+        (centers, diffusion_times, amplitudes),
+    )
+    return total
+
+
+def clipped_gaussian(
+    grid_shape: tuple[int, int, int],
+    centers: NDArray | Sequence[Sequence[int]],
+    grid_spacing: tuple[float, float, float],
+    scale: float = 1.0,
+    dtype: jnp.dtype = jnp.float64,
+    diffusion_times: NDArray | Sequence[float] | float = GAUSSIAN_SEED_DIFFUSION_TIME,
+    masses: NDArray | Sequence[float] | float = GAUSSIAN_SEED_MASS,
+    floor: float = GAUSSIAN_SEED_FLOOR,
+) -> jax.Array:
+    """
+    Create the initial tumor cell density: the sum of one isotropic
+    Gaussian profile per centre, each with its own width and mass. The
+    sum is floored and clipped once: values at or below floor are set to
+    0, values above 1 are clipped to 1. With one centre this is the single
+    clipped Gaussian seed.
+
+    Args:
+        grid_shape: Grid shape of the output field.
+        centers: Voxel indices of the profile centres, (n, 3) with n >= 1.
+        grid_spacing: Grid spacing (dx, dy, dz) in mm.
+        scale: Widens every seed by scaling the voxel coordinates.
+        dtype: Dtype at which the whole profile is evaluated.
+        diffusion_times: Width of the analytic heat kernel per centre,
+            (n,); a scalar applies to every centre.
+        masses: Total mass of the analytic heat kernel per centre, (n,);
+            a scalar applies to every centre.
+        floor: Values at or below this are zeroed, after the sum.
+
+    Returns:
+        The clipped sum of the Gaussian profiles, of the given shape and
+        dtype.
+    """
+    centers_host = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    n_seeds = centers_host.shape[0]
+    taus_host = np.broadcast_to(np.asarray(diffusion_times, dtype=np.float64), (n_seeds,))
+    masses_host = np.broadcast_to(np.asarray(masses, dtype=np.float64), (n_seeds,))
+    # The amplitudes are evaluated in float64 on the host, as the single
+    # seed's amplitude was, then cast to the state dtype.
+    amplitudes_host = masses_host / np.power(4 * np.pi * taus_host, 3 / 2)
+    total = _gaussian_sum(
+        jnp.asarray(centers_host, dtype=dtype),
+        jnp.asarray(np.asarray(grid_spacing, dtype=np.float64), dtype=dtype),
+        jnp.asarray(taus_host, dtype=dtype),
+        jnp.asarray(amplitudes_host, dtype=dtype),
+        jnp.asarray(float(scale), dtype=dtype),
+        grid_shape=tuple(int(s) for s in grid_shape),
         dtype=dtype,
     )
-    gauss = amplitude * jnp.exp(
-        -(x_scaled**2 + y_scaled**2 + z_scaled**2) / (4 * diffusion_time)
-    )
-    gauss = jnp.where(gauss > floor, gauss, 0)
-    gauss = jnp.where(gauss > 1, jnp.asarray(1.0, dtype=dtype), gauss)
-    return gauss
+    total = jnp.where(total > floor, total, 0)
+    total = jnp.where(total > 1, jnp.asarray(1.0, dtype=dtype), total)
+    return total
 
 
 def tissue_bounding_box(

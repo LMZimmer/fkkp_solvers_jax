@@ -608,7 +608,32 @@ PRE_PREFIX = "pre_"  # the QoI columns of that field
 # horizon-dependent stability estimate.
 TIME_STEP_KEYS: tuple[str, ...] = ("n_steps", "dt", "steps_per_day")
 
+# The three seed factors of a search space (script factors, linear on
+# [0, 1], projected onto the seedable voxels): a design record holds them
+# as the projected fractions, and ``seed_positions_entry`` turns them into
+# the solver's SEED_POSITIONS_KEY entry when the run config is written.
 SEED_KEYS: tuple[str, ...] = tuple(f"gaussian_seed_{axis}_fraction" for axis in "xyz")
+SEED_POSITIONS_KEY = "gaussian_seed_positions"
+
+
+def seed_positions_entry(values: dict[str, Any]) -> list[list[float]]:
+    """Pop the three seed factors (``SEED_KEYS``, the projected fractions
+    of a design record) from values and return the solver's
+    gaussian_seed_positions entry: one [x, y, z] row."""
+    return [[float(values.pop(key)) for key in SEED_KEYS]]
+
+
+def single_seed_value(value: Any, key: str) -> float:
+    """The value of a per-seed entry (gaussian_seed_mass,
+    gaussian_seed_diffusion_time) of a single-seed config: a number or a
+    one-entry sequence; several entries raise, since the scripts' seed
+    derivations describe one seed."""
+    values = np.asarray(value, dtype=np.float64).reshape(-1)
+    if values.size != 1:
+        raise ValueError(f"{key} holds {values.size} per-seed values; a single-seed config is expected.")
+    return float(values[0])
+
+
 # The derived factor group of the growth dynamics: the front speed v and
 # the front width lambda of the Fisher-KPP travelling wave are sampled,
 # white_matter_diffusivity and rho derived (see ``growth_parameters``).
@@ -1457,7 +1482,9 @@ def load_search_space(
         where = f"search space {path}"
     if not isinstance(entries, Mapping):
         raise ValueError(f"{where}: must be a JSON object.")
-    known = frozenset(config_keys)
+    # The seed factors are script factors, not solver parameters: the
+    # solver takes gaussian_seed_positions, which run_config builds.
+    known = frozenset(config_keys) | frozenset(SEED_KEYS)
     factors: dict[str, SearchSpaceParameter] = {}
     overrides: dict[str, Any] = {}
     groups: dict[str, DerivedGroup] = {}
@@ -1912,7 +1939,10 @@ def run_config(
     }
     config.update({key: value for key, value in base.items() if key != SOLVER_KEY})
     config.update(space.overrides)
+    values = dict(values)
+    seed_positions = seed_positions_entry(values)
     config.update(values)
+    config[SEED_POSITIONS_KEY] = seed_positions
     schedule = truncate_schedule(base, space.overrides)
     shift = float(config["resection_time"]) - float(base["resection_time"])
     config["chemo_doses"] = schedule["chemo_doses"]

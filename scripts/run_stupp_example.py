@@ -112,11 +112,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"seed label {args.seed_label} is absent from the cavity segmentation.")
     seed_voxel = tuple(int(v) for v in np.rint(center_of_mass(segmentation == args.seed_label)))
     # +0.5 so the solver's int(fraction * N) lands on the voxel.
-    seed_fractions = {
-        f"gaussian_seed_{axis}_fraction": (seed_voxel[i] + 0.5) / segmentation.shape[i]
-        for i, axis in enumerate("xyz")
-    }
-    config.update(seed_fractions, verbose=False)
+    seed_positions = [[(seed_voxel[i] + 0.5) / segmentation.shape[i] for i in range(3)]]
+    config.update(gaussian_seed_positions=seed_positions, verbose=False)
     solver = StuppFKPPSolver(config)
     params = solver.params
     wm = params["white_matter_pbmap"]

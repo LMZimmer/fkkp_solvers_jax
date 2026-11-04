@@ -105,9 +105,14 @@ DERIVED_KEYS: tuple[str, ...] = ("stopping_time", "volume_threshold", "voxel_siz
 # Directory of the pre-written default configs, one per solver class.
 DEFAULT_CONFIG_DIR: Path = Path(__file__).resolve().parent / "configs"
 
-GAUSSIAN_SEED_POSITION_FRACTION: tuple[str, ...] = tuple(
-    f"gaussian_seed_{axis}_fraction" for axis in "xyz"
-)
+# The seed parameters shared by every solver: the seed centres as
+# fractions of the grid per axis, (n, 3) with n >= 1 (the single seed is
+# one row), and the per-seed width and mass (``SEED_PER_SEED_KEYS``), each
+# a scalar or a one-entry sequence (the same value at every seed) or a
+# sequence with one value per seed. ``_validate_seed`` checks them and
+# stores float64 arrays, (n, 3) and (n,), in params.
+SEED_POSITIONS_KEY: str = "gaussian_seed_positions"
+SEED_PER_SEED_KEYS: tuple[str, ...] = ("gaussian_seed_diffusion_time", "gaussian_seed_mass")
 
 
 class _SharedConstants(TypedDict):
@@ -464,13 +469,50 @@ def _snapshot_steps(
     return steps, (steps + 1) * dt
 
 
-def _validate_unit_interval(
-    parameters: Mapping[str, Any], key: str, solver_name: str
-) -> None:
-    """Check that the parameter named key lies in [0, 1]."""
-    value = parameters[key]
-    if not 0 <= value <= 1:
-        raise ValueError(f"{solver_name}: {key} must be between 0 and 1, got {value!r}.")
+def _validate_seed(parameters: dict[str, Any], solver_name: str) -> None:
+    """
+    Check the seed parameters (in place): ``SEED_POSITIONS_KEY`` becomes a
+    float64 array (n, 3) of fractions in [0, 1], n >= 1, and each of the
+    ``SEED_PER_SEED_KEYS`` a float64 array (n,) of finite positive values,
+    a scalar or a one-entry sequence being broadcast to every seed.
+
+    Args:
+        parameters: Merged parameter dict, modified in place.
+        solver_name: Solver class name, used in error messages.
+    """
+    try:
+        positions = np.asarray(parameters[SEED_POSITIONS_KEY], dtype=np.float64)
+    except (TypeError, ValueError):
+        positions = np.empty((0,))
+    if positions.ndim != 2 or positions.shape[1] != 3 or positions.shape[0] < 1:
+        raise ValueError(
+            f"{solver_name}: {SEED_POSITIONS_KEY} must be a sequence of [x, y, z] "
+            f"fractions, (n, 3) with n >= 1, got {parameters[SEED_POSITIONS_KEY]!r}."
+        )
+    if not np.all(np.isfinite(positions)) or np.any(positions < 0) or np.any(positions > 1):
+        raise ValueError(f"{solver_name}: every {SEED_POSITIONS_KEY} entry must lie in [0, 1].")
+    parameters[SEED_POSITIONS_KEY] = positions
+    n_seeds = positions.shape[0]
+    for key in SEED_PER_SEED_KEYS:
+        try:
+            values = np.asarray(parameters[key], dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{solver_name}: {key} must be a number or a sequence of numbers, "
+                f"got {parameters[key]!r}."
+            ) from None
+        if values.size == 1:
+            values = np.broadcast_to(values, (n_seeds,)).copy()
+        elif values.size != n_seeds:
+            raise ValueError(
+                f"{solver_name}: {key} has {values.size} entries for {n_seeds} seed(s); "
+                "give one value per seed, or one value for every seed."
+            )
+        if not np.all(np.isfinite(values)) or np.any(values <= 0):
+            raise ValueError(
+                f"{solver_name}: {key} must be finite and positive, got {parameters[key]!r}."
+            )
+        parameters[key] = values
 
 
 def _validate_tissue_arrays(parameters: Mapping[str, Any], solver_name: str) -> None:
@@ -690,6 +732,16 @@ class BaseFKPPSolver(ABC):
     are all neutral is the untreated run: it compiles the model's update
     alone and builds no treatment volume (``_is_treated``).
 
+    Every solver seeds its tumour field with the clipped sum of Gaussian
+    kernels at ``gaussian_seed_positions`` (fractions of the grid per
+    axis, (n, 3); one row is the single seed), each kernel with the width
+    ``gaussian_seed_diffusion_time`` and the mass ``gaussian_seed_mass``
+    of its seed (a scalar or a one-entry list applies to every seed, a
+    list gives one value per seed), widened by ``gaussian_seed_scale``,
+    then floored at ``gaussian_seed_floor`` and clipped at 1
+    (``operators.clipped_gaussian``). The seed voxel of a row is
+    int(fraction * n) per axis on the low-resolution grid.
+
     Attributes:
         TREATMENT_KEYS: Names of the treatment parameters, the same for
             every solver.
@@ -714,8 +766,9 @@ class BaseFKPPSolver(ABC):
             downsampling, before any hook that uses it is called.
         grid_spacing: Grid spacing in mm after downsampling, populated by
             solve() alongside grid_shape.
-        seed_voxel: Voxel index of the Gaussian seed center, populated by
-            solve() alongside grid_shape.
+        seed_voxels: Voxel indices of the seed centres on the
+            low-resolution grid, int64 (n, 3), populated by solve()
+            alongside grid_shape; ``seed_voxel`` is the first row.
     """
 
     params: dict[str, Any]
@@ -726,7 +779,7 @@ class BaseFKPPSolver(ABC):
     dt: float | None
     grid_shape: tuple[int, int, int]
     grid_spacing: tuple[float, float, float]
-    seed_voxel: tuple[int, int, int]
+    seed_voxels: NDArray
 
     # The treatment parameters (a params dict without them is an untreated
     # run). Every solver's _DEFAULTS holds them at their neutral values
@@ -784,8 +837,7 @@ class BaseFKPPSolver(ABC):
         header_voxel_size = self._load_volumes(merged)
         self._resolve_voxel_size(merged, header_voxel_size)
         _validate_parameters(merged, name)
-        for key in GAUSSIAN_SEED_POSITION_FRACTION:
-            _validate_unit_interval(merged, key, name)
+        _validate_seed(merged, name)
         self._validate_extra(merged)
         # The horizon first: the event-time checks of the treatment
         # validation read parameters["stopping_time"].
@@ -1074,6 +1126,13 @@ class BaseFKPPSolver(ABC):
         return dx * dy * dz
 
     @property
+    def seed_voxel(self) -> tuple[int, int, int]:
+        """Voxel index of the first seed centre (the seed of a single-seed
+        run), available once the grid is set up."""
+        i, j, k = self.seed_voxels[0]
+        return int(i), int(j), int(k)
+
+    @property
     def _dtype(self) -> jnp.dtype:
         """Device state dtype selected by the ``precision`` parameter."""
         return jnp.float64 if self.params["precision"] == "f64" else jnp.float32
@@ -1098,10 +1157,12 @@ class BaseFKPPSolver(ABC):
 
     def _gaussian_seed(self) -> jax.Array:
         """
-        Create the clipped-Gaussian initial tumor density on the full
-        low-resolution grid, zero outside ``_seed_mask_host``.
+        Create the initial tumor density on the full low-resolution grid:
+        the sum of one Gaussian kernel per seed voxel (``seed_voxels``),
+        each with its seed's width and mass, floored and clipped once
+        (``operators.clipped_gaussian``), zero outside ``_seed_mask_host``.
 
-        The profile is cut, not renormalised: the peak keeps its value
+        The profile is cut, not renormalised: the peaks keep their value
         and the seeded mass falls below the analytic gaussian_seed_mass
         by the part of the profile outside the mask. The cut is what
         keeps the density zero outside the tissue for the whole run: a
@@ -1113,12 +1174,12 @@ class BaseFKPPSolver(ABC):
         """
         seed = clipped_gaussian(
             self.grid_shape,
-            self.seed_voxel,
+            self.seed_voxels,
             self.grid_spacing,
             scale=self.params["gaussian_seed_scale"],
             dtype=self._dtype,
-            diffusion_time=self.params["gaussian_seed_diffusion_time"],
-            mass=self.params["gaussian_seed_mass"],
+            diffusion_times=self.params["gaussian_seed_diffusion_time"],
+            masses=self.params["gaussian_seed_mass"],
             floor=self.params["gaussian_seed_floor"],
         )
         return jnp.where(jnp.asarray(self._seed_mask_host()), seed, jnp.asarray(0.0, dtype=self._dtype))
@@ -1233,7 +1294,7 @@ class BaseFKPPSolver(ABC):
         """
         Downsample the input fields and set up the grid geometry.
 
-        Populates grid_shape, grid_spacing and seed_voxel, then runs the
+        Populates grid_shape, grid_spacing and seed_voxels, then runs the
         seed check.
 
         Returns:
@@ -1251,12 +1312,15 @@ class BaseFKPPSolver(ABC):
             vy / resolution_factor,
             vz / resolution_factor,
         )
-        nx, ny, nz = lowres_shape
-        self.seed_voxel = (
-            int(params["gaussian_seed_x_fraction"] * nx),
-            int(params["gaussian_seed_y_fraction"] * ny),
-            int(params["gaussian_seed_z_fraction"] * nz),
-        )
+        # int(fraction * n) per axis, the single seed's rule, for every row.
+        self.seed_voxels = (
+            params[SEED_POSITIONS_KEY] * np.asarray(lowres_shape, dtype=np.float64)
+        ).astype(np.int64)
+        if len(np.unique(self.seed_voxels, axis=0)) < len(self.seed_voxels):
+            logger.warning(
+                f"{type(self).__name__}: several seeds fall on one voxel of the "
+                f"low-resolution grid {lowres_shape}; their kernels add up there."
+            )
         self._check_seed()
         return original_shape, lowres_shape
 
@@ -1620,8 +1684,8 @@ class BaseFKPPSolver(ABC):
 
     def _check_seed(self) -> None:
         """
-        Raise if the seed voxel lies outside the solver's simulated tissue.
+        Raise if a seed voxel lies outside the solver's simulated tissue.
 
-        Runs once grid geometry and the seed voxel are known; the default
+        Runs once grid geometry and the seed voxels are known; the default
         accepts any seed (the two-compartment solver never checks).
         """

@@ -24,6 +24,7 @@ from numpy.typing import NDArray
 from scipy.ndimage import binary_dilation
 
 from .base import (
+    SEED_POSITIONS_KEY,
     TREATMENT_DEFAULTS,
     TREATMENT_VOLUME_KEYS,
     BaseFKPPSolver,
@@ -55,8 +56,10 @@ _COMMON_DEFAULTS: dict[str, Any] = {
     # as a path, else 1 mm isotropic.
     "voxel_size_mm": None,
     "gaussian_seed_scale": 1.0,
-    "gaussian_seed_diffusion_time": GAUSSIAN_SEED_DIFFUSION_TIME,
-    "gaussian_seed_mass": GAUSSIAN_SEED_MASS,
+    # Per seed (one entry per row of gaussian_seed_positions, or one entry
+    # for every seed); tuples so that a written config holds lists.
+    "gaussian_seed_diffusion_time": (GAUSSIAN_SEED_DIFFUSION_TIME,),
+    "gaussian_seed_mass": (GAUSSIAN_SEED_MASS,),
     "gaussian_seed_floor": GAUSSIAN_SEED_FLOOR,
     # The horizon in days, at most one of the two (see
     # base._resolve_horizon); neither: base.DEFAULT_STOPPING_TIME.
@@ -592,9 +595,7 @@ class FKPPSolver(BaseFKPPSolver):
             "rho",
             "gray_matter_pbmap",
             "white_matter_pbmap",
-            "gaussian_seed_x_fraction",
-            "gaussian_seed_y_fraction",
-            "gaussian_seed_z_fraction",
+            SEED_POSITIONS_KEY,
             "resolution_factor",
         }
     )
@@ -627,9 +628,15 @@ class FKPPSolver(BaseFKPPSolver):
         return self._gm_lowres.shape, self.params["gray_matter_pbmap"].shape
 
     def _check_seed(self) -> None:
-        i, j, k = self.seed_voxel
-        if self._gm_lowres[i, j, k] == 0 and self._wm_lowres[i, j, k] == 0:
-            raise ValueError("Initial tumor position is outside the brain matter.")
+        outside = [
+            (int(i), int(j), int(k))
+            for i, j, k in self.seed_voxels
+            if self._gm_lowres[i, j, k] == 0 and self._wm_lowres[i, j, k] == 0
+        ]
+        if outside:
+            raise ValueError(
+                f"Initial tumor position is outside the brain matter: seed voxel(s) {outside}."
+            )
 
     def _crop_mask(self) -> NDArray:
         return (self._gm_lowres + self._wm_lowres) >= CROP_TISSUE_THRESHOLD
@@ -715,9 +722,7 @@ class TwoCompartmentWithNutrientFKPPSolver(BaseFKPPSolver):
             "nutrient_consumption_rate",
             "gray_matter_pbmap",
             "white_matter_pbmap",
-            "gaussian_seed_x_fraction",
-            "gaussian_seed_y_fraction",
-            "gaussian_seed_z_fraction",
+            SEED_POSITIONS_KEY,
             "resolution_factor",
         }
     )
@@ -853,9 +858,7 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
             "diffusivity",
             "rho",
             "diffusion_tensors",
-            "gaussian_seed_x_fraction",
-            "gaussian_seed_y_fraction",
-            "gaussian_seed_z_fraction",
+            SEED_POSITIONS_KEY,
             "resolution_factor",
         }
     )
@@ -1028,8 +1031,15 @@ class AnisotropicFKPPSolver(BaseFKPPSolver):
         return self._brainmask_lowres
 
     def _check_seed(self) -> None:
-        if not self._brainmask_lowres[self.seed_voxel]:
-            raise ValueError("Initial tumor position is outside the brain mask.")
+        outside = [
+            (int(i), int(j), int(k))
+            for i, j, k in self.seed_voxels
+            if not self._brainmask_lowres[i, j, k]
+        ]
+        if outside:
+            raise ValueError(
+                f"Initial tumor position is outside the brain mask: seed voxel(s) {outside}."
+            )
 
     def _initialize_state(self) -> dict[str, jax.Array]:
         cell_density = self._gaussian_seed()

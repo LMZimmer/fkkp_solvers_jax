@@ -42,9 +42,7 @@ from fisher_kpp_jax import (
 from fisher_kpp_jax.base import HORIZON_KEYS
 
 _COMMON = dict(
-    gaussian_seed_x_fraction=0.5,
-    gaussian_seed_y_fraction=0.5,
-    gaussian_seed_z_fraction=0.5,
+    gaussian_seed_positions=[[0.5, 0.5, 0.5]],
     resolution_factor=0.6,
     precision="f64",
 )

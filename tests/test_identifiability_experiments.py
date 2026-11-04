@@ -607,7 +607,7 @@ def test_design_fills_the_cells_by_size_screening(cohort, phantom_root):
     assert config["steps_per_day"] == patient.steps_per_day and config["dt"] is None and config["n_steps"] is None
     assert config["resection_cavity"] is None and config["rt_dose"] is None and config["time_after_resection"] == 120.0
     assert config["resection_time"] == patient.resection_time and config["chemo_times"][0] == pytest.approx(patient.resection_time + 14.0)
-    assert len(config["chemo_times"]) == 52 and len(config["rt_times"]) == 30 and config["gaussian_seed_x_fraction"] == pytest.approx(12.5 / 24)
+    assert len(config["chemo_times"]) == 52 and len(config["rt_times"]) == 30 and config["gaussian_seed_positions"][0][0] == pytest.approx(12.5 / 24)
     shape = cohort.wm.shape
     StuppFKPPSolver({**config, "resection_cavity": np.zeros(shape, dtype=bool), "rt_dose": np.zeros(shape)})
     assert (phantom_root / "search_space.json").is_file() and (phantom_root / "figures").is_dir()
@@ -666,7 +666,7 @@ def test_default_seed_voxel_on_atlas(tmp_path):
     cohort = ide.load_cohort(root)
     assert cohort.seed_voxel == (132, 103, 90) and cohort.tissue[132, 103, 90] and len(cohort.patients) == len(ide.CELLS)
     config = read_config(root / "configs" / "p00.json", solver=StuppFKPPSolver)
-    assert config["gaussian_seed_x_fraction"] == pytest.approx(132.5 / n[0])
+    assert config["gaussian_seed_positions"][0][0] == pytest.approx(132.5 / n[0])
     # An explicit voxel in the CSF is snapped to tissue and recorded as an argument.
     root = ide.make_design(sa.DEFAULT_CONFIG, ide.DEFAULT_SEARCH_SPACE, tmp_path, "explicit", tissue_maps=sa.DEFAULT_TISSUE_MAPS, seed_voxel=(91, 109, 91), log2_candidates=8, smoke=True, patients_per_cell=1)
     spec = json.loads((root / "spec.json").read_text())
