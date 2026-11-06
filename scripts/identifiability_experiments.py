@@ -2031,7 +2031,7 @@ def make_design(
         if all(0 <= v < n for v, n in zip(DEFAULT_SEED_VOXEL, geometry.shape)):
             target, target_source = list(DEFAULT_SEED_VOXEL), "default"
         else:
-            target = [int(float(base[key]) * n) for key, n in zip(sa.SEED_KEYS, geometry.shape)]
+            target = [int(float(f) * n) for f, n in zip(base[sa.SEED_POSITIONS_KEY][0], geometry.shape)]
             target_source = "base_config_fractions"
     else:
         target = [int(v) for v in seed_voxel]
@@ -2040,8 +2040,7 @@ def make_design(
         target_source = "argument"
     voxel, snap_distance = nearest_seedable_voxel(geometry, target)
     fractions = tuple(float(v) for v in (np.asarray(voxel, dtype=np.float64) + 0.5) / shape)
-    for key, fraction in zip(sa.SEED_KEYS, fractions):
-        base[key] = fraction
+    base[sa.SEED_POSITIONS_KEY] = [list(fractions)]
     schedules = {
         "fisher": sa.truncate_schedule(base, {"time_after_resection": FISHER_HORIZON})["schedule"],
         "substitute": sa.truncate_schedule(base, {"time_after_resection": SUBSTITUTE_HORIZON})["schedule"],

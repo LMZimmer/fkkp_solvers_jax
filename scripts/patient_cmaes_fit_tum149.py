@@ -12,6 +12,7 @@ the injected defaults (argparse keeps the last occurrence).
   python scripts/patient_cmaes_fit_tum149.py fit --name fit_tum149 --gpus 0,1,2,3 --dry-run
   python scripts/patient_cmaes_fit_tum149.py fit --name fit_tum149 --gpus 0,1,2,3
   python scripts/patient_cmaes_fit_tum149.py fit --name fit_tum149_preop --objective preop --gpus 0
+  python scripts/patient_cmaes_fit_tum149.py fit --name fit_tum149_3seeds --n-seeds 3 --gpus 0,1,2,3
   python scripts/patient_cmaes_fit_tum149.py resolve --fit-dir /mnt/Drive4/lucas/stupp_patient_fit_tum149/fit_tum149 --gpu 0
 
 Patient data
@@ -70,7 +71,9 @@ Design choices (2026-10-24)
    given; the fit directory receives DESIGN_FILE with this record.
 
 Everything else (search space, base config, loss, --solver, --objective,
-preop_time range, steps per day, CMA-ES settings) is patient_cmaes_fit.py's.
+--n-seeds (several seeds, one shared shape, ordered along x; the centre
+start puts every seed at the box centre), preop_time range, steps per
+day, CMA-ES settings) is patient_cmaes_fit.py's.
 """
 
 from __future__ import annotations

@@ -773,8 +773,8 @@ def test_design_bookkeeping(phantom_base):
             assert u_differing == {factor}
             if factor in SEED_KEYS:
                 # The mapping may land on the A run's voxel, so only the
-                # seed fractions may differ.
-                assert differing <= set(SEED_KEYS)
+                # seed positions entry may differ.
+                assert differing <= {"gaussian_seed_positions"}
                 n_seed_changes += bool(differing)
             elif factor == "resection_time":
                 assert differing == {"resection_time", "chemo_times", "rt_times"}
@@ -789,7 +789,9 @@ def test_design_bookkeeping(phantom_base):
                 assert differing == {"gaussian_seed_mass", "gaussian_seed_diffusion_time"}
             else:
                 assert differing == {factor}
-            if factor not in group_factors:
+            if factor in SEED_KEYS:  # the config holds the fraction in its positions row
+                assert ab["gaussian_seed_positions"][0][SEED_KEYS.index(factor)] == float(record[factor])
+            elif factor not in group_factors:
                 assert ab[factor] == float(record[factor])
     assert n_seed_changes > 0
     # design.csv: u, the sampled value, the derived parameters and the
@@ -830,7 +832,7 @@ def test_design_bookkeeping(phantom_base):
         voxel = np.array([int(record[f"seed_voxel_{ijk}"]) for ijk in "ijk"])
         assert seedable[tuple(voxel)]
         config = _config_entries(sweep_dir / "configs" / f"{record['run_name']}.json")
-        np.testing.assert_allclose([config[key] for key in SEED_KEYS], (voxel + 0.5) / n)
+        np.testing.assert_allclose(config["gaussian_seed_positions"][0], (voxel + 0.5) / n)
         for name in names:
             if name not in SEED_KEYS:
                 assert spec["factors"][name]["min"] <= float(record[name]) <= spec["factors"][name]["max"]
@@ -1114,7 +1116,7 @@ def test_growth_config(phantom_base):
     assert growth["snapshot_times"] is None  # the treated stage's snapshots are after resection
     assert set(growth) - {SOLVER_KEY} <= FKPPSolver.config_keys()
     assert not set(growth) & StuppFKPPSolver.TREATMENT_KEYS and "time_after_resection" not in growth
-    for key in ("white_matter_pbmap", "rho", "white_matter_diffusivity", "steps_per_day", "min_tissue_fraction", *SEED_KEYS):
+    for key in ("white_matter_pbmap", "rho", "white_matter_diffusivity", "steps_per_day", "min_tissue_fraction", "gaussian_seed_positions"):
         assert growth[key] == base[key]
     solver = FKPPSolver(growth)
     assert solver.params["stopping_time"] == 7.5

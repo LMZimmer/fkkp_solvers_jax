@@ -164,18 +164,232 @@ Things to look at if something fails:
   if a test asserts on the exact `known` key set, it will need the
   `SEED_KEYS` addition.
 
-## Open items (next steps, not started)
+## Open items (as of the first write-up; the status of each is below)
 
-1. The multi-seed CMA-ES script: a new script beside
-   `patient_cmaes_fit.py` that fixes the seed positions once from the
-   pre-op core (labels 1 and 3 with tissue, `patient_seed_geometry`),
-   writes them into every run config and drops `seed_bbox_x/y/z` from
-   the search space (seven factors instead of ten); shared or fixed
-   `seed_sigma_mm` / `seed_peak_density` map to one-entry lists.
-2. The placement rule for the seeds (lattice at about sigma,
-   farthest-point sampling, component centroids, every voxel). Seeding
-   every voxel should not use thousands of kernels; it is a Gaussian
-   blur of the indicator and belongs in a separate host-side mode.
-3. Per-field seeding of the two-compartment model (label 1 into the
-   necrotic field).
-4. A config migration helper for old fit directories, if needed.
+1. DONE 2026-11-04 (the last section of this file). The multi-seed
+   CMA-ES fit (CORRECTED 2026-11-04; the earlier text here, fixed
+   positions from the pre-op core and seven factors, was wrong). The
+   CMA-ES scripts (`patient_cmaes_fit.py` and the tum149 wrapper) take a
+   number of seeds n (an option, any n >= 1) and fit every seed with
+   CMA-ES: per seed, the position through the existing seed map (three
+   box factors per seed mapped onto the seedable voxels of the pre-op
+   core as now). The run config receives `gaussian_seed_positions` with
+   one row per seed. n = 1 is the existing single-seed fit. The four
+   questions this item left open were settled as follows: the factor
+   layout is a position per seed with ONE shared shape (`seed_sigma_mm`,
+   `seed_peak_density` for every seed, so the width and mass go into the
+   config as scalars, not per-seed lists); n is `--n-seeds`; the
+   per-seed columns are `seed_voxel_i/j/k_<k>` and `seed_snapped_<k>`
+   and the spec records `n_seeds`; the swap symmetry is removed by a
+   CMA-ES repair that orders the seed blocks along x (not by the
+   mapping alone, which cannot remove it: the summed kernels make the
+   loss permutation-invariant whatever order the mapping uses).
+2. Superseded by the correction of item 1: the seed positions are
+   fitted, there is no placement rule for fixed seeds.
+3. OPEN. Per-field seeding of the two-compartment model (label 1 into
+   the necrotic field).
+4. OPEN. A config migration helper for old fit directories, if needed.
+
+## 2026-11-04, on the JAX machine: review, tests, the multi-seed fit
+
+Everything above was committed as 2355504 before this step (the "nothing
+is committed" line above is stale). Review and test results:
+
+- Package code: correct, unchanged. The one-row `clipped_gaussian` is
+  bit-identical to the pre-change single-seed kernel on GPU and in eager
+  CPU mode (f32 and f64, three widths and masses); under jit on CPU only,
+  some voxels differ by 1 ULP, from XLA's fused-loop code generation.
+- One script bug: `identifiability_experiments.make_design` still read
+  and wrote the three fraction keys (a KeyError, and unknown keys in every
+  design's base config). Both lines now use the positions entry.
+- Three stale assertions in `tests/test_sensitivity_analysis.py`
+  (`test_design_bookkeeping`, `test_growth_config`) compared configs
+  through the old keys; they read the positions row now.
+- `JAX_PLATFORMS=cpu pytest tests -q`: 154 passed. The reference solves
+  were not rerun. Both fixes are uncommitted.
+
+Open item 1 was NOT done at this point (it was, later the same day:
+the next section). A "lattice" seed mode (positions fixed on a
+2 mm lattice over the pre-op core, box factors dropped, one shared width
+and mass) was built into `scripts/patient_cmaes_fit.py` with a tum149
+wrapper on 2026-11-04 and REVERTED the same day: it was a misreading of
+the old item 1, which is corrected above (n fitted seeds).
+`scripts/patient_cmaes_fit.py` was unchanged from 2355504 at this point.
+
+Open items 3 (necrotic-field seeding) and 4 (the config migration
+helper) stand.
+
+## 2026-11-04, later: the multi-seed CMA-ES fit (open item 1 DONE, uncommitted)
+
+Decisions taken with the author on 2026-11-04, after the first version
+of this section's plan was read back: any number of seeds (no cap; "2-3"
+was the expected use, not a limit), ONE shared seed shape for every
+seed, and n = 1 must reproduce the single-seed fit. Implemented in
+`scripts/patient_cmaes_fit.py`; `scripts/patient_cmaes_fit_tum149.py`
+passes every option through unchanged and only its docstring was
+updated; the `_seed_position` note of
+`fisher_kpp_jax/search_spaces/patient_fit_search_space.json` was updated
+(it still named the three fraction keys; the two-species file's notes
+refer to it). Nothing is committed; the working tree also still holds
+the identifiability fix and the three test assertions of the previous
+section.
+
+### The parametrisation
+
+- **`--n-seeds n`** (`DEFAULT_N_SEEDS = 1`, any integer n >= 1) on
+  `starts` and `fit`, in `_add_problem_args`; `build_problem(...,
+  n_seeds)` passes it to `read_fit_search_space(path, solver_mode,
+  objective_scope, n_seeds)`. On `--resume` and `resolve` the spec's
+  value wins, as for `--solver` and `--objective` (the command line's
+  `--n-seeds` is ignored there; the "resuming" line prints the count).
+- **Factor expansion.** The search-space file keeps its three entries
+  `seed_bbox_x/y/z` (linear on [0, 1], checked as before); they stand
+  for ONE seed. With n > 1 `read_fit_search_space` replaces them, at the
+  place of `seed_bbox_x` in the file's order (the file's `seed_bbox_y/z`
+  are dropped from wherever they stand), by one block per seed:
+  `seed_bbox_x_1, seed_bbox_y_1, seed_bbox_z_1, seed_bbox_x_2, ...`
+  (`seed_suffix(k, n)` = '' for n = 1, else `_<k>`; `seed_bbox_names(k,
+  n)`; `is_seed_bbox_factor(name)` recognises both forms), each a copy
+  of the file's range with its own name. With n = 1 the names stay
+  bare, so the one-seed factor order, columns, configs, starts.json and
+  spec are those of before. The isotropic file gives 10 + 3 (n - 1)
+  factors (16 with n = 3), the two-species file 14 + 3 (n - 1).
+  `FitSpace` gained `n_seeds`, `seed_blocks` (the n name triples),
+  `seed_bbox_names` (flat), and `solver_factor_names` now excludes the
+  per-seed names. A file cannot clash with the expanded names: it is
+  read before the expansion and rejects `seed_bbox_x_1` as unknown.
+- **Shared shape.** `seed_sigma_mm` and `seed_peak_density` stay single
+  factors (fitted or, the peak, fixed, as before). `config_of` writes
+  the scalars `gaussian_seed_diffusion_time` and `gaussian_seed_mass`,
+  which `_validate_seed` broadcasts to every row of
+  `gaussian_seed_positions`; the config holds one row per seed, `[(v +
+  0.5) / n]` of each seed voxel. The total initial mass is n times the
+  one-seed mass where the seeds do not overlap; overlapping kernels add
+  and clip at 1 (the package's rule). The evaluations.csv columns
+  `gaussian_seed_mass` and `gaussian_seed_diffusion_time` stay scalars.
+- **Mapping per seed.** `FitProblem.derive` maps every block through
+  the one `SeedMap.voxel` (rounding, snapping) as before; `Point` holds
+  `seed_voxels`, `seed_snapped` and `seed_fractions` as tuples of n
+  (`Point.n_seeds`); the old scalar fields are gone. `design_checks`
+  sets every seed's box factors to 0.5 at the corner.
+
+### The seed order (the swap symmetry)
+
+The loss is invariant under any permutation of the n seed blocks of the
+unit vector: the solver sums the kernels, so the initial field is the
+same. The item's note that "ordering the seeds along one axis in the
+mapping removes it" was wrong as stated: a sort inside `derive` leaves
+the loss landscape on the unit cube exactly as symmetric as before (it
+only canonicalises the record). What removes the symmetry for the
+optimizer is confining its search to one fundamental domain, done here
+as a REPAIR, the same mechanism the fit already uses for the bounds:
+
+- `CMAES(x0, sigma0, popsize, rng, repair=None)`: `ask` clips every
+  member into [0, 1] and then applies `repair` to it; the repaired
+  member is evaluated and is the point every update sees (y = (x - m) /
+  sigma, z = invsqrtC y), exactly as the clipped member already was.
+  `from_state(state, popsize, repair)` takes it too; the checkpoint
+  format is unchanged.
+- The repair is `FitSpace.order_seeds(u)`: a stable sort of the seed
+  blocks by their x box coordinate `seed_bbox_x_<k>` (the box factors
+  are linear on [0, 1], so the unit coordinate is the box coordinate),
+  whole blocks permuted, every other coordinate untouched
+  (`seed_order`, `order_seed_values` are the same on physical values).
+  The ordered region {x_1 <= x_2 <= ... <= x_n} is convex, so the
+  weighted mean of ordered members is ordered and the mean never falls
+  between two mirror images of one optimum. `run_restart` passes
+  `problem.space.order_seeds` with n > 1 and `None` with n = 1, so the
+  one-seed path is untouched.
+- Consequence for the records: seed k of every evaluated point is the
+  k-th seed along the box's x axis (the voxel i index after snapping may
+  break ties by a voxel). Near x_1 = x_2 the labelling flips between
+  neighbouring members, which is the usual property of a fundamental
+  domain and harmless (the losses are the same).
+
+### Records, starts, output
+
+- evaluations.csv: the per-seed columns `seed_voxel_i`, `seed_voxel_j`,
+  `seed_voxel_k`, `seed_snapped` are written once per seed with the
+  suffix of the factors (`seed_columns(n)`, `derived_columns(n)`
+  replaces the constant `DERIVED_COLUMNS`; `evaluation_columns(names,
+  prefixes, n_seeds)`); `typed_row` types them by prefix
+  (`is_int_column`, `is_bool_column`; the seed names left `INT_COLUMNS`
+  and `BOOL_COLUMNS`). `best_summary`, `run_restart` and `dry_run` use
+  the n-dependent columns.
+- The config's `_fit` record holds `n_seeds`, `seed_voxels` (a list of
+  n triples) and `seed_snapped` (a list of n flags) for EVERY n; with
+  n = 1 this replaces the old `seed_voxel` triple and the single flag
+  (nothing reads them: the visualizers take the moments and snapshot
+  days from `_fit`, not the seed). The solver-facing part of a one-seed
+  config is byte-identical to before.
+- spec.json: `search_space.n_seeds` and `search_space.seed_bbox_factors`
+  (`FitSpace.record`); `parametrisation.n_seeds`,
+  `parametrisation.seed_bbox_factors`, `parametrisation.seed_ordering`
+  (the rule above) and the shared-shape wording in
+  `parametrisation.seed_shape`. `problem_from_fit_dir` reads
+  `parametrisation.n_seeds` (1 when absent, every spec before
+  2026-11-04), and the existing factor-order check then verifies the
+  expansion against the spec's `factor_names`, so resume and resolve
+  work for fits of either kind.
+- Starts (`convert_sweep_row`, `centre_start`): a sweep start puts
+  EVERY seed at the row's one seed voxel (the box coordinates of that
+  voxel in every block; `fit_seed_voxel` of the conversion record is
+  that voxel) and the centre start every seed at the box centre: the
+  seeds start together and the optimizer separates them. `--init-values`
+  must name every per-seed factor (as it must name every factor);
+  `manual_start` then orders its blocks along x and records
+  `seeds_reordered` (only written with n > 1, so a one-seed starts.json
+  is unchanged). `resolve_starts` records `n_seeds` and the rule in
+  starts.json (n > 1 only). `format_starts` prints `seed voxel [i, j,
+  k]` as before with one seed and `seed voxels [[...], ...] (snapped:
+  [k, ...])` with several (`format_seed_voxels`); the `fit` start-up
+  line names the seed count and the box factors.
+- Module docstring: the "seed position" paragraph of the
+  parametrisation, the Starts paragraph, the evaluations.csv column
+  list, the CMA-ES bound-handling sentence and the examples
+  (`fit --n-seeds 3 --name fit_sub01_3seeds ...`).
+
+### Checked on 2026-11-04 on the JAX machine (CPU, no solve)
+
+- n = 1 against the committed script (`git show HEAD:scripts/
+  patient_cmaes_fit.py` imported next to the working copy) on sub-01
+  with the default sweep: 25 random unit vectors give identical run
+  configs (everything outside `_fit`, and `_fit` up to the three keys
+  above), identical point records and identical csv columns; the 5
+  sweep starts and their printed table are identical.
+- n = 3 on sub-01: 16 factors in the expected order (the blocks between
+  `growth_length_mm` and `rt_alpha`); `order_seeds` ascends in x and
+  permutes whole blocks (the config's position rows are the same
+  multiset before and after); the solver constructs from the config,
+  its low-resolution seed voxels equal the script's record and the
+  mass is broadcast to three equal entries; `CMAES.ask` members and the
+  mean after `tell` are ordered, `from_state` keeps the repair; a
+  manual start given with unordered seeds is reordered and records it;
+  two sweep starts put all three seeds on the row's voxel;
+  `run_design_checks` passes with n_steps 4176 confirmed at the corner.
+- Through the command line: `starts --n-seeds 2 --top 2` (both seeds of
+  each start at the row's voxel) and a one-seed `starts --init-values
+  ... --no-sweep-init`.
+- Expected noise: the solver logs "several seeds fall on one voxel of
+  the low-resolution grid; their kernels add up there" whenever two
+  seeds coincide, so every start evaluation (and the design check's
+  centre config) logs it once.
+
+NOT run: no GPU dry run, no fit, and the test suite was not rerun (no
+test imports the fit script; the previous section's 154 passed stand).
+
+### What to run next (nothing of it has been run)
+
+```
+python scripts/patient_cmaes_fit.py starts --n-seeds 3 --top 5
+python scripts/patient_cmaes_fit.py fit --n-seeds 3 --name smoke_3seeds --gpus 0 --top 2 --dry-run
+python scripts/patient_cmaes_fit_tum149.py fit --n-seeds 3 --name smoke_tum149_3seeds --gpus 0 --dry-run
+```
+
+Things to look at if something fails: the per-seed columns must appear
+in `dry_run/evaluations.csv` with the suffixes; the three seeds of a
+start coincide, so its initial field is three times one kernel, floored
+and clipped once, i.e. the dry-run loss equals that of a one-seed run of
+the same config with `gaussian_seed_mass` tripled (a hand check, not a
+command of the script); a resumed or resolved OLD fit directory must
+still read as one seed.

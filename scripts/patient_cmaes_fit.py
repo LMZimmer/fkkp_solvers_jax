@@ -221,6 +221,32 @@ evaluation (``FitProblem.derive``):
                 gaussian_seed_positions = [[(v + 0.5) / n per axis]] as
                 ``project_seeds`` writes them (int(fraction n) recovers v;
                 checked for every seedable voxel at start-up).
+                With --n-seeds n > 1 (default 1; any n >= 1) the file's
+                three box factors stand for ONE seed and are expanded, at
+                their place in the factor order, into one block per seed,
+                seed_bbox_x_1, seed_bbox_y_1, seed_bbox_z_1, seed_bbox_x_2,
+                ... (``seed_bbox_names``; with n = 1 the names stay
+                seed_bbox_x/y/z, so a one-seed fit is the fit of before);
+                every block is mapped as above, the config receives one
+                row of gaussian_seed_positions per seed and the solver
+                sums the kernels (floored, clipped at 1, cut to the
+                tissue). The seed SHAPE is shared: one seed_sigma_mm and
+                one seed_peak_density for every seed, written as the
+                scalars gaussian_seed_diffusion_time and
+                gaussian_seed_mass, which the solver broadcasts to every
+                row; the total initial mass grows with n and overlapping
+                seeds saturate at 1. The seeds are ORDERED along the box's
+                x axis: the loss is invariant under a permutation of the
+                seed blocks (the kernels are summed), so the optimizer
+                only proposes points whose blocks ascend in seed_bbox_x
+                (``FitSpace.order_seeds``, applied to every member after
+                the bound clip, the CMA-ES repair below; a stable sort of
+                the blocks by x; a manual start is ordered as well): the
+                search runs in one fundamental domain instead of n!
+                mirror copies, and seed k of a record is the k-th seed
+                along x. The columns seed_voxel_i/j/k_<k> and
+                seed_snapped_<k> record each seed (``seed_columns``; the
+                bare names with n = 1).
   direct        rt_alpha and chemo_kill_rate are written as they are.
 Fixed values (the search-space file's, overriding the base config's):
 rt_alpha_beta_ratio 8 Gy and diffusivity_ratio 10, which the SA found
@@ -327,7 +353,9 @@ C = (1 - c1 - cmu) C + c1 pc pc^T + cmu Cmu when it holds, else
 pc = (1 - cc) pc and C = (1 - c1 - cmu) C + c1 (pc pc^T + cc (2 - cc) C) + cmu Cmu
 (sigma is updated before C, as in GIFT). Differences to GIFT's cmaes.py:
 (1) bound handling, the ONE deliberate deviation: after sampling, x is
-clipped to [0, 1], the clipped point is evaluated, and the step is
+clipped to [0, 1] (and, with --n-seeds n > 1, its seed blocks are then
+ordered along x, ``FitSpace.order_seeds``, the same way), the clipped
+point is evaluated, and the step is
 REPAIRED so that every update sees the same point, y = (x_clip - m) / sigma
 and z = invsqrtC y, used in the mean, path and covariance updates (GIFT
 evaluates the clipped point but updates the paths and the covariance with
@@ -386,7 +414,9 @@ spec.json; the fit's timeline and masks use the SA's current constants),
 so the proxy is not the fit's objective at that point; the start is evaluated with the objective
 at generation 0. Each run's design row is converted: v, lambda, sigma
 from the row, growth_length_mm = v preop_time, the seed voxel
-seed_voxel_i/j/k mapped back into box coordinates ((v - lo) / (hi - lo)),
+seed_voxel_i/j/k mapped back into box coordinates ((v - lo) / (hi - lo);
+with --n-seeds n > 1 every seed block takes the row's one voxel, so the
+seeds start together and the optimizer separates them),
 rt_alpha and chemo_kill_rate; the values are clipped into the fit's
 ranges (recorded) and mapped with to_unit. The row's seed_peak_density is
 carried when the fit fits it (2026-09-27 file) and not carried when the
@@ -396,9 +426,11 @@ carried (fixed in the fit), nor rt_alpha and chemo_kill_rate with
 --init-values is given the script exits with an error; with
 --init-values it warns and uses the manual start. --no-sweep-init
 disables the sweep starts. --init-values name=value,... (physical units,
-every fitted factor named) adds one manual start after the sweep starts.
+every fitted factor named, the per-seed box factors included; its seed
+blocks are ordered along x, recorded when that changed them) adds one
+manual start after the sweep starts.
 --no-sweep-init without --init-values gives one start at the unit-cube
-centre (the seed at the box centre). starts.json records every start
+centre (every seed at the box centre). starts.json records every start
 (source, physical and unit values, proxy). The subcommand starts prints
 the resolved starts and exits (no GPU).
 
@@ -425,8 +457,10 @@ nothing is written outside <output-dir>/<name>/):
                        u_<factor> and <factor> per factor,
                        white_matter_diffusivity, rho, gaussian_seed_mass,
                        gaussian_seed_diffusion_time, preop_time,
-                       preop_time_clamped, seed_voxel_i/j/k, seed_snapped,
-                       success, error, loss, J, core_threshold_star,
+                       preop_time_clamped, seed_voxel_i/j/k and
+                       seed_snapped (suffixed _<k> per seed with
+                       --n-seeds n > 1), success, error, loss, J,
+                       core_threshold_star,
                        edema_threshold_star, necrotic_threshold_star,
                        n_nan_sessions, per session
                        <ses>_dice_core_star, <ses>_dice_whole_star,
@@ -470,6 +504,7 @@ project root, e.g.:
   python scripts/patient_cmaes_fit.py fit --name fit_sub01 --gpus 0,1,2,3 --top 5 --resume
   python scripts/patient_cmaes_fit.py fit --name fit_sub01 --gpus 0,1,2,3 --top 5
   python scripts/patient_cmaes_fit.py fit --objective preop --name fit_sub01_preop --gpus 0 --top 5
+  python scripts/patient_cmaes_fit.py fit --n-seeds 3 --name fit_sub01_3seeds --gpus 0,1,2,3 --top 5
   python scripts/patient_cmaes_fit.py resolve --fit-dir /mnt/Drive4/lucas/stupp_patient_fit/fit_sub01 --gpu 0
 
 Adaptations of the imported code, without changing it: ``parse_sessions``
@@ -499,7 +534,7 @@ import sys
 import time
 import traceback
 import warnings
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from multiprocessing import get_context
@@ -677,6 +712,49 @@ FULL_RESOLUTION = 1.0
 # (a script constant, the 2026-09-25 file).
 GROWTH_LENGTH_FACTOR = "growth_length_mm"
 SEED_BBOX_FACTORS: tuple[str, ...] = ("seed_bbox_x", "seed_bbox_y", "seed_bbox_z")
+# --n-seeds: the number of seeds (any n >= 1). The search-space file's
+# three box factors stand for one seed; with n > 1 they are expanded into
+# one block per seed (``seed_bbox_names``), the width and the peak stay
+# shared. The seeds are ordered along x (``FitSpace.order_seeds``).
+DEFAULT_N_SEEDS = 1
+SEED_VOXEL_COLUMNS: tuple[str, ...] = ("seed_voxel_i", "seed_voxel_j", "seed_voxel_k")
+SEED_SNAPPED_COLUMN = "seed_snapped"
+
+
+def seed_suffix(k: int, n_seeds: int) -> str:
+    """The per-seed suffix of a factor or column name: '' with one seed,
+    '_<k>' (k 1-based) with several."""
+    if not 1 <= int(k) <= int(n_seeds):
+        raise ValueError(f"seed {k} is not one of {n_seeds} seed(s).")
+    return "" if int(n_seeds) == 1 else f"_{int(k)}"
+
+
+def seed_bbox_names(k: int, n_seeds: int) -> tuple[str, str, str]:
+    """The three box factors of seed k (1-based) of n: seed_bbox_x/y/z with
+    one seed, seed_bbox_x_<k>/y_<k>/z_<k> with several."""
+    suffix = seed_suffix(k, n_seeds)
+    names = tuple(f"{name}{suffix}" for name in SEED_BBOX_FACTORS)
+    return names[0], names[1], names[2]
+
+
+def is_seed_bbox_factor(name: str) -> bool:
+    """Whether a factor name is a seed box factor, bare or per seed."""
+    for base in SEED_BBOX_FACTORS:
+        if name == base:
+            return True
+        if name.startswith(base + "_") and name[len(base) + 1 :].isdigit():
+            return True
+    return False
+
+
+def seed_columns(n_seeds: int) -> list[str]:
+    """The per-seed evaluations.csv columns, seed_voxel_i/j/k and
+    seed_snapped per seed, suffixed as the factors (``seed_suffix``)."""
+    return [
+        f"{column}{seed_suffix(k, n_seeds)}"
+        for k in range(1, int(n_seeds) + 1)
+        for column in (*SEED_VOXEL_COLUMNS, SEED_SNAPPED_COLUMN)
+    ]
 REQUIRED_SCRIPT_FACTORS: tuple[str, ...] = (
     GROWTH_SPEED_FACTOR,
     GROWTH_WIDTH_FACTOR,
@@ -757,15 +835,15 @@ MIN_THRESHOLD = float(min(*THRESHOLD_GRID_CORE, *THRESHOLD_GRID_EDEMA, *THRESHOL
 
 # evaluations.csv columns besides the factor and session columns.
 BOOKKEEPING_COLUMNS: list[str] = ["eval_id", "restart", "generation", "member", "worker", "resolution_factor"]
-DERIVED_COLUMNS: list[str] = [
-    *DERIVED_SOLVER_KEYS,
-    "preop_time",
-    "preop_time_clamped",
-    "seed_voxel_i",
-    "seed_voxel_j",
-    "seed_voxel_k",
-    "seed_snapped",
-]
+
+
+def derived_columns(n_seeds: int) -> list[str]:
+    """The derived columns of evaluations.csv: the derived solver keys,
+    preop_time and its clamp flag, then the per-seed columns
+    (``seed_columns``)."""
+    return [*DERIVED_SOLVER_KEYS, "preop_time", "preop_time_clamped", *seed_columns(n_seeds)]
+
+
 OUTCOME_COLUMNS: list[str] = [
     "success",
     "error",
@@ -786,11 +864,19 @@ SESSION_COLUMNS: list[str] = [
     "dice_necrotic_fixed",
 ]
 TAIL_COLUMNS: list[str] = ["n_steps", "dt", "solve_wall_time_s", "wall_time_s", "first_on_worker", "tag"]
-INT_COLUMNS: frozenset[str] = frozenset(
-    {"eval_id", "restart", "generation", "member", "worker", "seed_voxel_i", "seed_voxel_j", "seed_voxel_k", "n_nan_sessions", "n_steps"}
-)
-BOOL_COLUMNS: frozenset[str] = frozenset({"preop_time_clamped", "seed_snapped", "success", "first_on_worker"})
+INT_COLUMNS: frozenset[str] = frozenset({"eval_id", "restart", "generation", "member", "worker", "n_nan_sessions", "n_steps"})
+BOOL_COLUMNS: frozenset[str] = frozenset({"preop_time_clamped", "success", "first_on_worker"})
 STR_COLUMNS: frozenset[str] = frozenset({"error", "tag"})
+
+
+def is_int_column(key: str) -> bool:
+    """An integer column: INT_COLUMNS and the seed voxel columns of every seed."""
+    return key in INT_COLUMNS or any(key == column or key.startswith(column + "_") for column in SEED_VOXEL_COLUMNS)
+
+
+def is_bool_column(key: str) -> bool:
+    """A boolean column: BOOL_COLUMNS and the seed_snapped column of every seed."""
+    return key in BOOL_COLUMNS or key == SEED_SNAPPED_COLUMN or key.startswith(SEED_SNAPPED_COLUMN + "_")
 TAG_START = "start"
 TAG_REEVAL = "incumbent_reeval"
 TAG_DRY_RUN = "dry_run"
@@ -967,6 +1053,8 @@ class FitSpace:
         dropped: The file's factors the objective scope removed from the
             fit (TREATMENT_FACTORS with --objective preop), by name;
             neither fitted nor written (the base config's values stand).
+        n_seeds: The number of seeds (--n-seeds): the file's three box
+            factors expanded into one block per seed (``seed_bbox_names``).
     """
 
     factors: dict[str, SearchSpaceParameter]
@@ -975,6 +1063,7 @@ class FitSpace:
     source: dict[str, Any]
     path: Path
     dropped: dict[str, SearchSpaceParameter] = field(default_factory=dict)
+    n_seeds: int = DEFAULT_N_SEEDS
 
     @property
     def names(self) -> list[str]:
@@ -987,7 +1076,53 @@ class FitSpace:
     @property
     def solver_factor_names(self) -> list[str]:
         """The factors that are solver parameters, written directly."""
-        return [name for name in self.factors if name not in SCRIPT_FACTORS]
+        return [name for name in self.factors if name not in SCRIPT_FACTORS and not is_seed_bbox_factor(name)]
+
+    @property
+    def seed_blocks(self) -> list[tuple[str, str, str]]:
+        """The box factors of every seed, seed 1 first (``seed_bbox_names``)."""
+        return [seed_bbox_names(k, self.n_seeds) for k in range(1, self.n_seeds + 1)]
+
+    @property
+    def seed_bbox_names(self) -> list[str]:
+        """Every seed's box factors, in seed order."""
+        return [name for block in self.seed_blocks for name in block]
+
+    def seed_order(self, values: Mapping[str, float]) -> list[int]:
+        """The seed indices (0-based) sorted by the seeds' x box coordinate
+        (a stable sort: equal x keeps the given order)."""
+        xs = [float(values[block[0]]) for block in self.seed_blocks]
+        return sorted(range(self.n_seeds), key=lambda i: xs[i])
+
+    def order_seed_values(self, values: Mapping[str, float]) -> dict[str, float]:
+        """The factor values with the seed blocks permuted so that their x
+        box coordinates ascend (seed 1 the left-most); every other value
+        as given."""
+        out = dict(values)
+        blocks = self.seed_blocks
+        for target, source in enumerate(self.seed_order(values)):
+            for name_target, name_source in zip(blocks[target], blocks[source], strict=True):
+                out[name_target] = values[name_source]
+        return out
+
+    def order_seeds(self, u: NDArray | Sequence[float]) -> NDArray:
+        """
+        ``order_seed_values`` on a unit vector (the box factors are linear
+        on [0, 1], so the unit coordinate is the box coordinate): the
+        CMA-ES repair of the seed order. A copy; the identity with one
+        seed.
+        """
+        vector = np.array(u, dtype=np.float64).ravel()
+        if self.n_seeds == 1:
+            return vector
+        index = {name: i for i, name in enumerate(self.factors)}
+        blocks = [[index[name] for name in block] for block in self.seed_blocks]
+        xs = [float(vector[block[0]]) for block in blocks]
+        order = sorted(range(self.n_seeds), key=lambda i: xs[i])
+        out = vector.copy()
+        for target, source in enumerate(order):
+            out[blocks[target]] = vector[blocks[source]]
+        return out
 
     @property
     def seed_peak_fitted(self) -> bool:
@@ -1071,12 +1206,17 @@ class FitSpace:
             "overrides": dict(self.overrides),
             "constants": dict(self.constants),
             "dropped_factors": {name: {"min": f.low, "max": f.high, "scale": f.scale} for name, f in self.dropped.items()},
+            "n_seeds": self.n_seeds,
+            "seed_bbox_factors": self.seed_bbox_names,
             "source": dict(self.source),
         }
 
 
 def read_fit_search_space(
-    path: str | Path, solver_mode: str = DEFAULT_SOLVER_MODE, objective_scope: str = DEFAULT_OBJECTIVE_SCOPE
+    path: str | Path,
+    solver_mode: str = DEFAULT_SOLVER_MODE,
+    objective_scope: str = DEFAULT_OBJECTIVE_SCOPE,
+    n_seeds: int = DEFAULT_N_SEEDS,
 ) -> FitSpace:
     """
     Read the fit's search-space file (the module docstring's format) for
@@ -1084,14 +1224,20 @@ def read_fit_search_space(
     class, and a factor or fixed value that is not a script factor must be
     one of its parameters. With the objective scope "preop" the file's
     TREATMENT_FACTORS are removed from the fitted factors (``dropped``).
+    With n_seeds > 1 the file's seed_bbox_x/y/z are replaced, at their
+    place in the factor order, by one block per seed (``seed_bbox_names``)
+    with the file's range.
 
     Raises:
         ValueError: The file is not a JSON object or names another solver;
             an entry is set per evaluation (FORBIDDEN_KEYS); a required
             script factor is not a range or seed_peak_density neither a
             range nor a number; an unknown key; a missing script factor; a
-            seed box factor not linear on [0, 1].
+            seed box factor not linear on [0, 1]; n_seeds below 1.
     """
+    n_seeds = int(n_seeds)
+    if n_seeds < 1:
+        raise ValueError(f"--n-seeds must be at least 1, got {n_seeds}.")
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"search space not found: {path}")
@@ -1135,6 +1281,21 @@ def read_fit_search_space(
         factor = factors[name]
         if factor.scale != "linear" or factor.low != 0.0 or factor.high != 1.0:
             raise ValueError(f"{where}: {name} must be linear on [0, 1], got {factor}.")
+    if n_seeds > 1:
+        # One block of box factors per seed, in the place of the file's
+        # three (the file's seed_bbox_y/z entries are dropped from wherever
+        # they stand; the blocks are consecutive).
+        expanded: dict[str, SearchSpaceParameter] = {}
+        for name, factor in factors.items():
+            if name == SEED_BBOX_FACTORS[0]:
+                for k in range(1, n_seeds + 1):
+                    for base, per_seed in zip(SEED_BBOX_FACTORS, seed_bbox_names(k, n_seeds), strict=True):
+                        expanded[per_seed] = replace(factors[base], name=per_seed)
+            elif name in SEED_BBOX_FACTORS:
+                continue
+            else:
+                expanded[name] = factor
+        factors = expanded
     if objective_scope not in OBJECTIVE_SCOPES:
         raise ValueError(f"the objective scope must be one of {OBJECTIVE_SCOPES}, got {objective_scope!r}.")
     dropped: dict[str, SearchSpaceParameter] = {}
@@ -1142,7 +1303,9 @@ def read_fit_search_space(
         # No event fires before the pre-op scan: the treatment factors
         # have no effect on the objective and are not fitted.
         dropped = {name: factors.pop(name) for name in TREATMENT_FACTORS if name in factors}
-    return FitSpace(factors=factors, overrides=overrides, constants=constants, source=dict(entries), path=path, dropped=dropped)
+    return FitSpace(
+        factors=factors, overrides=overrides, constants=constants, source=dict(entries), path=path, dropped=dropped, n_seeds=n_seeds
+    )
 
 
 @dataclass(frozen=True)
@@ -1257,13 +1420,17 @@ class Point:
     preop_time_raw: float
     preop_time: float
     preop_time_clamped: bool
-    seed_voxel: tuple[int, int, int]
-    seed_snapped: bool
-    seed_fractions: tuple[float, float, float]
+    seed_voxels: tuple[tuple[int, int, int], ...]
+    seed_snapped: tuple[bool, ...]
+    seed_fractions: tuple[tuple[float, float, float], ...]
+
+    @property
+    def n_seeds(self) -> int:
+        return len(self.seed_voxels)
 
     def record(self, names: Sequence[str]) -> dict[str, Any]:
         """The evaluations.csv fields of the point (u_<factor>, <factor>,
-        DERIVED_COLUMNS)."""
+        ``derived_columns``)."""
         out: dict[str, Any] = {f"u_{name}": float(self.unit[i]) for i, name in enumerate(names)}
         out.update({name: float(self.physical[name]) for name in names})
         out.update(
@@ -1273,12 +1440,21 @@ class Point:
             gaussian_seed_diffusion_time=self.gaussian_seed_diffusion_time,
             preop_time=self.preop_time,
             preop_time_clamped=self.preop_time_clamped,
-            seed_voxel_i=self.seed_voxel[0],
-            seed_voxel_j=self.seed_voxel[1],
-            seed_voxel_k=self.seed_voxel[2],
-            seed_snapped=self.seed_snapped,
         )
+        for k, (voxel, snapped) in enumerate(zip(self.seed_voxels, self.seed_snapped, strict=True), start=1):
+            suffix = seed_suffix(k, self.n_seeds)
+            out.update({f"{column}{suffix}": int(v) for column, v in zip(SEED_VOXEL_COLUMNS, voxel, strict=True)})
+            out[f"{SEED_SNAPPED_COLUMN}{suffix}"] = bool(snapped)
         return out
+
+
+def format_seed_voxels(point: Point) -> str:
+    """'seed voxel [i, j, k]' (' (snapped)') with one seed; 'seed voxels
+    [[i, j, k], ...]' with the snapped seeds' numbers with several."""
+    if point.n_seeds == 1:
+        return f"seed voxel {list(point.seed_voxels[0])}" + (" (snapped)" if point.seed_snapped[0] else "")
+    snapped = [k for k, flag in enumerate(point.seed_snapped, start=1) if flag]
+    return f"seed voxels {[list(v) for v in point.seed_voxels]}" + (f" (snapped: {snapped})" if snapped else "")
 
 
 # --- objective ---
@@ -1680,7 +1856,12 @@ class FitProblem:
         preop_raw = physical[GROWTH_LENGTH_FACTOR] / physical[GROWTH_SPEED_FACTOR]
         lo, hi = self.preop_time_range
         preop = float(min(max(preop_raw, lo), hi))
-        voxel, snapped = self.seed_map.voxel([physical[name] for name in SEED_BBOX_FACTORS])
+        voxels: list[tuple[int, int, int]] = []
+        snapped: list[bool] = []
+        for block in self.space.seed_blocks:
+            voxel, snap = self.seed_map.voxel([physical[name] for name in block])
+            voxels.append(voxel)
+            snapped.append(snap)
         return Point(
             unit=np.asarray(self.space.to_unit(physical) if unit is None else unit, dtype=np.float64),
             physical=physical,
@@ -1691,9 +1872,9 @@ class FitProblem:
             preop_time_raw=float(preop_raw),
             preop_time=preop,
             preop_time_clamped=preop != preop_raw,
-            seed_voxel=voxel,
-            seed_snapped=snapped,
-            seed_fractions=self.seed_map.fractions(voxel),
+            seed_voxels=tuple(voxels),
+            seed_snapped=tuple(snapped),
+            seed_fractions=tuple(self.seed_map.fractions(voxel) for voxel in voxels),
         )
 
     def stopping_time(self, preop_time: float) -> float:
@@ -1708,7 +1889,9 @@ class FitProblem:
         """
         The run config of a point: the base config with the search
         space's fixed values, the derived and direct factor values, the
-        seed fractions, the patient's tissue maps, cavity and dose map, the
+        seed fractions (one row of gaussian_seed_positions per seed; the
+        shared width and mass as scalars, broadcast by the solver), the
+        patient's tissue maps, cavity and dose map, the
         timeline at the point's preop_time, the fixed n_steps of the
         resolution factor and the session snapshot days; the "_fit" entry
         records the point (stripped before the solver sees the config,
@@ -1759,8 +1942,9 @@ class FitProblem:
                 "preop_time": point.preop_time,
                 "preop_time_clamped": point.preop_time_clamped,
                 "preop_time_range": list(self.preop_time_range),
-                "seed_voxel": list(point.seed_voxel),
-                "seed_snapped": point.seed_snapped,
+                "n_seeds": point.n_seeds,
+                "seed_voxels": [list(voxel) for voxel in point.seed_voxels],
+                "seed_snapped": list(point.seed_snapped),
                 "objective_scope": self.objective_scope,
                 "resolution_factor": factor,
                 "n_steps": n_steps,
@@ -1779,7 +1963,7 @@ class FitProblem:
             gaussian_seed_diffusion_time=point.gaussian_seed_diffusion_time,
         )
         config.update({name: point.physical[name] for name in self.space.solver_factor_names})
-        config[SEED_POSITIONS_KEY] = [list(point.seed_fractions)]
+        config[SEED_POSITIONS_KEY] = [list(fractions) for fractions in point.seed_fractions]
         config.update({key: str(path) for key, path in self.data.tissue.items()})
         config.update(volumes)
         config.update(schedule)
@@ -1824,7 +2008,15 @@ class FitProblem:
             ),
             "seed_shape": (
                 f"gaussian_seed_diffusion_time = {SEED_SIGMA_FACTOR}^2 / 2, gaussian_seed_mass = {SEED_PEAK_FACTOR} "
-                "(4 pi gaussian_seed_diffusion_time)^(3/2)"
+                "(4 pi gaussian_seed_diffusion_time)^(3/2); one width and one peak shared by every seed (the solver "
+                "broadcasts the scalars to every seed)"
+            ),
+            "n_seeds": self.space.n_seeds,
+            "seed_bbox_factors": self.space.seed_bbox_names,
+            "seed_ordering": (
+                "the seed blocks of every evaluated point ascend in their x box coordinate (seed 1 the left-most): the "
+                "optimizer's members are permuted into that order after the bound clip and a manual start is ordered the "
+                "same way, so one of the n! equivalent seed labellings is searched; a no-op with one seed"
             ),
             "seed_position": self.seed_map.record(),
             "direct": self.space.solver_factor_names,
@@ -1858,11 +2050,13 @@ def build_problem(
     protocol: Protocol | None = None,
     solver_mode: str = DEFAULT_SOLVER_MODE,
     objective_scope: str = DEFAULT_OBJECTIVE_SCOPE,
+    n_seeds: int = DEFAULT_N_SEEDS,
 ) -> FitProblem:
     """
     Assemble the fit problem: the solver (SOLVER_MODES), the base config,
     the search space (its treatment factors dropped with the objective
-    scope "preop"), the patient's sessions and files
+    scope "preop"; its seed box factors expanded to n_seeds seeds), the
+    patient's sessions and files
     (``read_session_labels``, ``split_sessions``, ``select_sessions``,
     ``patient_files``), the objective (the pre-op session alone with the
     scope "preop"), the timeline (the base config's
@@ -1882,7 +2076,7 @@ def build_problem(
         raise ValueError(f"--loss {loss} needs --solver twospecies: {FKPPSolver.__name__} has no necrotic compartment.")
     cls = SOLVER_MODES[solver_mode]
     base = read_config(config_path, solver=cls)
-    space = read_fit_search_space(search_space_path, solver_mode, objective_scope)
+    space = read_fit_search_space(search_space_path, solver_mode, objective_scope, n_seeds)
     all_sessions = read_session_labels(session_labels, patient)
     requested = parse_sessions(sessions)
     preop_id, later_ids = split_sessions(all_sessions, requested)
@@ -1968,6 +2162,7 @@ def problem_from_fit_dir(fit_dir: Path, spec: Mapping[str, Any]) -> FitProblem:
         protocol_from_spec(spec),
         spec.get("solver", {}).get("mode", DEFAULT_SOLVER_MODE),
         spec["objective"].get("scope", DEFAULT_OBJECTIVE_SCOPE),
+        int(parametrisation.get("n_seeds", DEFAULT_N_SEEDS)),  # specs before 2026-11-04 have one seed
     )
     rebuilt = problem.timeline.record()
     for key in ("snapshot_offsets", "chemo_offsets", "chemo_doses", "resection", "rt_fractions"):
@@ -1997,13 +2192,13 @@ def problem_from_fit_dir(fit_dir: Path, spec: Mapping[str, Any]) -> FitProblem:
 # --- evaluation records ---
 
 
-def evaluation_columns(names: Sequence[str], prefixes: Sequence[str]) -> list[str]:
+def evaluation_columns(names: Sequence[str], prefixes: Sequence[str], n_seeds: int = DEFAULT_N_SEEDS) -> list[str]:
     """The evaluations.csv columns (the module docstring)."""
     return [
         *BOOKKEEPING_COLUMNS,
         *(f"u_{name}" for name in names),
         *names,
-        *DERIVED_COLUMNS,
+        *derived_columns(n_seeds),
         *OUTCOME_COLUMNS,
         *(f"{prefix}{name}" for prefix in prefixes for name in SESSION_COLUMNS),
         *TAIL_COLUMNS,
@@ -2020,10 +2215,10 @@ def typed_row(row: Mapping[str, Any]) -> dict[str, Any]:
             if key in STR_COLUMNS:
                 out[key] = value
             elif value == "":
-                out[key] = None if key in INT_COLUMNS or key in BOOL_COLUMNS else float("nan")
-            elif key in INT_COLUMNS:
+                out[key] = None if is_int_column(key) or is_bool_column(key) else float("nan")
+            elif is_int_column(key):
                 out[key] = int(float(value))
-            elif key in BOOL_COLUMNS:
+            elif is_bool_column(key):
                 out[key] = value == "True"
             else:
                 out[key] = float(value)
@@ -2662,7 +2857,7 @@ def design_checks(problem: FitProblem, resolution_factors: Sequence[float]) -> d
         "time_stepping": {},
     }
     corner_values = {name: factor.high for name, factor in space.factors.items()}
-    corner_values.update({name: 0.5 for name in SEED_BBOX_FACTORS})
+    corner_values.update({name: 0.5 for name in space.seed_bbox_names})
     corner = replace(problem.derive(corner_values), preop_time=problem.preop_time_range[1], preop_time_clamped=True)
     for factor in sorted({float(f) for f in resolution_factors} | {FULL_RESOLUTION}):
         config = problem.config_of(corner, factor)
@@ -2730,6 +2925,10 @@ class CMAES:
         sigma0: The initial step size.
         popsize: lambda, the number of members per generation (at least 2).
         rng: The random generator of the sampling.
+        repair: A map of a clipped member onto an equivalent point (the
+            seed order, ``FitSpace.order_seeds``), applied in ``ask`` after
+            the clip; the repaired member is evaluated and used in every
+            update as the clipped one is. None: the clip alone.
 
     Attributes:
         mean: m, the distribution mean.
@@ -2740,7 +2939,14 @@ class CMAES:
             the update).
     """
 
-    def __init__(self, x0: NDArray | Sequence[float], sigma0: float, popsize: int, rng: np.random.Generator) -> None:
+    def __init__(
+        self,
+        x0: NDArray | Sequence[float],
+        sigma0: float,
+        popsize: int,
+        rng: np.random.Generator,
+        repair: Callable[[NDArray], NDArray] | None = None,
+    ) -> None:
         mean = np.array(x0, dtype=np.float64).ravel()
         n = int(mean.size)
         if n < 1:
@@ -2769,6 +2975,7 @@ class CMAES:
         self.pc = np.zeros(n)
         self.generation = 0
         self.rng = rng
+        self.repair = repair
         self._d: NDArray | None = None
         self._sqrt_c: NDArray | None = None
         self._inv_sqrt_c: NDArray | None = None
@@ -2793,12 +3000,15 @@ class CMAES:
 
     def ask(self) -> NDArray:
         """The members of the next generation, (popsize, N), each
-        x = m + sigma sqrtC z clipped into [0, 1]."""
+        x = m + sigma sqrtC z clipped into [0, 1] and repaired (``repair``)."""
         self._decompose()
         assert self._sqrt_c is not None
         z = self.rng.standard_normal((self.popsize, self.n))
         y = z @ self._sqrt_c  # sqrtC is symmetric: row i is sqrtC z_i
-        return np.clip(self.mean + self.sigma * y, 0.0, 1.0)
+        members = np.clip(self.mean + self.sigma * y, 0.0, 1.0)
+        if self.repair is not None:
+            members = np.stack([np.asarray(self.repair(member), dtype=np.float64) for member in members])
+        return members
 
     def tell(self, xs: NDArray, losses: Sequence[float]) -> None:
         """
@@ -2846,10 +3056,10 @@ class CMAES:
         }
 
     @classmethod
-    def from_state(cls, state: Mapping[str, Any], popsize: int) -> CMAES:
+    def from_state(cls, state: Mapping[str, Any], popsize: int, repair: Callable[[NDArray], NDArray] | None = None) -> CMAES:
         rng = np.random.default_rng(0)
         rng.bit_generator.state = json.loads(str(state["rng_state"]))
-        optimizer = cls(np.asarray(state["mean"]), float(state["sigma"]), popsize, rng)
+        optimizer = cls(np.asarray(state["mean"]), float(state["sigma"]), popsize, rng, repair)
         optimizer.C = np.array(state["C"], dtype=np.float64)
         optimizer.ps = np.array(state["ps"], dtype=np.float64)
         optimizer.pc = np.array(state["pc"], dtype=np.float64)
@@ -2956,7 +3166,9 @@ def convert_sweep_row(record: Mapping[str, str], problem: FitProblem) -> tuple[d
         SEED_SIGMA_FACTOR: as_float(record[SEED_SIGMA_FACTOR]),
         GROWTH_LENGTH_FACTOR: speed * preop_time,
     }
-    values.update(dict(zip(SEED_BBOX_FACTORS, problem.seed_map.to_bbox(voxel), strict=True)))
+    bbox = problem.seed_map.to_bbox(voxel)
+    for block in space.seed_blocks:  # every seed at the row's one voxel
+        values.update(dict(zip(block, bbox, strict=True)))
     centre = space.to_physical(np.full(space.dimension, 0.5))
     filled = {
         name: float(SWEEP_FILL_VALUES.get(name, centre[name]))
@@ -2982,7 +3194,7 @@ def convert_sweep_row(record: Mapping[str, str], problem: FitProblem) -> tuple[d
         "fit_preop_time": clipped[GROWTH_LENGTH_FACTOR] / clipped[GROWTH_SPEED_FACTOR],
         "sweep_seed_voxel": list(voxel),
         "seed_voxel_seedable_in_fit": bool(problem.seed_map.geometry.mask[voxel]),
-        "fit_seed_voxel": list(problem.seed_map.voxel([clipped[name] for name in SEED_BBOX_FACTORS])[0]),
+        "fit_seed_voxel": list(problem.seed_map.voxel([clipped[name] for name in space.seed_blocks[0]])[0]),
         "not_carried": not_carried,
         "filled": filled,
         "clipped": changed,
@@ -3099,7 +3311,8 @@ def sweep_starts(sweep_dir: Path, problem: FitProblem, top: int, min_distance: f
 
 def manual_start(text: str, problem: FitProblem, index: int) -> Start:
     """The start of --init-values name=value,... (physical units; every
-    fitted factor named; clipped into the ranges, recorded)."""
+    fitted factor named; clipped into the ranges, recorded; with several
+    seeds the blocks ordered along x, recorded when that changed them)."""
     given: dict[str, float] = {}
     for item in (part.strip() for part in str(text).split(",") if part.strip()):
         name, sep, value = item.partition("=")
@@ -3112,7 +3325,12 @@ def manual_start(text: str, problem: FitProblem, index: int) -> Start:
     if unknown or missing:
         raise ValueError(f"--init-values: unknown factor(s) {unknown}, missing {missing}; the factors are {names}.")
     values, changed = problem.space.clip(given)
-    return Start(index, "manual", problem.to_unit(values), values, {"given": given, "clipped": changed})
+    source: dict[str, Any] = {"given": given, "clipped": changed}
+    if problem.space.n_seeds > 1:
+        ordered = problem.space.order_seed_values(values)
+        source["seeds_reordered"] = ordered != values
+        values = ordered
+    return Start(index, "manual", problem.to_unit(values), values, source)
 
 
 def centre_start(problem: FitProblem, index: int) -> Start:
@@ -3151,6 +3369,13 @@ def resolve_starts(
     if not starts:
         starts.append(centre_start(problem, 0))
         record["centre"] = True
+    if problem.space.n_seeds > 1:
+        record["n_seeds"] = problem.space.n_seeds
+        record["seed_rule"] = (
+            "every seed of a sweep start takes the row's one seed voxel and every seed of the centre start the box centre "
+            "(the seeds start together; the optimizer separates them); a manual start names every seed's box factors and "
+            "its blocks are ordered along x"
+        )
     return starts, record
 
 
@@ -3177,8 +3402,9 @@ def format_starts(starts: Sequence[Start], problem: FitProblem) -> str:
             + (f", proxy {proxy:.4f}" if isinstance(proxy, float) else "")
             + f"): preop_time {point.preop_time:.1f} d"
             + (" (clamped)" if point.preop_time_clamped else "")
-            + f", seed voxel {list(point.seed_voxel)}" + (" (snapped)" if point.seed_snapped else "")
+            + f", {format_seed_voxels(point)}"
             + (f", clipped {sorted(start.source['clipped'])}" if start.source.get("clipped") else "")
+            + (" (seeds reordered along x)" if start.source.get("seeds_reordered") else "")
         )
         for name in names:
             lines.append(f"    {name:<24} u = {start.unit[names.index(name)]:.4f}   {start.physical[name]:.6g}")
@@ -3376,7 +3602,7 @@ def best_summary(record: Mapping[str, Any], problem: FitProblem) -> dict[str, An
         "n_nan_sessions": row["n_nan_sessions"],
         "unit": {name: row[f"u_{name}"] for name in names},
         "physical": {name: row.get(name) for name in names},
-        "derived": {column: row.get(column) for column in DERIVED_COLUMNS},
+        "derived": {column: row.get(column) for column in derived_columns(problem.space.n_seeds)},
         "per_session": {
             session.id: {name: row.get(f"{session.prefix}{name}") for name in SESSION_COLUMNS} for session in problem.sessions
         },
@@ -3493,10 +3719,11 @@ def run_restart(
     state_path = restart_dir / STATE_FILE
     csv_path = restart_dir / EVALUATIONS_FILE
     trace_path = restart_dir / TRACE_FILE
-    columns = evaluation_columns(problem.space.names, problem.prefixes)
+    columns = evaluation_columns(problem.space.names, problem.prefixes, problem.space.n_seeds)
     sigma0 = settings.sigma0s[k]
     n_generations = settings.generations[k]
     schedule = settings.schedule
+    repair = problem.space.order_seeds if problem.space.n_seeds > 1 else None  # the seed order (the module docstring)
     incumbent: Incumbent | None = None
     trace: list[dict[str, Any]] = []
     elapsed_before = 0.0
@@ -3505,7 +3732,7 @@ def run_restart(
             raise FileExistsError(f"{state_path} exists; a restart is never overwritten (use --resume).")
         state = load_state(state_path)
         rows, dropped = truncate_evaluations(csv_path, columns, state["generation"])
-        optimizer = CMAES.from_state(state, settings.popsize)
+        optimizer = CMAES.from_state(state, settings.popsize, repair)
         if state["incumbent_eval_id"] >= 0:
             row = next(r for r in rows if r["eval_id"] == state["incumbent_eval_id"])
             incumbent = Incumbent(state["incumbent_unit"], state["incumbent_loss"], state["incumbent_eval_id"], state["incumbent_generation"], row)
@@ -3528,7 +3755,7 @@ def run_restart(
         if csv_path.is_file():  # an interrupted generation 0 (no checkpoint yet): redone
             print(f"restart {k}: {csv_path} has rows but no checkpoint; they are discarded", flush=True)
             csv_path.unlink()
-        optimizer = CMAES(start.unit, sigma0, settings.popsize, np.random.default_rng([settings.seed, k]))
+        optimizer = CMAES(start.unit, sigma0, settings.popsize, np.random.default_rng([settings.seed, k]), repair)
         next_eval_id = 0
         current_factor = None
         print(f"restart {k}: start {start.label}, sigma0 {sigma0:g}, {n_generations} generations, popsize {settings.popsize}", flush=True)
@@ -3648,7 +3875,7 @@ def dry_run(pool: WorkerPool, problem: FitProblem, starts: Sequence[Start], fit_
     and print the wall times."""
     directory = fit_dir / DRY_RUN_DIR
     directory.mkdir(parents=True, exist_ok=True)
-    log = EvaluationLog(directory / EVALUATIONS_FILE, evaluation_columns(problem.space.names, problem.prefixes))
+    log = EvaluationLog(directory / EVALUATIONS_FILE, evaluation_columns(problem.space.names, problem.prefixes, problem.space.n_seeds))
     try:
         jobs = [(start.index, start.unit, FULL_RESOLUTION, None) for start in starts]
         started = time.perf_counter()
@@ -3809,7 +4036,7 @@ def prepare_fit(args: argparse.Namespace, fit_dir: Path, gpus: Sequence[str | No
         starts = load_starts(fit_dir / STARTS_FILE, problem)
         settings = FitSettings.from_args(args, n_workers, len(starts), problem.space.dimension)
         settings.check_against(spec["cmaes"])
-        print(f"resuming {fit_dir}: {len(starts)} start(s), popsize {settings.popsize}", flush=True)
+        print(f"resuming {fit_dir}: {len(starts)} start(s), popsize {settings.popsize}, {problem.space.n_seeds} seed(s)", flush=True)
         return problem, settings, starts
     if fit_dir.exists():
         raise FileExistsError(f"{fit_dir} exists; a fit directory is never overwritten (continue it with --resume).")
@@ -3827,6 +4054,7 @@ def prepare_fit(args: argparse.Namespace, fit_dir: Path, gpus: Sequence[str | No
         schedule.factors,
         solver_mode=args.solver,
         objective_scope=args.objective,
+        n_seeds=int(args.n_seeds),
     )
     print(f"solver: {problem.solver_class.__name__} (--solver {args.solver}); base config {problem.base.get(SOLVER_KEY)!s}", flush=True)
     checks = check_patient_data(problem.data)
@@ -3845,6 +4073,7 @@ def prepare_fit(args: argparse.Namespace, fit_dir: Path, gpus: Sequence[str | No
     )
     print(
         f"seedable voxels: {problem.seed_map.geometry.n_voxels}, box {problem.seed_map.lo.tolist()} .. {problem.seed_map.hi.tolist()}; "
+        f"{problem.space.n_seeds} seed(s), box factors {problem.space.seed_bbox_names}; "
         f"preop_time clamp {list(problem.preop_time_range)} days; horizon offset {problem.horizon_offset} days",
         flush=True,
     )
@@ -3933,6 +4162,7 @@ def run_starts(args: argparse.Namespace) -> int:
         [FULL_RESOLUTION],
         solver_mode=args.solver,
         objective_scope=args.objective,
+        n_seeds=int(args.n_seeds),
     )
     sweep_dir = None if args.no_sweep_init else Path(args.init_from_sweep)
     starts, record = resolve_starts(problem, sweep_dir, int(args.top), args.init_values, float(args.min_start_distance))
@@ -3994,6 +4224,14 @@ def _add_problem_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "the objective's scope: full = the pre-op and the later sessions under the treated forward run, preop = the pre-op "
             f"session alone under the untreated growth to the pre-op scan, rt_alpha and chemo_kill_rate not fitted (default {DEFAULT_OBJECTIVE_SCOPE})"
+        ),
+    )
+    parser.add_argument(
+        "--n-seeds", type=int, default=DEFAULT_N_SEEDS,
+        help=(
+            "the number of seeds, any n >= 1: the search space's seed_bbox_x/y/z are expanded into one block per seed "
+            "(seed_bbox_x_<k>, ...), the width and the peak are shared, the seeds are ordered along x; 1 is the single-seed "
+            f"fit (default {DEFAULT_N_SEEDS})"
         ),
     )
     parser.add_argument("--preop-time-range", default=DEFAULT_PREOP_TIME_RANGE, help=f"clamp of preop_time in days 'lo,hi' (default {DEFAULT_PREOP_TIME_RANGE})")
