@@ -1,0 +1,19 @@
+{
+  "solver": "FKPPSolver",
+  "_note": "Variant of patient_fit_search_space.json (2026-11-10) for scripts/patient_cmaes_fit.py: the white-to-gray-matter diffusivity ratio diffusivity_ratio is a fitted factor instead of the fixed value 10. Every other entry (the ten factors with their ranges, scales and order, and the fixed values rt_alpha_beta_ratio, chemo_decay_rate, gaussian_seed_scale) is that file's, and its notes (_growth_band, _seed_band, _seed_position, _clock, _chemo, _radiotherapy, _scales, _units, _sources) apply here unchanged, except where they call diffusivity_ratio fixed. Pass this file with --search-space; the format is the one described in that file's _note.",
+  "_diffusivity_ratio": "diffusivity_ratio (1-1000, log-uniform, dimensionless) is a solver parameter written directly into every run config: the face diffusivity is white_matter_diffusivity * (wm + gm / diffusivity_ratio), so 1 is equal diffusion in white and gray matter and 1000 is growth confined to white matter. The floor and the scale are those of patient_SA_v2_search_space.json (1-100, log-uniform); the cap is raised a decade to 1000 (the author's choice, 2026-11-10). The unit-cube centre is 31.6, not the 10 that patient_fit_search_space.json fixes (10 is u = 1/3), so a centre start is NOT the start of a fit with that file: to start there, give --init-values with that file's centre values and diffusivity_ratio=10. Above a ratio of about lambda^2 (lambda = front_width_mm on the 1 mm grid) the gray-matter front, of width lambda / sqrt(diffusivity_ratio), is narrower than a voxel and is not resolved, so the top of the range acts as growth blocked by gray matter rather than as a calibrated slow front. The factor stands last in the factor order, so the first ten unit-cube coordinates are those of patient_fit_search_space.json (with --n-seeds n > 1 the seed blocks expand at the place of seed_bbox_x as there). The front parametrisation is unchanged: front_speed_mm_per_day and front_width_mm give white_matter_diffusivity and rho, i.e. they are the speed and width of the front in white matter; in gray matter the front moves at v / sqrt(diffusivity_ratio) with the width lambda / sqrt(diffusivity_ratio). The fixed step count is not affected: the ratio is at least 1, so the largest face diffusivity stays at most white_matter_diffusivity wherever wm + gm <= 1, and the solver raises the count itself where its stability estimate is stricter. The sub-01 sensitivity analysis found the ratio inert on the agreement QoIs, which is why patient_fit_search_space.json fixes it; this file exists to test that on other patients.",
+  "front_speed_mm_per_day": {"min": 0.03, "max": 0.25, "scale": "log"},
+  "front_width_mm": {"min": 1.0, "max": 8.0, "scale": "log"},
+  "seed_sigma_mm": {"min": 2.0, "max": 16.0, "scale": "log"},
+  "seed_peak_density": {"min": 0.5, "max": 1.0, "scale": "linear"},
+  "growth_length_mm": {"min": 0.21, "max": 50.0, "scale": "log"},
+  "seed_bbox_x": {"min": 0.0, "max": 1.0, "scale": "linear"},
+  "seed_bbox_y": {"min": 0.0, "max": 1.0, "scale": "linear"},
+  "seed_bbox_z": {"min": 0.0, "max": 1.0, "scale": "linear"},
+  "rt_alpha": {"min": 1e-05, "max": 0.1, "scale": "log"},
+  "chemo_kill_rate": {"min": 1e-05, "max": 0.01, "scale": "log"},
+  "diffusivity_ratio": {"min": 1.0, "max": 1000.0, "scale": "log"},
+  "rt_alpha_beta_ratio": 8.0,
+  "chemo_decay_rate": 9.24,
+  "gaussian_seed_scale": 1.0
+}

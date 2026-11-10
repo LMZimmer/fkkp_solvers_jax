@@ -559,12 +559,16 @@ def render_model(
     stopping_time: float,
     n_col: int,
     yscale: tuple[float, float] | None = None,
+    model_label: str = "model core at scan (cavity excluded)",
+    colorbar_label: str = "cell density",
 ) -> None:
     """The model figure: per session the segmented tumour core of the
     display labels (necrotic + enhancing, red) and, in every session but
     the pre-op one, the resection cavity (the post-op session's label-4
     mask, green) over the field, the two contours named in a frameless
-    legend above the panels; the volume curve is drawn only when given."""
+    legend above the panels; the volume curve is drawn only when given.
+    model_label and colorbar_label name the per-session volume markers and
+    the field (scripts/copy_last_eval.py passes its prediction masks)."""
     fig, axes, (bottom, colorbar_ax) = _figure(len(sessions), n_col)
     fig.legend(
         handles=[
@@ -597,13 +601,13 @@ def render_model(
         )
         ax.axis("off")
     if image is not None:
-        fig.colorbar(image, cax=colorbar_ax, label="cell density")
+        fig.colorbar(image, cax=colorbar_ax, label=colorbar_label)
     if curve_times is not None and curve_volumes is not None:
         bottom.plot(
             curve_times, curve_volumes, "--", color=MODEL_COLOR, linewidth=1.2,
             label=f"model core (u >= {threshold:g}, latest scan's cavity excluded)",
         )
-    bottom.plot(moments, model_volumes, "s", color=MODEL_COLOR, markersize=6, label="model core at scan (cavity excluded)")
+    bottom.plot(moments, model_volumes, "s", color=MODEL_COLOR, markersize=6, label=model_label)
     bottom.plot(
         moments, reference_volumes, "o", markerfacecolor="none", markeredgecolor=REFERENCE_COLOR,
         markersize=7, markeredgewidth=1.5, label=REFERENCE_CORE_LABEL,

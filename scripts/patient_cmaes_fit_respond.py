@@ -74,6 +74,12 @@ Design choices (decided with the author on 2026-11-06)
    fit_tum149_2026-10-29.
 8. Output: OUTPUT_DIR unless --output-dir is given; the fit directory
    receives DESIGN_FILE with this record.
+9. Segmentations: the *_corrected files next to the originals
+   (CORRECTED_SEGMENTATIONS). The mirror keeps the file names the fit script
+   reads, but they link to the corrected files, so spec.json shows the plain
+   names; DESIGN_FILE records the link targets. A fitted session without its
+   corrected file raises, the originals are never used and are not in the
+   mirror.
 
 Queue
 -----
@@ -132,7 +138,9 @@ from patient_sensitivity_analysis import (  # noqa: E402
     LABEL_FOLLOWUP,
     LABEL_POSTOP,
     LABEL_PREOP,
+    LATER_SEGMENTATION_FILE,
     N_FRACTIONS,
+    PREOP_SEGMENTATION_FILE,
     AdjuvantCycle,
     Protocol,
     Session,
@@ -153,6 +161,11 @@ EXCLUDED_SUBJECTS: dict[str, str] = {  # design choice 1
     "GR115": "no RT dose map",
     "GR147": "no RT dose map and no RT planning date",
     "GR138": "the pre-op mask holds no label 1 or 3, so no voxel can be seeded",
+}
+
+CORRECTED_SEGMENTATIONS: dict[str, str] = {  # design choice 9: the file the fit script reads -> the file it links to
+    PREOP_SEGMENTATION_FILE: "tumor_segmentation/tumor_seg_corrected.nii.gz",
+    LATER_SEGMENTATION_FILE: "longitudinal/recurrence_preop_corrected.nii.gz",
 }
 
 LABEL_INTRAOP = "intraop"
@@ -373,6 +386,14 @@ def expected_links(subject: Subject) -> dict[Path, Path]:
             relative = Path(session.id) / Path(root).relative_to(source)
             for name in files:
                 links[relative / name] = Path(root) / name
+        required = PREOP_SEGMENTATION_FILE if session.id == subject.sessions[0].id else LATER_SEGMENTATION_FILE
+        for plain, corrected in CORRECTED_SEGMENTATIONS.items():
+            target = links.pop(Path(session.id) / corrected, None)
+            links.pop(Path(session.id) / plain, None)  # the original is never in the mirror
+            if target is not None:
+                links[Path(session.id) / plain] = target
+            elif plain == required:
+                raise FileNotFoundError(f"corrected segmentation not found: {source / corrected}")
     dose_target = Path(crt_start_session(subject.sessions).id) / DOSE_FILE
     if dose_target in links:
         raise RuntimeError(f"{links[dose_target]} already exists in the processed data; this script expected to supply it from {subject.dose_source}.")
@@ -514,6 +535,10 @@ def design_record(subject: Subject) -> dict:
         "session_labels": str(subject.session_labels),
         "sessions": [s.record() for s in subject.sessions],
         "skipped_sessions": subject.skipped,
+        "segmentation_sources": {
+            s.id: str(subject.processed_root / s.id / CORRECTED_SEGMENTATIONS[PREOP_SEGMENTATION_FILE if s.id == subject.sessions[0].id else LATER_SEGMENTATION_FILE])
+            for s in subject.sessions
+        },
         "dose_source": str(subject.dose_source),
         "dose_session": crt_start_session(subject.sessions).id,
         "resection": {"rule": "the Resection date of dates.xlsx", "date": subject.resection.isoformat()},
